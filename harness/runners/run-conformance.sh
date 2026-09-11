@@ -7,9 +7,9 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 
 HOST="${1:?usage: run-conformance.sh <host> [suites...]}"
 shift || true
-SUITES=("${@:-wire e2e-replay session-replay}")
+SUITES=("${@:-wire e2e-replay session-replay interop}")
 # zsh/bash default quirk guard:
-[ "${#SUITES[@]}" -eq 0 ] || [ "${SUITES[0]}" = "wire e2e-replay session-replay" ] && SUITES=(wire e2e-replay session-replay)
+[ "${#SUITES[@]}" -eq 0 ] || [ "${SUITES[0]}" = "wire e2e-replay session-replay interop" ] && SUITES=(wire e2e-replay session-replay interop)
 
 export CONFORMANCE_HOME="$ROOT/.scratch/${HOST}-home"
 rm -rf "$CONFORMANCE_HOME"; mkdir -p "$CONFORMANCE_HOME"
@@ -45,6 +45,18 @@ for suite in "${SUITES[@]}"; do
     session-replay)
         (cd "$ROOT/conformance/session-replay" 2>/dev/null && cargo test) \
             || { echo "session-replay: not yet scaffolded (M0 pending)"; }
+        ;;
+    interop)
+        # Only meaningful for the Rust host: drive a few writes, then let
+        # the JS session stack read the produced home back.
+        if [ "$HOST" = vocoderd ]; then
+            SID="interop-$$"
+            curl -sf -X POST "$BASE/api/session/create" -H 'content-type: application/json' \
+                -d "{\"type\":\"client-request\",\"rpcId\":\"i1\",\"method\":\"session/create\",\"payload\":{\"args\":{\"request\":{\"cwd\":\"/tmp/interop\",\"sessionId\":\"$SID\"}}}}" >/dev/null || status=1
+            curl -sf -X POST "$BASE/api/session/prompt" -H 'content-type: application/json' \
+                -d "{\"type\":\"client-request\",\"rpcId\":\"i2\",\"method\":\"session/prompt\",\"payload\":{\"args\":{\"request\":{\"sessionId\":\"$SID\",\"requestId\":\"r1\",\"content\":[{\"type\":\"text\",\"text\":\"hello interop\"}]}}}}" >/dev/null || status=1
+            (cd "$ROOT/dsh" && node --import tsx/esm "$ROOT/harness/probe/interop-vocoder-sessions.ts" "$CONFORMANCE_HOME/sessions") || status=1
+        fi
         ;;
     *)
         echo "unknown suite: $suite" >&2; exit 2
