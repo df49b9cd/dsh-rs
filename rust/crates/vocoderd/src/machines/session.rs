@@ -284,7 +284,13 @@ impl PluginMachine for SessionMachine {
         }
         let method = payload.get("method").and_then(|v| v.as_str()).unwrap_or_default();
         let args = payload.get("args").cloned().unwrap_or_default();
-        let req = args.get("request").cloned().unwrap_or(serde_json::json!({}));
+        // session/list's wire name is _request (dsh reserves it as an
+        // unused placeholder); everything else uses request.
+        let req = args
+            .get("request")
+            .or_else(|| args.get("_request"))
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
 
         match method {
             "create" => self.create(&req),

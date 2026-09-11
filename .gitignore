@@ -5,3 +5,6 @@ __pycache__/
 *.tsbuildinfo
 /rust/target/
 /rust/Cargo.lock
+
+# conformance build outputs
+/conformance/*/target/

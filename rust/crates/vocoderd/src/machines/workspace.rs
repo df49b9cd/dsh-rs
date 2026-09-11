@@ -30,6 +30,47 @@ impl WorkspaceMachine {
             .map(|id| rpc::stream_item(id, increment.clone()))
             .collect()
     }
+
+    /// Run a mutation and, on success, append broadcast increments computed
+    /// from the persisted state. The closure returns (rpc outs, increment
+    /// builder invoked after persist with a read handle on the registry).
+    fn mutate_and_broadcast(
+        &self,
+        mutate: impl FnOnce(&mut WorkspaceRegistryData) -> MutateOutcome,
+        increments: impl FnOnce(&WorkspaceRegistryData) -> Vec<serde_json::Value>,
+    ) -> Vec<MachineOut> {
+        match self.registry.mutate(mutate) {
+            Ok(MutateOutcome { mut outs, broadcast: true }) => {
+                for inc in increments(&self.registry.read(|d| {
+                    // Clone out the tiny amount we need: whole-data clone is
+                    // fine at this scale (registry stays in the low KBs).
+                    d.clone()
+                })) {
+                    outs.append(&mut self.broadcast(inc));
+                }
+                outs
+            }
+            Ok(MutateOutcome { outs, .. }) => outs,
+            Err(e) => rpc::err("gateway/internal", format!("persisting workspace registry: {e}")),
+        }
+    }
+}
+
+use crate::registry::WorkspaceRegistryData;
+
+struct MutateOutcome {
+    outs: Vec<MachineOut>,
+    broadcast: bool,
+}
+
+impl MutateOutcome {
+    fn ok_broadcast(outs: Vec<MachineOut>) -> Self {
+        Self { outs, broadcast: true }
+    }
+    /// Error path: return the error outputs without broadcasting.
+    fn err(outs: Vec<MachineOut>) -> Self {
+        Self { outs, broadcast: false }
+    }
 }
 
 fn view_of(id: &str, r: &crate::registry::WorkspaceRecord) -> serde_json::Value {
@@ -177,52 +218,75 @@ impl WorkspaceMachine {
             return rpc::err("gateway/bad-request", "missing workspaceId");
         };
         let title = req.get("title").and_then(|v| v.as_str()).unwrap_or_default();
-        let trimmed = title.trim();
+        let trimmed = title.trim().to_string();
         if trimmed.is_empty() {
             return rpc::err_details(
                 "gateway/bad-request", "blank workspace title",
                 serde_json::json!({ "issues": ["title must not be blank"] }),
             );
         }
-        self.registry.mutate(|d| {
-            if !d.records.contains_key(&id) {
-                return rpc::err_details(
-                    "workspace/not-found", format!("no such workspace: {id}"),
-                    serde_json::json!({ "workspaceId": id }),
-                );
-            }
-            for (other, r) in d.records.iter() {
-                if *other != id && r.title == trimmed {
-                    return rpc::err_details(
-                        "workspace/name-conflict",
-                        format!("a workspace named {trimmed} already exists"),
-                        serde_json::json!({ "name": trimmed }),
-                    );
+        let id2 = id.clone();
+        self.mutate_and_broadcast(
+            move |d| {
+                if !d.records.contains_key(&id2) {
+                    return MutateOutcome::err(rpc::err_details(
+                        "workspace/not-found", format!("no such workspace: {id2}"),
+                        serde_json::json!({ "workspaceId": id2 }),
+                    ));
                 }
-            }
-            let r = d.records.get_mut(&id).unwrap();
-            if r.title != trimmed {
-                r.title = trimmed.to_string();
-                r.updated_at = crate::machines::session_now_ms();
-            }
-            rpc::ok(serde_json::json!({ "workspace": view_of(&id, r) }))
-        }).unwrap_or_else(|e| rpc::err("gateway/internal", format!("persisting workspace registry: {e}")))
+                for (other, r) in d.records.iter() {
+                    if *other != id2 && r.title == trimmed {
+                        return MutateOutcome::err(rpc::err_details(
+                            "workspace/name-conflict",
+                            format!("a workspace named {trimmed} already exists"),
+                            serde_json::json!({ "name": trimmed }),
+                        ));
+                    }
+                }
+                let r = d.records.get_mut(&id2).unwrap();
+                let changed = r.title != trimmed;
+                if changed {
+                    r.title = trimmed.clone();
+                    r.updated_at = crate::machines::session_now_ms();
+                }
+                let view = view_of(&id2, r);
+                MutateOutcome {
+                    outs: rpc::ok(serde_json::json!({ "workspace": view })),
+                    broadcast: changed,
+                }
+            },
+            move |d| match d.records.get(&id) {
+                Some(r) => vec![serde_json::json!({ "type": "upsert", "workspace": view_of(&id, r) })],
+                None => vec![],
+            },
+        )
     }
 
     fn delete(&mut self, req: &serde_json::Value) -> Vec<MachineOut> {
         let Some(id) = req.get("workspaceId").and_then(|v| v.as_str()).map(str::to_string) else {
             return rpc::err("gateway/bad-request", "missing workspaceId");
         };
-        self.registry.mutate(|d| {
-            if d.records.remove(&id).is_none() {
-                return rpc::err_details(
-                    "workspace/not-found", format!("no such workspace: {id}"),
-                    serde_json::json!({ "workspaceId": id }),
-                );
-            }
-            d.workspace_ids.retain(|w| *w != id);
-            rpc::ok(serde_json::json!({ "deleted": true }))
-        }).unwrap_or_else(|e| rpc::err("gateway/internal", format!("persisting workspace registry: {e}")))
+        let id2 = id.clone();
+        self.mutate_and_broadcast(
+            move |d| {
+                if d.records.remove(&id).is_none() {
+                    return MutateOutcome::err(rpc::err_details(
+                        "workspace/not-found", format!("no such workspace: {id}"),
+                        serde_json::json!({ "workspaceId": id }),
+                    ));
+                }
+                d.workspace_ids.retain(|w| *w != id);
+                MutateOutcome::ok_broadcast(rpc::ok(serde_json::json!({ "deleted": true })))
+            },
+            move |d| {
+                let order: Vec<serde_json::Value> =
+                    d.workspace_ids.iter().map(|s| serde_json::Value::from(s.as_str())).collect();
+                vec![
+                    serde_json::json!({ "type": "remove", "workspaceId": id2 }),
+                    serde_json::json!({ "type": "order", "workspaceIds": order }),
+                ]
+            },
+        )
     }
 
     fn insert_before(&mut self, req: &serde_json::Value) -> Vec<MachineOut> {
@@ -230,32 +294,39 @@ impl WorkspaceMachine {
             return rpc::err("gateway/bad-request", "missing workspaceId");
         };
         let before = req.get("beforeWorkspaceId").and_then(|v| v.as_str()).map(str::to_string);
-        self.registry.mutate(|d| {
-            let ids = &mut d.workspace_ids;
-            if !ids.contains(&id) {
-                return rpc::err_details(
-                    "workspace/not-found", format!("no such workspace: {id}"),
-                    serde_json::json!({ "workspaceId": id }),
-                );
-            }
-            if let Some(b) = &before
-                && !ids.contains(b)
-            {
-                return rpc::err_details(
-                    "workspace/not-found", format!("no such workspace: {b}"),
-                    serde_json::json!({ "workspaceId": b }),
-                );
-            }
-            ids.retain(|w| *w != id);
-            let pos = before
-                .as_ref()
-                .and_then(|b| ids.iter().position(|w| w == b))
-                .unwrap_or(ids.len());
-            ids.insert(pos, id);
-            let order: Vec<serde_json::Value> =
-                ids.iter().map(|s| serde_json::Value::from(s.as_str())).collect();
-            rpc::ok(serde_json::json!({ "workspaceIds": order }))
-        }).unwrap_or_else(|e| rpc::err("gateway/internal", format!("persisting workspace registry: {e}")))
+        self.mutate_and_broadcast(
+            move |d| {
+                let ids = &mut d.workspace_ids;
+                if !ids.contains(&id) {
+                    return MutateOutcome::err(rpc::err_details(
+                        "workspace/not-found", format!("no such workspace: {id}"),
+                        serde_json::json!({ "workspaceId": id }),
+                    ));
+                }
+                if let Some(b) = &before
+                    && !ids.contains(b)
+                {
+                    return MutateOutcome::err(rpc::err_details(
+                        "workspace/not-found", format!("no such workspace: {b}"),
+                        serde_json::json!({ "workspaceId": b }),
+                    ));
+                }
+                ids.retain(|w| *w != id);
+                let pos = before
+                    .as_ref()
+                    .and_then(|b| ids.iter().position(|w| w == b))
+                    .unwrap_or(ids.len());
+                ids.insert(pos, id);
+                let order: Vec<serde_json::Value> =
+                    ids.iter().map(|s| serde_json::Value::from(s.as_str())).collect();
+                MutateOutcome::ok_broadcast(rpc::ok(serde_json::json!({ "workspaceIds": order })))
+            },
+            |d| {
+                let order: Vec<serde_json::Value> =
+                    d.workspace_ids.iter().map(|s| serde_json::Value::from(s.as_str())).collect();
+                vec![serde_json::json!({ "type": "order", "workspaceIds": order })]
+            },
+        )
     }
 
     fn insert_session_before(&mut self, req: &serde_json::Value) -> Vec<MachineOut> {
@@ -266,26 +337,34 @@ impl WorkspaceMachine {
             return rpc::err("gateway/bad-request", "missing sessionId");
         };
         let before = req.get("beforeSessionId").and_then(|v| v.as_str()).map(str::to_string);
-        self.registry.mutate(|d| {
-            let Some(record) = d.records.get_mut(&ws) else {
-                return rpc::err_details(
-                    "workspace/not-found", format!("no such workspace: {ws}"),
-                    serde_json::json!({ "workspaceId": ws }),
-                );
-            };
-            // dsh prepends newly accounted sessions, then (re)moves.
-            if !record.session_ids.contains(&session) {
-                record.session_ids.insert(0, session.clone());
-            }
-            record.session_ids.retain(|s| *s != session);
-            let pos = before
-                .as_ref()
-                .and_then(|b| record.session_ids.iter().position(|s| s == b))
-                .unwrap_or(record.session_ids.len());
-            record.session_ids.insert(pos, session.clone());
-            record.updated_at = crate::machines::session_now_ms();
-            rpc::ok(serde_json::json!({ "workspace": view_of(&ws, record) }))
-        }).unwrap_or_else(|e| rpc::err("gateway/internal", format!("persisting workspace registry: {e}")))
+        let ws2 = ws.clone();
+        self.mutate_and_broadcast(
+            move |d| {
+                let Some(record) = d.records.get_mut(&ws) else {
+                    return MutateOutcome::err(rpc::err_details(
+                        "workspace/not-found", format!("no such workspace: {ws}"),
+                        serde_json::json!({ "workspaceId": ws }),
+                    ));
+                };
+                // dsh prepends newly accounted sessions, then (re)moves.
+                if !record.session_ids.contains(&session) {
+                    record.session_ids.insert(0, session.clone());
+                }
+                record.session_ids.retain(|s| *s != session);
+                let pos = before
+                    .as_ref()
+                    .and_then(|b| record.session_ids.iter().position(|s| s == b))
+                    .unwrap_or(record.session_ids.len());
+                record.session_ids.insert(pos, session.clone());
+                record.updated_at = crate::machines::session_now_ms();
+                let view = view_of(&ws, record);
+                MutateOutcome::ok_broadcast(rpc::ok(serde_json::json!({ "workspace": view })))
+            },
+            move |d| match d.records.get(&ws2) {
+                Some(r) => vec![serde_json::json!({ "type": "upsert", "workspace": view_of(&ws2, r) })],
+                None => vec![],
+            },
+        )
     }
 
     fn archive_session(&mut self, req: &serde_json::Value) -> Vec<MachineOut> {
@@ -299,14 +378,29 @@ impl WorkspaceMachine {
                 serde_json::json!({ "sessionId": session }),
             );
         }
-        self.registry.mutate(|d| {
-            if !d.archived_session_ids.contains(&session) {
-                d.archived_session_ids.push(session);
-            }
-            let archived: Vec<serde_json::Value> =
-                d.archived_session_ids.iter().map(|s| serde_json::Value::from(s.as_str())).collect();
-            rpc::ok(serde_json::json!({ "archivedSessionIds": archived }))
-        }).unwrap_or_else(|e| rpc::err("gateway/internal", format!("persisting workspace registry: {e}")))
+        self.mutate_and_broadcast(
+            move |d| {
+                if !d.archived_session_ids.contains(&session) {
+                    d.archived_session_ids.push(session.clone());
+                }
+                let archived: Vec<serde_json::Value> = d
+                    .archived_session_ids
+                    .iter()
+                    .map(|s| serde_json::Value::from(s.as_str()))
+                    .collect();
+                MutateOutcome::ok_broadcast(
+                    rpc::ok(serde_json::json!({ "archivedSessionIds": archived })),
+                )
+            },
+            |d| {
+                let archived: Vec<serde_json::Value> = d
+                    .archived_session_ids
+                    .iter()
+                    .map(|s| serde_json::Value::from(s.as_str()))
+                    .collect();
+                vec![serde_json::json!({ "type": "archived", "archivedSessionIds": archived })]
+            },
+        )
     }
 
     fn follow_snapshot(&self) -> Vec<MachineOut> {

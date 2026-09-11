@@ -8,6 +8,13 @@ fn base_url() -> String {
     std::env::var("CONFORMANCE_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:3080".into())
 }
 
+/// Signed dsh cookie ("k=v") minted by harness/runners/run.sh when running
+/// the control host; ignored by vocoderd.
+fn auth_cookie() -> Option<String> {
+    let path = std::env::var("CONFORMANCE_COOKIE_FILE").ok()?;
+    std::fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+}
+
 fn rpc(method: &str, args: Value) -> std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send>> {
     let method = method.to_string();
     Box::pin(async move {
@@ -18,12 +25,11 @@ fn rpc(method: &str, args: Value) -> std::pin::Pin<Box<dyn std::future::Future<O
             "payload": { "args": args },
         });
         let client = reqwest::Client::new();
-        let r = client
-            .post(format!("{}/api/{method}", base_url()))
-            .json(&body)
-            .send()
-            .await
-            .expect("rpc send");
+        let mut b = client.post(format!("{}/api/{method}", base_url())).json(&body);
+        if let Some(c) = auth_cookie() {
+            b = b.header("cookie", c);
+        }
+        let r = b.send().await.expect("rpc send");
         r.json::<Value>().await.expect("rpc json")
     })
 }
@@ -185,13 +191,14 @@ async fn unknown_namespace_maps_to_gateway_internal_cell() {
 #[tokio::test]
 async fn malformed_envelope_is_bad_request_cell() {
     let client = reqwest::Client::new();
-    let r = client
+    let mut b = client
         .post(format!("{}/api/session/list", base_url()))
         .body("not json")
-        .header("content-type", "application/json")
-        .send()
-        .await
-        .unwrap();
+        .header("content-type", "application/json");
+    if let Some(c) = auth_cookie() {
+        b = b.header("cookie", c);
+    }
+    let r = b.send().await.unwrap();
     let v: Value = r.json().await.unwrap();
     assert_eq!(v["result"]["ok"], false);
     assert_eq!(error_code(&v), "gateway/bad-request");
