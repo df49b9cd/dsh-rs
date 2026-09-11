@@ -1,0 +1,7 @@
+/target
+.scratch/
+node_modules/
+__pycache__/
+*.tsbuildinfo
+/rust/target/
+/rust/Cargo.lock

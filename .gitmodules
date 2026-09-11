@@ -1,0 +1,3 @@
+[submodule "dsh"]
+	path = dsh
+	url = /home/asdf/Projects/deepseek-harness

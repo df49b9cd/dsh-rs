@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vocoderd",
+    "crates/vocoder-spec-api",
+]
+# tools/codegen joins as vocoder-codegen in M0 wiring.
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "MIT"

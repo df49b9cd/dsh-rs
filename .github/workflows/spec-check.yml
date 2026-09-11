@@ -1,0 +1,25 @@
+name: spec-parity
+
+on:
+  pull_request:
+  push: { branches: [main] }
+
+jobs:
+  spec-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: true }
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "24", cache: pnpm, cache-dependency-path: dsh/pnpm-lock.yaml }
+      - name: Spec must match regeneration from pinned dsh
+        run: just spec-check
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --workspace && cargo test --workspace
+        working-directory: rust

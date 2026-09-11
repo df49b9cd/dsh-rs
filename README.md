@@ -1,0 +1,44 @@
+# Vocoder
+
+A pure-Rust reimplementation of the [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
+backend (`vocoderd`), developed against a **machine-checked specification** extracted from the
+upstream TypeScript host — spec-driven strangler rewrite.
+
+See [PLAN.md](PLAN.md) for the full roadmap and phase exit gates.
+
+## Layout
+
+```
+dsh/            Pinned git submodule — deepseek-harness upstream (source of the spec)
+spec/           GENERATED, committed: the language-neutral backend contract
+  typert/         RPC namespaces, methods, error codes, lookup/key maps (from Typert descriptors)
+  schemas/        JSON Schemas for every request/response/event payload
+  events/         Host→client forwarded-event catalog
+  session-log/    session.vN.jsonl format spec + adjacent-migration matrix
+harness/        Test orchestration
+  runners/        Host launchers shared by every suite: dsh-js (control) / vocoderd (candidate)
+  fixtures/       Shared workspaces, wire captures, golden files
+conformance/    The verdict suite — black-box, host-agnostic, written against spec/ only
+  wire/           Hand-written raw HTTP/WebSocket Typert protocol tests
+  e2e-replay/     Adapter driving the upstream Playwright/Vitest e2e suite against any host
+rust/           Cargo workspace — the Rust backend itself
+tools/codegen/  spec/ → Rust code generator (DTOs, error codes, service traits)
+docs/           Project-local architecture notes
+```
+
+## Command surface
+
+| Command | What it does |
+|---|---|
+| `just update-spec` | Re-extract `spec/` from the pinned `dsh/` checkout |
+| `just spec-check` | Diff-check: committed `spec/` matches regeneration (CI gate) |
+| `just conformance HOST=dsh` | Run the full verdict suite against the JS host (control) |
+| `just conformance HOST=vocoderd` | Same suite against the Rust host |
+| `just codegen` | Regenerate Rust bindings from `spec/` into `rust/crates/vocoder-spec-api` |
+| `just coverage-report` | Emit `docs/spec-coverage.md`: spec endpoints × passing tests per host |
+
+## Spec parity rule
+
+`spec/` is generated **only** from `dsh/`, never hand-edited, and committed. CI regenerates
+it at both pins and fails on drift. The Rust backend is correct ⇔ the conformance suite
+passes against it with the same green set as against the JS control host.
