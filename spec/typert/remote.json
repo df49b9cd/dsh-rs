@@ -7,6 +7,7 @@
       "service": "agentPresets",
       "namespace": "agentPresets",
       "method": "copy",
+      "mode": "unary",
       "implementation": "remoteExportCopy",
       "invocation": {
         "kind": "direct"
@@ -72,6 +73,7 @@
       "service": "agentPresets",
       "namespace": "agentPresets",
       "method": "deletePreset",
+      "mode": "unary",
       "implementation": "remoteExportDelete",
       "invocation": {
         "kind": "direct"
@@ -111,6 +113,7 @@
       "service": "agentPresets",
       "namespace": "agentPresets",
       "method": "list",
+      "mode": "unary",
       "implementation": "remoteExportList",
       "invocation": {
         "kind": "direct"
@@ -200,6 +203,7 @@
       "service": "agentPresets",
       "namespace": "agentPresets",
       "method": "read",
+      "mode": "unary",
       "implementation": "readDocument",
       "invocation": {
         "kind": "direct"
@@ -276,6 +280,7 @@
       "service": "agentPresets",
       "namespace": "agentPresets",
       "method": "select",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -337,6 +342,7 @@
       "service": "sessionFileReferences",
       "namespace": "fileReferences",
       "method": "list",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -423,6 +429,7 @@
       "service": "sessionController",
       "namespace": "session",
       "method": "attachment",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -567,6 +574,7 @@
       "service": "sessionController",
       "namespace": "session",
       "method": "cancel",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -631,6 +639,7 @@
       "service": "sessionController",
       "namespace": "session",
       "method": "canOpenWorkspacePath",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -655,6 +664,7 @@
       "service": "sessionController",
       "namespace": "session",
       "method": "control",
+      "mode": "stream",
       "invocation": {
         "kind": "direct"
       },
@@ -1944,6 +1954,7 @@
       "service": "sessionController",
       "namespace": "session",
       "method": "create",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -2030,6 +2041,7 @@
       "service": "sessionController",
       "namespace": "session",
       "method": "follow",
+      "mode": "stream",
       "invocation": {
         "kind": "direct"
       },
@@ -3625,6 +3637,7 @@
       "service": "sessionController",
       "namespace": "session",
       "method": "fork",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -3697,6 +3710,7 @@
       "service": "sessionController",
       "namespace": "session",
       "method": "list",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -4508,6 +4522,7 @@
       "service": "sessionController",
       "namespace": "session",
       "method": "modelCatalog",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -4687,6 +4702,7 @@
       "service": "sessionController",
       "namespace": "session",
       "method": "openWorkspacePath",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -4751,6 +4767,7 @@
       "service": "sessionController",
       "namespace": "session",
       "method": "page",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -5098,6 +5115,7 @@
       "service": "sessionController",
       "namespace": "session",
       "method": "prompt",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -5287,6 +5305,7 @@
       "service": "sessionController",
       "namespace": "session",
       "method": "rename",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -5360,6 +5379,7 @@
       "service": "sessionController",
       "namespace": "session",
       "method": "search",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -5446,6 +5466,7 @@
       "service": "sessionController",
       "namespace": "session",
       "method": "selectModel",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -5542,6 +5563,7 @@
       "service": "sessionController",
       "namespace": "session",
       "method": "updateQueue",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -6115,6 +6137,7 @@
       "service": "sessionSkillCatalog",
       "namespace": "skills",
       "method": "list",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -6209,6 +6232,7 @@
       "service": "credentialsController",
       "namespace": "credentials",
       "method": "describe",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -6272,6 +6296,7 @@
       "service": "credentialsController",
       "namespace": "credentials",
       "method": "set",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -6323,6 +6348,7 @@
       "service": "credentialsController",
       "namespace": "credentials",
       "method": "unset",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -6361,6 +6387,7 @@
       "service": "settingsController",
       "namespace": "settings",
       "method": "canOpenAgentPresetDirectory",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -6385,6 +6412,7 @@
       "service": "settingsController",
       "namespace": "settings",
       "method": "describe",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -6667,6 +6695,7 @@
       "service": "settingsController",
       "namespace": "settings",
       "method": "mutate",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -7090,6 +7119,7 @@
       "service": "settingsController",
       "namespace": "settings",
       "method": "openAgentPresetDirectory",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -7162,6 +7192,7 @@
       "service": "settingsController",
       "namespace": "settings",
       "method": "openSettingsDocument",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -7197,6 +7228,7 @@
       "service": "settingsController",
       "namespace": "settings",
       "method": "replace",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -7578,6 +7610,7 @@
       "service": "settingsController",
       "namespace": "settings",
       "method": "update",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -7959,6 +7992,7 @@
       "service": "directoryPickerController",
       "namespace": "directoryPicker",
       "method": "createDirectory",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -8010,6 +8044,7 @@
       "service": "directoryPickerController",
       "namespace": "directoryPicker",
       "method": "list",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -8113,6 +8148,7 @@
       "service": "directoryPickerController",
       "namespace": "directoryPicker",
       "method": "pick",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -8145,6 +8181,7 @@
       "service": "workspaceController",
       "namespace": "workspace",
       "method": "archiveSession",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -8216,6 +8253,7 @@
       "service": "workspaceController",
       "namespace": "workspace",
       "method": "create",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -8327,6 +8365,7 @@
       "service": "workspaceController",
       "namespace": "workspace",
       "method": "delete",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -8391,6 +8430,7 @@
       "service": "workspaceController",
       "namespace": "workspace",
       "method": "follow",
+      "mode": "stream",
       "invocation": {
         "kind": "direct"
       },
@@ -8654,6 +8694,7 @@
       "service": "workspaceController",
       "namespace": "workspace",
       "method": "insertBefore",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -8734,6 +8775,7 @@
       "service": "workspaceController",
       "namespace": "workspace",
       "method": "insertSessionBefore",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -8864,6 +8906,7 @@
       "service": "workspaceController",
       "namespace": "workspace",
       "method": "rename",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -8980,6 +9023,7 @@
       "service": "workspaceFiles",
       "namespace": "workspaceFiles",
       "method": "changes",
+      "mode": "stream",
       "invocation": {
         "kind": "direct"
       },
@@ -9096,6 +9140,7 @@
       "service": "workspaceFiles",
       "namespace": "workspaceFiles",
       "method": "list",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -9208,6 +9253,7 @@
       "service": "workspaceFiles",
       "namespace": "workspaceFiles",
       "method": "read",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -9328,6 +9374,7 @@
       "service": "workspaceFiles",
       "namespace": "workspaceFiles",
       "method": "readAll",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -9419,6 +9466,7 @@
       "service": "workspaceFiles",
       "namespace": "workspaceFiles",
       "method": "readBytes",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -9534,6 +9582,7 @@
       "service": "workspaceFiles",
       "namespace": "workspaceFiles",
       "method": "readRelated",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -9638,6 +9687,7 @@
       "service": "workspaceFiles",
       "namespace": "workspaceFiles",
       "method": "stat",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -9714,6 +9764,7 @@
       "service": "fileUploads",
       "namespace": "fileUploads",
       "method": "upload",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -9831,6 +9882,7 @@
       "service": "sessionFeedback",
       "namespace": "sessionFeedback",
       "method": "record",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -9992,6 +10044,7 @@
       "service": "commands",
       "namespace": "commands",
       "method": "execute",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -10143,6 +10196,7 @@
       "service": "commands",
       "namespace": "commands",
       "method": "list",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -10236,6 +10290,7 @@
       "service": "dynamicCordisRunner",
       "namespace": "dynamicCordisRunner",
       "method": "getClientCode",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -10360,6 +10415,7 @@
       "service": "dynamicCordisRunner",
       "namespace": "dynamicCordisRunner",
       "method": "inventory",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -10747,6 +10803,7 @@
       "service": "dynamicCordisRunner",
       "namespace": "dynamicCordisRunner",
       "method": "invoke",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -11051,6 +11108,7 @@
       "service": "dynamicCordisRunner",
       "namespace": "dynamicCordisRunner",
       "method": "reportClientGuardFailure",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -11161,6 +11219,7 @@
       "service": "dynamicCordisRunner",
       "namespace": "dynamicCordisRunner",
       "method": "reportRenderFailure",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -11279,6 +11338,7 @@
       "service": "dynamicCordisRunner",
       "namespace": "dynamicCordisRunner",
       "method": "resolveInspectQuery",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -11500,6 +11560,7 @@
       "service": "dynamicCordisRunner",
       "namespace": "dynamicCordisRunner",
       "method": "resolveRequestRun",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -11641,6 +11702,7 @@
       "service": "dynamicCordisRunner",
       "namespace": "dynamicCordisRunner",
       "method": "runHostHalf",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -11870,6 +11932,7 @@
       "service": "dynamicCordisRunner",
       "namespace": "dynamicCordisRunner",
       "method": "settleUserRun",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -12186,6 +12249,7 @@
       "service": "dynamicCordisRunner",
       "namespace": "dynamicCordisRunner",
       "method": "stopFromPanel",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -12296,6 +12360,7 @@
       "service": "dynamicCordisRunner",
       "namespace": "dynamicCordisRunner",
       "method": "syncInspectManifest",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -12486,6 +12551,7 @@
       "service": "dynamicCordisRunner",
       "namespace": "dynamicCordisRunner",
       "method": "undefineFromPanel",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -12592,6 +12658,7 @@
       "service": "agentTeams",
       "namespace": "agentTeams",
       "method": "createTask",
+      "mode": "unary",
       "implementation": "remoteCreateTask",
       "invocation": {
         "kind": "direct"
@@ -12841,6 +12908,7 @@
       "service": "agentTeams",
       "namespace": "agentTeams",
       "method": "updateTask",
+      "mode": "unary",
       "implementation": "remoteUpdateTask",
       "invocation": {
         "kind": "direct"
@@ -13145,6 +13213,7 @@
       "service": "agentTeams",
       "namespace": "agentTeams",
       "method": "view",
+      "mode": "unary",
       "implementation": "remoteView",
       "invocation": {
         "kind": "direct"
@@ -13398,6 +13467,7 @@
       "service": "goals",
       "namespace": "goals",
       "method": "clear",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -13499,6 +13569,7 @@
       "service": "goals",
       "namespace": "goals",
       "method": "complete",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -13680,6 +13751,7 @@
       "service": "goals",
       "namespace": "goals",
       "method": "create",
+      "mode": "unary",
       "implementation": "remoteExportCreate",
       "invocation": {
         "kind": "direct"
@@ -13786,6 +13858,7 @@
       "service": "goals",
       "namespace": "goals",
       "method": "edit",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -13991,6 +14064,7 @@
       "service": "goals",
       "namespace": "goals",
       "method": "get",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -14039,6 +14113,7 @@
       "service": "goals",
       "namespace": "goals",
       "method": "pause",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -14220,6 +14295,7 @@
       "service": "goals",
       "namespace": "goals",
       "method": "resume",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -14401,6 +14477,7 @@
       "service": "pluginInventory",
       "namespace": "pluginInventory",
       "method": "list",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -14620,6 +14697,7 @@
       "service": "llm",
       "namespace": "llm",
       "method": "discoverModels",
+      "mode": "unary",
       "implementation": "remoteDiscoverModels",
       "invocation": {
         "kind": "direct"
@@ -14708,6 +14786,7 @@
       "service": "llm",
       "namespace": "llm",
       "method": "listConfigurableProviders",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -14765,6 +14844,7 @@
       "service": "llm",
       "namespace": "llm",
       "method": "listProviders",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -14805,6 +14885,7 @@
       "service": "messageFeedback",
       "namespace": "messageFeedback",
       "method": "delete",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -15066,6 +15147,7 @@
       "service": "messageFeedback",
       "namespace": "messageFeedback",
       "method": "list",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -15278,6 +15360,7 @@
       "service": "messageFeedback",
       "namespace": "messageFeedback",
       "method": "put",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -15745,6 +15828,7 @@
       "service": "sessionReferenceResolver",
       "namespace": "sessionReferenceResolver",
       "method": "candidates",
+      "mode": "unary",
       "implementation": "remoteExportCandidates",
       "invocation": {
         "kind": "direct"
@@ -15843,6 +15927,7 @@
       "service": "subagents",
       "namespace": "subagents",
       "method": "interruptByParent",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },
@@ -15929,6 +16014,7 @@
       "service": "subagents",
       "namespace": "subagents",
       "method": "list",
+      "mode": "unary",
       "implementation": "remoteExportList",
       "invocation": {
         "kind": "direct"
@@ -16165,6 +16251,7 @@
       "service": "subagents",
       "namespace": "subagents",
       "method": "prompt",
+      "mode": "unary",
       "invocation": {
         "kind": "direct"
       },

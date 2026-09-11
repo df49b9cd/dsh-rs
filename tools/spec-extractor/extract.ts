@@ -48,6 +48,7 @@ function descriptorOf(pkg, d) {
     service: d.service,
     namespace: d.namespace,
     method: d.method,
+    mode: d.mode ?? 'unary',
     implementation: d.implementation,
     invocation: d.invocation?.kind === 'context'
       ? { kind: 'context', context: d.invocation.context, wire: d.invocation.wire, codec: codecOf(d.invocation.codec) }
