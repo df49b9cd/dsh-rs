@@ -1,0 +1,16 @@
+[package]
+name = "vocoder-typert"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Typert wire protocol as Sans-I/O frames: HTTP RPC envelopes and WS mux streams"
+
+[dependencies]
+vocoder-cordis = { path = "../vocoder-cordis" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true

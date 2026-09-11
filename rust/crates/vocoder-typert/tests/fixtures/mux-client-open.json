@@ -1,0 +1,8 @@
+{
+  "type": "open",
+  "streamId": "s-1",
+  "endpoint": "$events",
+  "payload": {
+    "args": {}
+  }
+}

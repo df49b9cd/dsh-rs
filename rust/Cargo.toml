@@ -4,6 +4,7 @@ members = [
     "crates/vocoderd",
     "crates/vocoder-spec-api",
     "crates/vocoder-cordis",
+    "crates/vocoder-typert",
 ]
 # tools/codegen joins as vocoder-codegen in M0 wiring.
 
@@ -18,7 +19,7 @@ license = "MIT"
 [workspace.dependencies]
 # async runtime / web
 tokio = { version = "1.53", features = ["full"] }
-axum = "0.8.9"
+axum = { version = "0.8.9", features = ["ws"] }
 tower-http = "0.7"
 hyper = { version = "1.8", features = ["full"] }
 # wire

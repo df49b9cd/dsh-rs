@@ -1,0 +1,11 @@
+{
+  "type": "item",
+  "streamId": "s-1",
+  "value": {
+    "type": "ready",
+    "clientId": "c-1",
+    "host": {
+      "home": "/home/u"
+    }
+  }
+}

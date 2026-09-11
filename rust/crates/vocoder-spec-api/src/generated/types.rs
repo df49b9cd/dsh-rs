@@ -298,8 +298,7 @@ pub type CredentialsDescribeRefs = serde_json::Value;
 /// Wire type for `@deepseek-ai/dsh-api-settings-controller#credentials/describe:result`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CredentialsDescribeResult {
-}
+pub struct CredentialsDescribeResult {}
 
 /// Wire alias for `@deepseek-ai/dsh-api-settings-controller#credentials/set:ref`.
 pub type CredentialsSetRef = String;
@@ -370,8 +369,7 @@ pub type SettingsReplaceNs = String;
 /// Wire type for `@deepseek-ai/dsh-api-settings-controller#settings/replace:section`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SettingsReplaceSection {
-}
+pub struct SettingsReplaceSection {}
 
 /// Wire alias for `@deepseek-ai/dsh-api-settings-controller#settings/replace:expectedRevision` (structural: unknown).
 pub type SettingsReplaceExpectedRevision = serde_json::Value;
@@ -382,8 +380,7 @@ pub type SettingsUpdateNs = String;
 /// Wire type for `@deepseek-ai/dsh-api-settings-controller#settings/update:patch`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SettingsUpdatePatch {
-}
+pub struct SettingsUpdatePatch {}
 
 /// Wire alias for `@deepseek-ai/dsh-api-settings-controller#settings/update:expectedRevision` (structural: unknown).
 pub type SettingsUpdateExpectedRevision = serde_json::Value;
@@ -926,4 +923,3 @@ pub struct SubagentPromptRequest {
 pub struct SubagentPromptReceipt {
     pub message_id: serde_json::Value,
 }
-

@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, VecDeque};
 pub const MAX_DELIVERIES_PER_STEP: usize = 1024;
 
 /// One plugin, as a pure protocol.
-pub trait PluginMachine {
+pub trait PluginMachine: Send {
     /// Facts arriving from the context.
     type In;
     /// Intentions the router/driver must realize.

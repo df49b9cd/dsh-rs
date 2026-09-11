@@ -7,13 +7,13 @@ use vocoder_cordis::*;
 /// A test machine scripted by closures over a log.
 struct Scripted<F>
 where
-    F: FnMut(&MachineIn) -> Vec<MachineOut>,
+    F: FnMut(&MachineIn) -> Vec<MachineOut> + Send,
 {
     handle: F,
     seen: Vec<MachineIn>,
 }
 
-impl<F: FnMut(&MachineIn) -> Vec<MachineOut>> Scripted<F> {
+impl<F: FnMut(&MachineIn) -> Vec<MachineOut> + Send + 'static> Scripted<F> {
     fn new(f: F) -> Self {
         Self {
             handle: f,
@@ -22,7 +22,7 @@ impl<F: FnMut(&MachineIn) -> Vec<MachineOut>> Scripted<F> {
     }
 }
 
-impl<F: FnMut(&MachineIn) -> Vec<MachineOut>> PluginMachine for Scripted<F> {
+impl<F: FnMut(&MachineIn) -> Vec<MachineOut> + Send> PluginMachine for Scripted<F> {
     type In = MachineIn;
     type Out = MachineOut;
     fn handle(&mut self, ev: MachineIn) -> Vec<MachineOut> {

@@ -1,0 +1,9 @@
+{
+  "type": "emit",
+  "event": "api-session/added",
+  "args": [
+    {
+      "id": "a-1"
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "type": "server-response",
+  "rpcId": "r-1",
+  "result": {
+    "ok": false,
+    "error": {
+      "code": "goal/not-found",
+      "message": "goal \"x\"",
+      "details": {
+        "goalId": "x"
+      }
+    }
+  }
+}

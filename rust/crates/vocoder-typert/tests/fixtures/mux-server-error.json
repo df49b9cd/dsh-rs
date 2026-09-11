@@ -1,0 +1,11 @@
+{
+  "type": "error",
+  "streamId": "s-1",
+  "error": {
+    "name": "RemoteError",
+    "message": "oops",
+    "details": {
+      "code": "gateway/internal"
+    }
+  }
+}

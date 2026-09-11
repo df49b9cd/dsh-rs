@@ -7,6 +7,9 @@ license.workspace = true
 description = "vocoderd — pure-Rust dsh backend: web host, Typert gateway, session log"
 
 [dependencies]
+vocoder-cordis = { path = "../vocoder-cordis" }
+vocoder-typert = { path = "../vocoder-typert" }
+parking_lot = "0.12"
 vocoder-spec-api = { path = "../vocoder-spec-api" }
 anyhow.workspace = true
 axum.workspace = true

@@ -1,0 +1,9 @@
+{
+  "type": "waterfall",
+  "event": "approval/request",
+  "eventId": "e-1",
+  "agentId": "a-1",
+  "request": {
+    "tool": "bash"
+  }
+}

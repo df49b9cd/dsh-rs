@@ -1,0 +1,7 @@
+{
+  "type": "ready",
+  "clientId": "c-1",
+  "host": {
+    "home": "/home/u"
+  }
+}

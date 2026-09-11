@@ -1,0 +1,10 @@
+{
+  "type": "server-response",
+  "rpcId": "r-1",
+  "result": {
+    "ok": true,
+    "value": {
+      "accepted": true
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "type": "client-request",
+  "rpcId": "r-1",
+  "method": "goals/create",
+  "payload": {
+    "objective": "hello"
+  }
+}
