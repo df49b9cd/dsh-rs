@@ -1,0 +1,10 @@
+# vocoderd — Cargo configuration
+
+# Predicates on "1.98.1" pinned via ../rust-toolchain.toml for reproducibility.
+[build]
+rustflags = []
+
+# Use the newer token-efficient resolver defaults; workspace.lock committed.
+
+#[net]
+#git-fetch-with-cli = true
