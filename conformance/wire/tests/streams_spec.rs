@@ -247,6 +247,65 @@ async fn events_stream_ready_then_forwards_session_added() {
     assert!(emit["value"]["args"].is_array(), "{emit}");
 }
 
+
+#[tokio::test]
+async fn workspace_follow_streams_upsert_increment_on_create() {
+    let mut socket = ws_connect().await;
+    let stream_id = format!("s-{}", uuid());
+    let first = open_stream(&mut socket, &stream_id, "workspace/follow", json!({ "args": {} })).await;
+    assert_eq!(first["value"]["type"], "baseline");
+
+    // Create a workspace over unary HTTP; the follow stream gets an upsert.
+    let dir = std::env::temp_dir().join(format!("vocoder-ws-cell-{}", uuid()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let created = rpc(
+        "workspace/create",
+        json!({ "request": { "path": dir.to_string_lossy() } }),
+    )
+    .await;
+    assert!(created["ok"].as_bool().unwrap(), "{created}");
+    let ws_id = created["value"]["workspace"]["workspaceId"].as_str().unwrap().to_string();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let inc = loop {
+        let msg = tokio::time::timeout_at(deadline, socket.next())
+            .await
+            .expect("timed out waiting for workspace upsert increment")
+            .expect("socket closed")
+            .unwrap();
+        let Message::Text(t) = msg else { continue };
+        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+        if v["streamId"] == stream_id && v["type"] == "item" && v["value"]["type"] == "upsert" {
+            break v;
+        }
+    };
+    assert_eq!(inc["value"]["workspace"]["workspaceId"], ws_id, "{inc}");
+
+    // Rename → another upsert carrying the new title.
+    let renamed = rpc(
+        "workspace/rename",
+        json!({ "request": { "workspaceId": ws_id, "title": "Cell Renamed" } }),
+    )
+    .await;
+    assert!(renamed["ok"].as_bool().unwrap(), "{renamed}");
+    loop {
+        let msg = tokio::time::timeout_at(deadline, socket.next())
+            .await
+            .expect("timed out waiting for rename upsert")
+            .expect("socket closed")
+            .unwrap();
+        let Message::Text(t) = msg else { continue };
+        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+        if v["streamId"] == stream_id
+            && v["type"] == "item"
+            && v["value"]["type"] == "upsert"
+            && v["value"]["workspace"]["title"] == "Cell Renamed"
+        {
+            break;
+        }
+    }
+}
+
 #[tokio::test]
 async fn unknown_namespace_stream_errors() {
     let mut socket = ws_connect().await;
