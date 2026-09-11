@@ -1040,12 +1040,6 @@ mod tests {
     }
 
     #[test]
-    fn prompt_then_page_and_search() {
-        let (_dir, mut m, _registry) = machine();
-        let r = call(&mut m, "create", serde_json::json!({"request": {"cwd": "/tmp/y"}}));
-        let id = r["value"]["sessionId"].as_str().unwrap().to_string();
-
-    #[test]
     fn create_conflict_realpath_via_symlink() {
         let (_dir, mut m, _registry) = machine();
         let base = tempfile::tempdir().unwrap();
@@ -1063,6 +1057,12 @@ mod tests {
         let r3 = call(&mut m, "create", serde_json::json!({"request": {"sessionId": "s-rp", "cwd": other.path().to_string_lossy().to_string()}}));
         assert_eq!(r3["error"]["code"], "session/conflict", "{r3}");
     }
+
+    #[test]
+    fn prompt_then_page_and_search() {
+        let (_dir, mut m, _registry) = machine();
+        let r = call(&mut m, "create", serde_json::json!({"request": {"cwd": "/tmp/y"}}));
+        let id = r["value"]["sessionId"].as_str().unwrap().to_string();
         let p = call(&mut m, "prompt", serde_json::json!({"request": {
             "sessionId": id,
             "requestId": "req-1",
