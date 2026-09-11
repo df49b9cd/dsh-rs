@@ -14,6 +14,56 @@ pub fn call_event(namespace: &str) -> String {
     format!("vocoder/{namespace}/call")
 }
 
+/// The event name carrying `MachineIn::Event` stream-open notices for a
+/// namespace (payload: {"streamId", "request"}).
+pub fn stream_open_event(namespace: &str) -> String {
+    format!("vocoder/{namespace}/stream/open")
+}
+
+/// The event name carrying stream-close notices (payload: {"streamId"}).
+pub fn stream_close_event(namespace: &str) -> String {
+    format!("vocoder/{namespace}/stream/close")
+}
+
+/// Emit one stream item frame to the client.
+pub fn stream_item(stream_id: &str, value: serde_json::Value) -> MachineOut {
+    MachineOut::Realize(RealizeRequest::Raw(serde_json::json!({
+        "kind": "stream.item",
+        "streamId": stream_id,
+        "value": value,
+    })))
+}
+
+/// Terminate a stream normally.
+#[allow(dead_code)] // streams stay open in the current profiles; used by future machines
+pub fn stream_end(stream_id: &str) -> MachineOut {
+    MachineOut::Realize(RealizeRequest::Raw(serde_json::json!({
+        "kind": "stream.end",
+        "streamId": stream_id,
+    })))
+}
+
+/// Terminate a stream with a RemoteError-shaped failure. The Typert error
+/// code rides inside `details.code`, mirroring dsh's stream failure.
+pub fn stream_error(
+    stream_id: &str,
+    code: &str,
+    message: impl Into<String>,
+    details: Option<serde_json::Value>,
+) -> MachineOut {
+    let mut details = details.unwrap_or(serde_json::json!({}));
+    if let Some(obj) = details.as_object_mut() {
+        obj.insert("code".into(), code.into());
+    }
+    MachineOut::Realize(RealizeRequest::Raw(serde_json::json!({
+        "kind": "stream.error",
+        "streamId": stream_id,
+        "name": "RemoteError",
+        "message": message.into(),
+        "details": details,
+    })))
+}
+
 /// Success result output.
 pub fn ok(value: serde_json::Value) -> Vec<MachineOut> {
     vec![MachineOut::Realize(RealizeRequest::Raw(serde_json::json!({

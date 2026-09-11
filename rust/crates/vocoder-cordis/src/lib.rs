@@ -90,6 +90,12 @@ pub enum MachineIn {
     ServicesReady { keys: Vec<ServiceKey> },
     /// The machine is being unmounted; answer with compensations.
     DisposeRequested,
+    /// A client opened a logical stream this machine owns (see rpc stream
+    /// plumbing in vocoderd). The payload carries `streamId` and the
+    /// endpoint-specific request under `request`.
+    StreamOpen { stream_id: String, payload: Payload },
+    /// The client cancelled (or the connection dropped) a live stream.
+    StreamClose { stream_id: String },
 }
 
 /// Outputs a machine emits to the router.

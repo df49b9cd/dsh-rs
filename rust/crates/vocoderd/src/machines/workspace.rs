@@ -14,11 +14,21 @@ use crate::rpc;
 pub struct WorkspaceMachine {
     registry: Arc<WorkspaceRegistryStore>,
     sessions: SessionStore,
+    /// Live `workspace/follow` stream ids (baseline already sent).
+    follow_streams: Vec<String>,
 }
 
 impl WorkspaceMachine {
     pub fn new(registry: Arc<WorkspaceRegistryStore>, session_root: std::path::PathBuf) -> Self {
-        Self { registry, sessions: SessionStore::new(session_root) }
+        Self { registry, sessions: SessionStore::new(session_root), follow_streams: Vec::new() }
+    }
+
+    /// Broadcast a WorkspaceFollowIncrement to every live follow stream.
+    fn broadcast(&self, increment: serde_json::Value) -> Vec<MachineOut> {
+        self.follow_streams
+            .iter()
+            .map(|id| rpc::stream_item(id, increment.clone()))
+            .collect()
     }
 }
 
@@ -33,12 +43,40 @@ fn view_of(id: &str, r: &crate::registry::WorkspaceRecord) -> serde_json::Value 
     })
 }
 
+/// Extract `result.value.workspace` from a Raw rpc.ok output, if present.
+fn created_view(out: &MachineOut) -> Option<serde_json::Value> {
+    if let MachineOut::Realize(vocoder_cordis::RealizeRequest::Raw(v)) = out {
+        return v
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .and_then(|v| v.get("workspace"))
+            .cloned();
+    }
+    None
+}
+
 impl PluginMachine for WorkspaceMachine {
     type In = MachineIn;
     type Out = MachineOut;
 
     fn handle(&mut self, ev: MachineIn) -> Vec<MachineOut> {
         let MachineIn::Event { name, payload } = &ev else { return vec![] };
+        if name.0 == rpc::stream_open_event("workspace") {
+            let stream_id = payload
+                .get("streamId")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            return self.stream_open(&stream_id);
+        }
+        if name.0 == rpc::stream_close_event("workspace") {
+            let stream_id = payload
+                .get("streamId")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            self.follow_streams.retain(|s| s != stream_id);
+            return vec![];
+        }
         if name.0 != rpc::call_event("workspace") { return vec![] }
         let method = payload.get("method").and_then(|v| v.as_str()).unwrap_or_default();
         let args = payload.get("args").cloned().unwrap_or_default();
@@ -58,6 +96,22 @@ impl PluginMachine for WorkspaceMachine {
 }
 
 impl WorkspaceMachine {
+    fn stream_open(&mut self, stream_id: &str) -> Vec<MachineOut> {
+        self.follow_streams.push(stream_id.to_string());
+        let baseline = self.registry.read(|d| {
+            let items: Vec<serde_json::Value> = d
+                .workspace_ids
+                .iter()
+                .filter_map(|id| d.records.get(id).map(|r| view_of(id, r)))
+                .collect();
+            serde_json::json!({
+                "type": "baseline",
+                "value": { "items": items, "archivedSessionIds": d.archived_session_ids },
+            })
+        });
+        vec![rpc::stream_item(stream_id, baseline)]
+    }
+
     fn create(&mut self, req: &serde_json::Value) -> Vec<MachineOut> {
         let Some(path) = req.get("path").and_then(|v| v.as_str()) else {
             return rpc::err("gateway/bad-request", "missing path");
@@ -80,12 +134,12 @@ impl WorkspaceMachine {
         }
         let path = canon.to_string_lossy().to_string();
 
-        self.registry.mutate(|d| {
+        let result = self.registry.mutate(|d| {
             // Idempotent by canonical path.
             for (id, r) in &d.records {
                 if r.path == path {
                     let view = view_of(id, r);
-                    return rpc::ok(serde_json::json!({ "created": false, "workspace": view }));
+                    return (rpc::ok(serde_json::json!({ "created": false, "workspace": view })), false);
                 }
             }
             let id = rpc::new_id();
@@ -101,8 +155,21 @@ impl WorkspaceMachine {
             d.workspace_ids.push(id.clone());
             d.initialized = true;
             let view = view_of(&id, d.records.get(&id).unwrap());
-            rpc::ok(serde_json::json!({ "created": true, "workspace": view }))
-        }).unwrap_or_else(|e| rpc::err("gateway/internal", format!("persisting workspace registry: {e}")))
+            (rpc::ok(serde_json::json!({ "created": true, "workspace": view })), true)
+        });
+        match result {
+            Ok((mut outs, created)) => {
+                if created {
+                    if let Some(view) = outs.first().and_then(created_view) {
+                        outs.append(&mut self.broadcast(
+                            serde_json::json!({ "type": "upsert", "workspace": view }),
+                        ));
+                    }
+                }
+                outs
+            }
+            Err(e) => rpc::err("gateway/internal", format!("persisting workspace registry: {e}")),
+        }
     }
 
     fn rename(&mut self, req: &serde_json::Value) -> Vec<MachineOut> {

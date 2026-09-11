@@ -169,6 +169,10 @@ pub struct SessionMachine {
     state: BTreeMap<String, SessionState>,
     /// Shared workspace registry for workspaceId → path resolution.
     workspaces: std::sync::Arc<crate::registry::WorkspaceRegistryStore>,
+    /// Live `session/follow` streams: streamId → the followed session id.
+    follow_streams: BTreeMap<String, String>,
+    /// Live `session/control` streams (stream ids only; baseline already sent).
+    control_streams: Vec<String>,
 }
 
 impl SessionMachine {
@@ -176,7 +180,13 @@ impl SessionMachine {
         root: PathBuf,
         workspaces: std::sync::Arc<crate::registry::WorkspaceRegistryStore>,
     ) -> Self {
-        Self { store: SessionStore::new(root), state: BTreeMap::new(), workspaces }
+        Self {
+            store: SessionStore::new(root),
+            state: BTreeMap::new(),
+            workspaces,
+            follow_streams: BTreeMap::new(),
+            control_streams: Vec::new(),
+        }
     }
 
     fn find(&self, id: &str) -> Option<StoredSession> {
@@ -241,6 +251,33 @@ impl PluginMachine for SessionMachine {
         let MachineIn::Event { name, payload } = &ev else {
             return vec![];
         };
+        if name.0 == rpc::stream_open_event("session") {
+            let stream_id = payload
+                .get("streamId")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let method = payload
+                .get("method")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let req = payload
+                .get("request")
+                .cloned()
+                .unwrap_or(serde_json::json!({}));
+            return self.stream_open(&stream_id, &method, &req);
+        }
+        if name.0 == rpc::stream_close_event("session") {
+            let stream_id = payload
+                .get("streamId")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            self.follow_streams.remove(&stream_id);
+            self.control_streams.retain(|s| s != &stream_id);
+            return vec![];
+        }
         if name.0 != rpc::call_event("session") {
             return vec![];
         }
@@ -329,6 +366,7 @@ impl SessionMachine {
             return rpc::ok(v);
         }
         // New session.
+        let new = true; // reached only when `find` missed above
         let now = now_ms();
         let mut header = serde_json::json!({
             "type": "session",
@@ -367,7 +405,19 @@ impl SessionMachine {
         if let Some(p) = get_str!(req, "agentPreset") {
             v["agentPreset"] = p.into();
         }
-        rpc::ok(v)
+        let mut outs = rpc::ok(v);
+        if new {
+            let summary = self
+                .find(&id)
+                .map(|s| self.summary(&s))
+                .unwrap_or(serde_json::json!({ "sessionId": id }));
+            outs.push(MachineOut::Dispatch {
+                name: vocoder_cordis::EventName::new("api-session/added"),
+                payload: summary,
+                mode: vocoder_cordis::DispatchMode::Emit,
+            });
+        }
+        outs
     }
 
     fn list(&self) -> Vec<MachineOut> {
@@ -475,14 +525,27 @@ impl SessionMachine {
             Ok(id) => id,
             Err(e) => return rpc::err("gateway/bad-request", e),
         };
-        let Some(s) = self.find(&session_id) else {
-            return rpc::err_details(
-                "session/not-found",
+        match self.follow_snapshot_value(&session_id) {
+            Ok(snapshot) => rpc::ok(snapshot),
+            Err((code, details)) => rpc::err_details(
+                code,
                 format!("no such session: {session_id}"),
+                details,
+            ),
+        }
+    }
+
+    /// The opening `snapshot` frame for `session/follow`, as a plain value.
+    fn follow_snapshot_value(
+        &self,
+        session_id: &str,
+    ) -> Result<serde_json::Value, (&'static str, serde_json::Value)> {
+        let Some(s) = self.find(session_id) else {
+            return Err((
+                "session/not-found",
                 serde_json::json!({ "sessionId": session_id }),
-            );
+            ));
         };
-        let _max = get_f64(req, "maxMessages").unwrap_or(50.0) as usize;
         let rows = self.store.read_rows(&s.dir).unwrap_or_default();
         // Cursor = last durable seq: header + N events → last seq N-1; -1 when
         // the log is empty (mirrors dsh's "-1 allowed = empty log").
@@ -493,7 +556,7 @@ impl SessionMachine {
             records.push(serde_json::json!({ "type": "event", "event": row }));
         }
         let h = header;
-        rpc::ok(serde_json::json!({
+        Ok(serde_json::json!({
             "type": "snapshot",
             "header": {
                 "version": h.get("version").cloned().unwrap_or(FORMAT_VERSION.into()),
@@ -511,6 +574,70 @@ impl SessionMachine {
             "hasMore": false,
             "projections": { "asOfSeq": cursor, "values": {} },
         }))
+    }
+
+    /// One durable event broadcast to every live follow stream of `session_id`.
+    fn emit_follow_event(
+        &self,
+        session_id: &str,
+        event: &serde_json::Value,
+    ) -> Vec<MachineOut> {
+        let mut outs = Vec::new();
+        for (stream_id, followed) in &self.follow_streams {
+            if followed == session_id {
+                outs.push(rpc::stream_item(
+                    stream_id,
+                    serde_json::json!({ "type": "event", "event": event }),
+                ));
+            }
+        }
+        outs
+    }
+
+    /// Handle a `vocoder/session/stream/open` event.
+    fn stream_open(
+        &mut self,
+        stream_id: &str,
+        method: &str,
+        req: &serde_json::Value,
+    ) -> Vec<MachineOut> {
+        match method {
+            "follow" => {
+                let session_id = match address_session_id(req.get("address")) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        return vec![rpc::stream_error(stream_id, "RemoteError", e, None)];
+                    }
+                };
+                match self.follow_snapshot_value(&session_id) {
+                    Ok(snapshot) => {
+                        self.follow_streams
+                            .insert(stream_id.to_string(), session_id);
+                        vec![rpc::stream_item(stream_id, snapshot)]
+                    }
+                    Err((code, details)) => vec![rpc::stream_error(
+                        stream_id,
+                        "RemoteError",
+                        format!("no such session: {session_id} ({code})"),
+                        Some(details),
+                    )],
+                }
+            }
+            "control" => {
+                self.control_streams.push(stream_id.to_string());
+                let baseline = serde_json::json!({
+                    "type": "baseline",
+                    "value": { "queues": {}, "jobs": {}, "projections": {} },
+                });
+                vec![rpc::stream_item(stream_id, baseline)]
+            }
+            other => vec![rpc::stream_error(
+                stream_id,
+                "RemoteError",
+                format!("no such stream endpoint: session/{other}"),
+                None,
+            )],
+        }
     }
 
     fn control(&self) -> Vec<MachineOut> {
@@ -548,11 +675,13 @@ impl SessionMachine {
             "time": now_ms(),
             "data": { "title": normalized },
         });
-        if let Err(e) = self.persist_append(&s, &[event]) {
+        if let Err(e) = self.persist_append(&s, &[event.clone()]) {
             return rpc::err("gateway/internal", e);
         }
         self.state.entry(id.to_string()).or_default().title = Some(normalized.clone());
-        rpc::ok(serde_json::json!({ "title": normalized, "seq": seq }))
+        let mut outs = rpc::ok(serde_json::json!({ "title": normalized, "seq": seq }));
+        outs.append(&mut self.emit_follow_event(id, &event));
+        outs
     }
 
     fn prompt(&mut self, req: &serde_json::Value) -> Vec<MachineOut> {
@@ -596,9 +725,12 @@ impl SessionMachine {
                 "data": { "content": content },
                 "source": { "kind": "user", "rpcId": request_id },
             });
-            if let Err(e) = self.persist_append(&s, &[event]) {
+            if let Err(e) = self.persist_append(&s, &[event.clone()]) {
                 return rpc::err("gateway/internal", e);
             }
+            let mut outs = rpc::ok(serde_json::json!({ "accepted": true }));
+            outs.append(&mut self.emit_follow_event(id, &event));
+            return outs;
         }
         rpc::ok(serde_json::json!({ "accepted": true }))
     }
