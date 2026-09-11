@@ -4,6 +4,7 @@
 import { mkdir, readdir, writeFile } from 'node:fs/promises'
 import { join, relative } from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { extractSessionLog } from './session-log.ts'
 
 const DSH_SUBMODULE = 'dsh'
 
@@ -129,7 +130,9 @@ async function extract(dshRoot, specDir) {
 
 const meta = {
     generated: {
-      extractedAt: new Date().toISOString(),
+      // Deterministic: pinned to the submodule revision, not wall-clock time,
+      // so `just spec-check` fails only on real drift.
+      dshRevision: process.env.DSH_REVISION ?? 'unknown',
       dshSubmodule: DSH_SUBMODULE,
       packageCount: packages.length,
       endpointCount: endpoints.length,
@@ -162,6 +165,8 @@ const meta = {
     join(specDir, 'events', 'forwarded.json'),
     JSON.stringify({ version: 1, events: forwarded }, null, 2) + '\n',
   )
+
+  const sessionLog = await extractSessionLog(specDir)
 
   console.log(
     `extracted: ${endpoints.length} endpoints across ${packages.length} packages, ` +

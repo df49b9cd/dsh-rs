@@ -10,5 +10,5 @@ if [ ! -f "$DSH/packages/goal/goal/lib/typert.remote-client.js" ]; then
   (cd "$DSH" && pnpm install --frozen-lockfile --ignore-scripts && pnpm run build)
 fi
 
-(cd "$DSH" && node --import tsx/esm "$ROOT/tools/spec-extractor/extract.ts" --spec-dir "$ROOT/spec")
+(cd "$DSH" && DSH_REVISION="$(git -C "$DSH" rev-parse HEAD)" node --import tsx/esm "$ROOT/tools/spec-extractor/extract.ts" --spec-dir "$ROOT/spec")
 echo "spec/ updated from dsh@$(cd "$DSH" && git rev-parse --short HEAD)"

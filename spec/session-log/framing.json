@@ -3,8 +3,8 @@
   "source": "dsh/packages/session/session-persistence-jsonl/src/format.ts",
   "layout": {
     "root": "<sessions-root>/<projectDir>/<sessionDir>/",
-    "projectDir": "--<cwd with / \\ : replaced by -, truncated to 251 chars>-- or _no-cwd",
-    "sessionDir": "encodeSegment(sessionId): [A-Za-z0-9._-] literal; others ~(utf16 unit hex x4); '.' → ~002e, '..' → ~002e~002e"
+    "projectDir": "--<cwd with / \\ : collapsed to single -, unsafe units ~XXXX, truncated to 251 chars after leading - strip>-- or _no-cwd",
+    "sessionDir": "encodeSegment(sessionId): [A-Za-z0-9._-] literal; others ~XXXX (utf16 code unit hex, uppercase); '.' → ~002E, '..' → ~002E~002E"
   },
   "generations": {
     "filename": "session[.vN].jsonl[.zstd] where v0 = session.jsonl, vN≥1 = session.vN.jsonl",
@@ -23,9 +23,24 @@
   },
   "header": {
     "row": 0,
-    "requiredKeys": ["type", "version", "id", "createdAt", "isSeeded", "delegationDepth"],
-    "optionalKeys": ["cwd", "parentSession", "origin", "agentPreset"],
-    "forbiddenKeys": ["sandboxMode", "approvalPolicy"],
+    "requiredKeys": [
+      "type",
+      "version",
+      "id",
+      "createdAt",
+      "isSeeded",
+      "delegationDepth"
+    ],
+    "optionalKeys": [
+      "cwd",
+      "parentSession",
+      "origin",
+      "agentPreset"
+    ],
+    "forbiddenKeys": [
+      "sandboxMode",
+      "approvalPolicy"
+    ],
     "shape": {
       "type": "literal 'session'",
       "version": "non-negative integer",
@@ -41,9 +56,43 @@
     "seededRule": "a seeded header (isSeeded:true) must be accompanied by a session/end-seed event whose handle.inheritedEventCount records the inherited prefix length; unseeded implies 0"
   },
   "event": {
-    "requiredKeys": ["type", "seq", "time", "data"],
-    "optionalKeys": ["ignorable", "sourceEventSeqs", "surfaceOp"],
+    "requiredKeys": [
+      "type",
+      "seq",
+      "time",
+      "data"
+    ],
+    "optionalKeys": [
+      "ignorable",
+      "sourceEventSeqs",
+      "surfaceOp"
+    ],
     "seqRule": "dense 0-based, contiguous from the first row after the header",
     "surfaceOp": "'append' or {op:'replace', startSeq, endSeq}"
+  },
+  "probes": {
+    "encodeSegment": {
+      ".": "~002E",
+      "..": "~002E~002E",
+      "plain-Id_1.2": "plain-Id_1.2",
+      "a/b\\c:d": "a~002Fb~005Cc~003Ad",
+      "~": "~007E",
+      "é": "~00E9"
+    },
+    "projectKey": {
+      "/home/u/proj": "--home-u-proj--",
+      "C:\\Users\\u": "--C-Users-u--",
+      "/": "--root--",
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": "--aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa--"
+    },
+    "logSuffix": {
+      "zstd": ".jsonl.zstd",
+      "none": ".jsonl"
+    },
+    "generationLogFilename": {
+      "v0z": "session.jsonl.zstd",
+      "v0p": "session.jsonl",
+      "v3z": "session.v3.jsonl.zstd"
+    }
   }
 }
