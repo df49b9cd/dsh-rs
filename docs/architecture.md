@@ -80,7 +80,20 @@ has no event vocabulary of its own it stays a function, not a machine.
 - **Codecs** are the classic Sans-I/O case: `fn decode(&[u8]) -> Vec<Frame>`,
   `fn encode(Frame) -> Bytes`. Fuzzable, no I/O.
 - **Machines** are the novel application: each dsh capability becomes one.
-- **Driver + router** are deliberately thin (~200–400 lines target).
+- **Router** is itself a machine (see below).
+- **Driver** is the only async code (~40 lines), realizing `RouteOut::Realize`.
+
+## Router-as-machine
+
+The router is a `PluginMachine` too: `handle(RouteIn) -> Vec<RouteOut>`.
+Waterfalls and bails run synchronously inside one router step (matching
+Cordis's synchronous `waterfall`); their chains are expressed as
+`WaterfallTurn`/`WaterfallNext`/`WaterfallReturn` envelopes rather than
+closures, so they stay serializable and replayable. Delivery is
+breadth-first to quiescence, capped by `MAX_DELIVERIES_PER_STEP` (the
+ping-pong guard; Cordis's loop guards play the same role). Disposal walks a
+machine's outstanding `Compensate` outputs — saga compensation collection.
+Scoped compositions are routers mounted into parent routers.
 
 ## External plugins
 
