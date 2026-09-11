@@ -1,0 +1,81 @@
+{
+  "version": 1,
+  "events": [
+    {
+      "event": "agent-preset/selected",
+      "mode": "emit"
+    },
+    {
+      "event": "approval/request",
+      "mode": "waterfall"
+    },
+    {
+      "event": "api-session/activity",
+      "mode": "emit"
+    },
+    {
+      "event": "api-session/added",
+      "mode": "emit"
+    },
+    {
+      "event": "api-session/error",
+      "mode": "emit"
+    },
+    {
+      "event": "api-session/removed",
+      "mode": "emit"
+    },
+    {
+      "event": "api-session/status",
+      "mode": "emit"
+    },
+    {
+      "event": "commands/change",
+      "mode": "emit"
+    },
+    {
+      "event": "credentials/reference-updated",
+      "mode": "emit"
+    },
+    {
+      "event": "goal/activation-changed",
+      "mode": "emit"
+    },
+    {
+      "event": "cordis/request-run",
+      "mode": "emit"
+    },
+    {
+      "event": "cordis/request-run-resolved",
+      "mode": "emit"
+    },
+    {
+      "event": "cordis/dynamic-package",
+      "mode": "emit"
+    },
+    {
+      "event": "cordis/dynamic-retract",
+      "mode": "emit"
+    },
+    {
+      "event": "cordis/inspect-query",
+      "mode": "emit"
+    },
+    {
+      "event": "cordis/inspect-query-resolved",
+      "mode": "emit"
+    },
+    {
+      "event": "llm/adapters-updated",
+      "mode": "emit"
+    },
+    {
+      "event": "settings/document-updated",
+      "mode": "emit"
+    },
+    {
+      "event": "user-questions/request",
+      "mode": "waterfall"
+    }
+  ]
+}

@@ -1,0 +1,74 @@
+{
+  "packages": [
+    {
+      "name": "@deepseek-ai/dsh-agent-presets",
+      "path": "packages/preset/agent-presets/lib/typert.remote-client.js"
+    },
+    {
+      "name": "@deepseek-ai/dsh-api-session-controller",
+      "path": "packages/api/session-controller/lib/typert.remote-client.js"
+    },
+    {
+      "name": "@deepseek-ai/dsh-api-settings-controller",
+      "path": "packages/api/settings-controller/lib/typert.remote-client.js"
+    },
+    {
+      "name": "@deepseek-ai/dsh-api-workspace-controller",
+      "path": "packages/api/workspace-controller/lib/typert.remote-client.js"
+    },
+    {
+      "name": "@deepseek-ai/dsh-api-workspace-files",
+      "path": "packages/api/workspace-files/lib/typert.remote-client.js"
+    },
+    {
+      "name": "@deepseek-ai/dsh-client-file-upload",
+      "path": "packages/client/file-upload/lib/typert.remote-client.js"
+    },
+    {
+      "name": "@deepseek-ai/dsh-command-feedback",
+      "path": "packages/feedback/command-feedback/lib/typert.remote-client.js"
+    },
+    {
+      "name": "@deepseek-ai/dsh-commands",
+      "path": "packages/interaction/commands/lib/typert.remote-client.js"
+    },
+    {
+      "name": "@deepseek-ai/dsh-cordis-host-runner",
+      "path": "packages/extensions/cordis-host-runner/lib/typert.remote-client.js"
+    },
+    {
+      "name": "@deepseek-ai/dsh-experimental-agent-team",
+      "path": "packages/experimental/agent-team/lib/typert.remote-client.js"
+    },
+    {
+      "name": "@deepseek-ai/dsh-goal",
+      "path": "packages/goal/goal/lib/typert.remote-client.js"
+    },
+    {
+      "name": "@deepseek-ai/dsh-host-plugin-inventory",
+      "path": "packages/host/plugin-inventory/lib/typert.remote-client.js"
+    },
+    {
+      "name": "@deepseek-ai/dsh-llm",
+      "path": "packages/llm/llm/lib/typert.remote-client.js"
+    },
+    {
+      "name": "@deepseek-ai/dsh-message-feedback",
+      "path": "packages/feedback/message-feedback/lib/typert.remote-client.js"
+    },
+    {
+      "name": "@deepseek-ai/dsh-session-reference",
+      "path": "packages/context/session-reference/lib/typert.remote-client.js"
+    },
+    {
+      "name": "@deepseek-ai/dsh-subagent",
+      "path": "packages/subagent/subagent/lib/typert.remote-client.js"
+    }
+  ],
+  "generated": {
+    "extractedAt": "2026-09-11T09:31:29.784Z",
+    "dshSubmodule": "dsh",
+    "packageCount": 16,
+    "endpointCount": 87
+  }
+}

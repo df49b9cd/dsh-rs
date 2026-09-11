@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# Extract spec/ FROM the pinned dsh/ submodule. Idempotent; run after bumping dsh.
+# Extract spec/ FROM the pinned dsh/ submodule's build artifacts.
+# Requires dsh/ to be built at least once (`cd dsh && pnpm install && pnpm run build`).
 set -euo pipefail
-cd "$(dirname "$0")/.."
-DSH_DIR="${DSH_DIR:-dsh}"
-echo ">> preparing dsh workspace in dsh/"
-(cd "$DSH_DIR" && pnpm install --frozen-lockfile --silent)
-echo ">> extracting spec"
-(cd "$DSH_DIR" && node --import tsx/esm ../tools/spec-extractor/extract.ts --spec-dir ../spec)
-echo ">> done"
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+DSH="$ROOT/dsh"
+
+if [ ! -f "$DSH/packages/goal/goal/lib/typert.remote-client.js" ]; then
+  echo "dsh build artifacts not found; building dsh..." >&2
+  (cd "$DSH" && pnpm install --frozen-lockfile --ignore-scripts && pnpm run build)
+fi
+
+(cd "$DSH" && node --import tsx/esm "$ROOT/tools/spec-extractor/extract.ts" --spec-dir "$ROOT/spec")
+echo "spec/ updated from dsh@$(cd "$DSH" && git rev-parse --short HEAD)"
