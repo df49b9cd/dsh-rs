@@ -130,13 +130,14 @@ impl SessionStore {
         vocoder_session::read_generation(&path).map_err(|e| e.to_string())
     }
 
-    /// Write a full new-generation snapshot (v3, uncompressed for now).
+    /// Write a full new-generation snapshot. Physical encoding matches dsh's
+    /// default: zstd-compressed frames (framing.json defaultCompression).
     pub fn write_generation(&self, dir: &Path, rows: &[serde_json::Value]) -> Result<(), String> {
         let next = vocoder_session::latest_generation(dir)
             .map_err(|e| e.to_string())?
             .map(|v| v + 1)
             .unwrap_or(0);
-        vocoder_session::write_generation(dir, rows, next, false).map_err(|e| e.to_string())?;
+        vocoder_session::write_generation(dir, rows, next, true).map_err(|e| e.to_string())?;
         Ok(())
     }
 }
@@ -948,17 +949,21 @@ mod tests {
     use super::*;
     use vocoder_cordis::EventName;
 
-    fn machine() -> (tempfile::TempDir, SessionMachine) {
+    fn machine() -> (
+        tempfile::TempDir,
+        SessionMachine,
+        std::sync::Arc<crate::registry::WorkspaceRegistryStore>,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let registry = crate::registry::WorkspaceRegistryStore::open(dir.path());
-        let m = SessionMachine::new(dir.path().join("sessions"), registry);
-        (dir, m)
+        let m = SessionMachine::new(dir.path().join("sessions"), registry.clone());
+        (dir, m, registry)
     }
 
     #[test]
     fn create_with_workspace_id_resolves_and_attaches() {
-        let (dir, mut m) = machine();
-        let registry = crate::registry::WorkspaceRegistryStore::open(dir.path());
+        let (dir, mut m, registry) = machine();
+        // The daemon shares one registry across both machines — mirror that.
         let mut w = crate::machines::workspace::WorkspaceMachine::new(
             registry,
             dir.path().join("sessions"),
@@ -1009,7 +1014,7 @@ mod tests {
 
     #[test]
     fn create_list_rename_flow() {
-        let (_dir, mut m) = machine();
+        let (_dir, mut m, _registry) = machine();
         let r = call(&mut m, "create", serde_json::json!({"request": {"cwd": "/tmp/x"}}));
         assert!(r["ok"].as_bool().unwrap());
         let id = r["value"]["sessionId"].as_str().unwrap().to_string();
@@ -1026,7 +1031,7 @@ mod tests {
 
     #[test]
     fn prompt_then_page_and_search() {
-        let (_dir, mut m) = machine();
+        let (_dir, mut m, _registry) = machine();
         let r = call(&mut m, "create", serde_json::json!({"request": {"cwd": "/tmp/y"}}));
         let id = r["value"]["sessionId"].as_str().unwrap().to_string();
         let p = call(&mut m, "prompt", serde_json::json!({"request": {
@@ -1055,7 +1060,7 @@ mod tests {
 
     #[test]
     fn unknown_session_is_not_found() {
-        let (_dir, mut m) = machine();
+        let (_dir, mut m, _registry) = machine();
         let r = call(&mut m, "rename", serde_json::json!({"request": {"sessionId": "nope", "title": "t"}}));
         assert_eq!(r["error"]["code"], "session/not-found");
     }

@@ -2,15 +2,113 @@
 //!   <home>/settings.json  — { "<ns>": <user section>, ... }
 //!
 //! Multi-layer resolution mirrors dsh: value = deep-merge(base?, user).
-//! Schemas ship empty until spec/schemas gain namespace defaults; the wire
-//! view reports them exactly like dsh's SettingsNamespaceView so the
-//! frontend renders correctly.
+//! The namespace catalog (schemas, applies, secret paths) ships from
+//! `catalog()` below — the settings-controller wire shape is from
+//! dsh/packages/api/settings-controller (SettingsNamespaceView):
+//! {ns, schema, value, base?, user?, applies, secrets:[{path,set}], revision}.
+//! Secret paths are declared per catalog entry and projected after
+//! redaction.
 
 use std::path::PathBuf;
 
 use vocoder_cordis::{MachineIn, MachineOut, PluginMachine};
 
 use crate::rpc;
+
+/// One catalog entry: a namespace the host knows, its schema (empty until
+/// spec/schemas carry namespace shapes), and declared secret paths
+/// (JSON-pointer-ish dotted paths whose values appear redacted).
+struct CatalogEntry {
+    ns: &'static str,
+    schema: &'static str,
+    /// Secret field selectors, e.g. "providers.anthropic.apiKey".
+    secrets: &'static [&'static str],
+}
+
+/// The built-in namespaces vocoderd knows. The wire vocabulary is dsh's;
+/// entries here exist so `describe` returns them even before a write and
+/// so `secrets` redaction has a declared home. LLM provider credentials are
+/// the only secret-bearing surface today (M4 wires the live catalog).
+fn catalog() -> &'static [CatalogEntry] {
+    &[
+        CatalogEntry {
+            ns: "llm",
+            schema: "llm",
+            secrets: &["providers"],
+        },
+        CatalogEntry {
+            ns: "subagent-model-selection",
+            schema: "subagent-model-selection",
+            secrets: &[],
+        },
+        CatalogEntry {
+            ns: "agent-default-model",
+            schema: "agent-default-model",
+            secrets: &[],
+        },
+        CatalogEntry {
+            ns: "ui",
+            schema: "ui",
+            secrets: &[],
+        },
+    ]
+}
+
+/// Does `path` (dot-separated segments) match a declared secret selector
+/// (prefix match: a provider-level secret applies to everything beneath)?
+fn secret_match(selector: &str, path: &str) -> bool {
+    path == selector || path.starts_with(&format!("{selector}."))
+}
+
+/// Collect {"path": [...segments], "set": bool} entries for every declared
+/// secret in a section value.
+fn redacted_secrets(entry: &CatalogEntry, value: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for sel in entry.secrets {
+        let mut found = false;
+        let mut cur = value;
+        for seg in sel.split('.') {
+            match cur.get(seg) {
+                Some(next) => cur = next,
+                None => {
+                    cur = &serde_json::Value::Null;
+                    found = false;
+                    break;
+                }
+            }
+            found = true;
+        }
+        out.push(serde_json::json!({
+            "path": sel.split('.').collect::<Vec<_>>(),
+            "set": found && !cur.is_null(),
+        }));
+    }
+    out
+}
+
+/// Deep-redact a section: any string value under a secret selector path is
+/// replaced by null (dsh never ships secret material to the wire).
+fn redact_section(entry: &CatalogEntry, value: &serde_json::Value) -> serde_json::Value {
+    fn walk(v: &serde_json::Value, path: &mut Vec<String>, selectors: &[&str]) -> serde_json::Value {
+        let here = path.join(".");
+        if selectors.iter().any(|s| secret_match(s, &here)) && !v.is_object() && !v.is_array() {
+            return serde_json::Value::Null;
+        }
+        match v {
+            serde_json::Value::Object(map) => {
+                let mut out = serde_json::Map::new();
+                for (k, val) in map {
+                    path.push(k.clone());
+                    out.insert(k.clone(), walk(val, path, selectors));
+                    path.pop();
+                }
+                serde_json::Value::Object(out)
+            }
+            other => other.clone(),
+        }
+    }
+    walk(value, &mut Vec::new(), entry.secrets)
+}
 
 #[derive(Default)]
 struct Document {
@@ -74,14 +172,26 @@ impl SettingsMachine {
         }
         rpc::deep_merge(&mut value, &user);
         let revision = self.document.revisions.get(ns).copied().unwrap_or(0);
+        let entry = catalog().into_iter().find(|e| e.ns == ns);
+        // Secret material is never shipped: redact in both value and user
+        // projections and report redaction slots separately.
+        let (value, user, secrets) = match entry {
+            Some(e) => {
+                let redacted_value = redact_section(e, &value);
+                let redacted_user = redact_section(e, &user);
+                let secrets = redacted_secrets(e, &value);
+                (redacted_value, redacted_user, secrets)
+            }
+            None => (value, user, Vec::new()),
+        };
         serde_json::json!({
             "ns": ns,
-            "schema": {},
+            "schema": entry.map(|e| serde_json::json!({"$catalogSchema": e.schema})).unwrap_or_else(|| serde_json::json!({})),
             "value": value,
             "base": base,
             "user": if user.is_object() && !user.as_object().unwrap().is_empty() { Some(user) } else { None },
             "applies": "live",
-            "secrets": [],
+            "secrets": secrets,
             "revision": revision,
         })
     }
