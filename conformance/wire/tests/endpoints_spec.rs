@@ -1,0 +1,196 @@
+// Per-endpoint unary RPC conformance cells generated mechanically from
+// spec/typert/remote.json. For every unary endpoint on live namespaces we
+// exercise:
+//   1. malformed envelope     → gateway/bad-request
+//   2. unknown method         → gateway/bad-request (or a namespaced error)
+//   3. empty-args call        → well-formed server-response envelope
+//      (no timeout, no HTML error page; result may be ok or a RemoteError)
+// Stream endpoints (mode:"stream") are covered by streams_spec.rs instead.
+//
+// Run against either host: CONFORMANCE_BASE_URL=http://127.0.0.1:PORT.
+
+use serde_json::json;
+
+fn base_url() -> String {
+    std::env::var("CONFORMANCE_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:3080".into())
+}
+
+fn uuid() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static C: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "{:x}-{:x}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        C.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+/// Namespaces the candidate host implements today. Generated cells skip
+/// anything outside this set; as machines land, extend the set.
+const LIVE_NAMESPACES: &[&str] = &[
+    "goals",
+    "session",
+    "workspace",
+    "settings",
+];
+
+struct Endpoint {
+    namespace: String,
+    method: String,
+    mode: String,
+}
+
+fn load_endpoints() -> Vec<Endpoint> {
+    // spec/ is resolved relative to the workspace root; the test binary's
+    // cwd is conformance/wire, hence ../../spec.
+    let text = std::fs::read_to_string("../../spec/typert/remote.json")
+        .expect("spec/typert/remote.json readable");
+    let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+    doc["endpoints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| Endpoint {
+            namespace: e["namespace"].as_str().unwrap().to_string(),
+            method: e["method"].as_str().unwrap().to_string(),
+            mode: e["mode"].as_str().unwrap_or("unary").to_string(),
+        })
+        .collect()
+}
+
+async fn post_raw(path: &str, body: &serde_json::Value) -> (u16, serde_json::Value) {
+    let res = reqwest::Client::new()
+        .post(format!("{}/api/{}", base_url(), path))
+        .json(body)
+        .send()
+        .await
+        .unwrap();
+    let status = res.status().as_u16();
+    let v: serde_json::Value = res
+        .json()
+        .await
+        .unwrap_or_else(|_| serde_json::json!({"__nonJson": true}));
+    (status, v)
+}
+
+async fn call(method: &str, args: serde_json::Value) -> serde_json::Value {
+    let (_, v) = post_raw(
+        method,
+        &json!({
+            "type": "client-request",
+            "rpcId": format!("cell-{}", uuid()),
+            "method": method,
+            "payload": { "args": args },
+        }),
+    )
+    .await;
+    v
+}
+
+#[tokio::test]
+async fn malformed_envelope_yields_bad_request() {
+    let (_, v) = post_raw("session/list", &json!({"not": "an envelope"})).await;
+    // Gateway error: a well-formed failure envelope.
+    assert_eq!(v["type"], "server-response", "{v}");
+    assert_eq!(v["result"]["ok"], false, "{v}");
+    assert_eq!(v["result"]["error"]["code"], "gateway/bad-request", "{v}");
+}
+
+#[tokio::test]
+async fn unknown_method_errors_typed() {
+    let v = call("session/noSuchMethod", json!({})).await;
+    assert_eq!(v["type"], "server-response", "{v}");
+    assert_eq!(v["result"]["ok"], false, "{v}");
+    let code = v["result"]["error"]["code"].as_str().unwrap_or_default();
+    assert!(
+        code.starts_with("gateway/") || code.starts_with("session/"),
+        "unexpected code {code}: {v}"
+    );
+}
+
+/// The generated per-endpoint matrix: for every unary endpoint in a live
+/// namespace, the envelope round-trips with ok-or-typed-error (never a
+/// 5xx, never HTML, never a hang).
+#[tokio::test]
+async fn every_unary_endpoint_answers_typed_envelope() {
+    let endpoints = load_endpoints();
+    let mut failures: Vec<String> = Vec::new();
+    let mut covered = 0usize;
+    for ep in endpoints
+        .iter()
+        .filter(|e| LIVE_NAMESPACES.contains(&e.namespace.as_str()) && e.mode != "stream")
+    {
+        covered += 1;
+        let method = format!("{}/{}", ep.namespace, ep.method);
+        let v = call(&method, json!({})).await;
+        if v["type"] != "server-response" {
+            failures.push(format!("{method}: not a server-response: {v}"));
+            continue;
+        }
+        let result = &v["result"];
+        match result["ok"].as_bool() {
+            Some(true) => {
+                if !result.get("value").is_some() {
+                    failures.push(format!("{method}: ok without value: {v}"));
+                }
+            }
+            Some(false) => {
+                let code = result["error"]["code"].as_str().unwrap_or_default();
+                if code.is_empty() {
+                    failures.push(format!("{method}: error without code: {v}"));
+                }
+                if result["error"]["message"].as_str().is_none_or(str::is_empty) {
+                    failures.push(format!("{method}: error without message: {v}"));
+                }
+            }
+            None => failures.push(format!("{method}: result lacks ok: {v}")),
+        }
+    }
+    assert!(covered >= 20, "expected ≥20 live unary endpoints, saw {covered}");
+    assert!(failures.is_empty(), "cell failures:\n{}", failures.join("\n"));
+}
+
+/// Error-detail shape: known conflict cases carry structured details.
+#[tokio::test]
+async fn error_detail_shape_session_not_found() {
+    // prompt an unknown session → session/not-found + details.sessionId
+    let v = call(
+        "session/prompt",
+        json!({ "request": {
+            "sessionId": format!("missing-{}", uuid()),
+            "requestId": "r1",
+            "content": [{ "type": "text", "text": "hi" }],
+        } }),
+    )
+    .await;
+    assert_eq!(v["result"]["ok"], false, "{v}");
+    assert_eq!(v["result"]["error"]["code"], "session/not-found", "{v}");
+    assert!(
+        v["result"]["error"]["details"]["sessionId"].is_string(),
+        "details.sessionId expected: {v}"
+    );
+}
+
+#[tokio::test]
+async fn settings_conflict_details() {
+    // Seed a namespace so revision 1 exists, then write with a stale
+    // expectedRevision → settings/conflict with {ns, expected, actual}.
+    let ns = format!("cell-{}", uuid());
+    let v1 = call(
+        "settings/update",
+        json!({ "ns": ns, "patch": { "k": 1 } }),
+    )
+    .await;
+    assert_eq!(v1["result"]["ok"], true, "{v1}");
+    let v2 = call(
+        "settings/update",
+        json!({ "ns": ns, "patch": { "k": 2 }, "expectedRevision": 99 }),
+    )
+    .await;
+    assert_eq!(v2["result"]["error"]["code"], "settings/conflict", "{v2}");
+    assert_eq!(v2["result"]["error"]["details"]["ns"], serde_json::json!(ns));
+    assert!(v2["result"]["error"]["details"]["actual"].is_number());
+}
