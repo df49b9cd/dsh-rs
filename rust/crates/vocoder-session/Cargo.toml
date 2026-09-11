@@ -1,0 +1,16 @@
+[package]
+name = "vocoder-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Session log on disk: JSONL[.zstd] generations, adjacent migration seam, interop with dsh snapshots"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true

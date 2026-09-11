@@ -5,6 +5,7 @@ members = [
     "crates/vocoder-spec-api",
     "crates/vocoder-cordis",
     "crates/vocoder-typert",
+    "crates/vocoder-session",
 ]
 # tools/codegen joins as vocoder-codegen in M0 wiring.
 
