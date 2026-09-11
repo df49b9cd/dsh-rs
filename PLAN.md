@@ -22,7 +22,7 @@ match its own spec), the Rust host as candidate.
 - [ ] `tools/spec-extractor` real implementation: live Typert descriptors +
   error codes + lookup/context maps + forwarded events → `spec/typert|events`
 - [ ] Schema dump: per-payload Zod → JSON Schema → `spec/schemas/`
-- [ ] Session-log spec: framing constants + migration matrix → `spec/session-log/`
+- [x] Session-log spec: framing constants + migration matrix → `spec/session-log/` (extractor: `tools/spec-extractor/session-log.ts` with dsh-behavior probes)
 - [ ] `vocoder-cordis` crate: `PluginMachine` trait, router, tokio driver
 - [ ] `harness/runners/` control-host runner working (`dsh` boots)
 - [ ] `conformance/wire` first real cell green against control
