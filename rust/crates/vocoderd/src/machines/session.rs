@@ -1107,4 +1107,16 @@ mod tests {
         assert_eq!(SessionStore::encode_segment(".."), "~2e~2e");
         assert_eq!(SessionStore::encode_segment("a/b"), "a~002fb");
     }
+
+    #[test]
+    fn composition_trace_replays_create_prompt_rename() {
+        let trace_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../conformance/composition-replay/trace/session.jsonl");
+        let text = std::fs::read_to_string(&trace_path)
+            .expect("session trace committed under conformance/composition-replay/trace/");
+        let (_dir, mut m, _registry) = machine();
+        let mut vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let steps = crate::composition::replay_trace(&mut m, &text, &mut vars);
+        assert!(steps >= 5, "trace too thin: {steps} steps");
+    }
 }

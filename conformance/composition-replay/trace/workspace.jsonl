@@ -1,0 +1,8 @@
+{"kind":"in","event":"vocoder/workspace/call","payload":{"method":"create","args":{"request":{"path":"$WD"}}},"expect":{"result":"ok","capture":{"WS":"workspace.workspaceId"}}}
+{"kind":"in","event":"vocoder/workspace/call","payload":{"method":"create","args":{"request":{"path":"$WD"}}},"expect":{"result":"ok"}}
+{"kind":"in","event":"vocoder/workspace/call","payload":{"method":"rename","args":{"request":{"workspaceId":"$WS","title":"Renamed WS"}}},"expect":{"result":"ok"}}
+{"kind":"in","event":"vocoder/workspace/call","payload":{"method":"rename","args":{"request":{"workspaceId":"$WS","title":"   "}}},"expect":{"result":"err","code":"gateway/bad-request"}}
+{"kind":"in","event":"vocoder/workspace/call","payload":{"method":"rename","args":{"request":{"workspaceId":"nope","title":"x"}}},"expect":{"result":"err","code":"workspace/not-found"}}
+{"kind":"in","event":"vocoder/workspace/call","payload":{"method":"follow","args":{}},"expect":{"result":"ok"}}
+{"kind":"in","event":"vocoder/workspace/call","payload":{"method":"delete","args":{"request":{"workspaceId":"$WS"}}},"expect":{"result":"ok"}}
+{"kind":"in","event":"vocoder/workspace/call","payload":{"method":"delete","args":{"request":{"workspaceId":"$WS"}}},"expect":{"result":"err","code":"workspace/not-found"}}

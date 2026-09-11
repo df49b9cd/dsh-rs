@@ -417,3 +417,38 @@ impl WorkspaceMachine {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Composition-replay for the workspace machine: a golden trace of
+    //! (input event, expected outputs) pairs, replayed through the machine.
+    //! The trace lives in conformance/composition-replay/trace/workspace.jsonl;
+    //! regenerating it (against the JS host's instrumented plugin bus) swaps
+    //! golden rows without touching this test.
+    use super::*;
+
+    fn machine() -> (tempfile::TempDir, WorkspaceMachine) {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = crate::registry::WorkspaceRegistryStore::open(dir.path());
+        let sessions = dir.path().join("sessions");
+        (dir, WorkspaceMachine::new(registry, sessions))
+    }
+
+    #[test]
+    fn composition_trace_replays_create_rename_delete() {
+        let trace_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../conformance/composition-replay/trace/workspace.jsonl");
+        let text = std::fs::read_to_string(&trace_path)
+            .expect("workspace trace committed under conformance/composition-replay/trace/");
+
+        let (_home, mut m) = machine();
+        let wd = tempfile::tempdir().unwrap();
+        let wd_path: String = wd.path().canonicalize().unwrap().to_string_lossy().into();
+
+        let mut vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        vars.insert("WD".into(), wd_path);
+
+        let steps = crate::composition::replay_trace(&mut m, &text, &mut vars);
+        assert!(steps >= 5, "trace too thin: {steps} steps");
+    }
+}

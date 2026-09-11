@@ -3,6 +3,8 @@
 mod machines;
 mod registry;
 mod rpc;
+#[cfg(test)]
+mod composition;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
