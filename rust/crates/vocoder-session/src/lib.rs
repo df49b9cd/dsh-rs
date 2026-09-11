@@ -162,6 +162,43 @@ pub fn read_generation(path: &Path) -> Result<Vec<serde_json::Value>, SessionErr
     Ok(rows)
 }
 
+/// Serialize one row exactly as dsh writes it: JSON with integral floats
+/// rendered without a fraction (e.g. 123 not 123.0). dsh parses numbers with
+/// JSON.parse so spellings are semantically equal, but byte parity keeps
+/// snapshot diffs clean.
+pub fn row_to_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Number(n) => {
+            if let Some(f) = n.as_f64()
+                && n.is_f64()
+                && f.fract() == 0.0
+                && f.abs() < 9.007_199_254_740_992e15
+            {
+                return format!("{f:.0}");
+            }
+            n.to_string()
+        }
+        serde_json::Value::Array(items) => {
+            let parts: Vec<String> = items.iter().map(row_to_json).collect();
+            format!("[{}]", parts.join(","))
+        }
+        serde_json::Value::Object(map) => {
+            let parts: Vec<String> = map
+                .iter()
+                .map(|(k, v)| {
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(k).expect("map key"),
+                        row_to_json(v)
+                    )
+                })
+                .collect();
+            format!("{{{}}}", parts.join(","))
+        }
+        other => serde_json::to_string(other).expect("JSON value serializes"),
+    }
+}
+
 /// Write one generation atomically (tmp + rename) into `dir`.
 pub fn write_generation(
     dir: &Path,
@@ -183,14 +220,14 @@ pub fn write_generation(
         if compress {
             let mut enc = zstd::stream::write::Encoder::new(std::fs::File::create(&tmp)?, 3)?;
             for row in rows {
-                enc.write_all(&serde_json::to_vec(row)?)?;
+                enc.write_all(row_to_json(row).as_bytes())?;
                 enc.write_all(b"\n")?;
             }
             enc.finish()?; // completes the frame and flushes
         } else {
             let mut out = std::fs::File::create(&tmp)?;
             for row in rows {
-                out.write_all(&serde_json::to_vec(row)?)?;
+                out.write_all(row_to_json(row).as_bytes())?;
                 out.write_all(b"\n")?;
             }
             out.flush()?;

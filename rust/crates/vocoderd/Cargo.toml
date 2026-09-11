@@ -11,6 +11,7 @@ vocoder-cordis = { path = "../vocoder-cordis" }
 vocoder-typert = { path = "../vocoder-typert" }
 parking_lot = "0.12"
 vocoder-spec-api = { path = "../vocoder-spec-api" }
+vocoder-session = { path = "../vocoder-session" }
 anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true
@@ -21,3 +22,6 @@ tower-http = { workspace = true, features = ["fs", "trace"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 zstd.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,6 +1,7 @@
 //! vocoderd — the Rust web host. Thin async driver over the Sans-I/O core.
 
 mod machines;
+mod rpc;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -73,14 +74,34 @@ async fn main() -> Result<()> {
     let Cmd::Serve(args) = Cmd::parse();
     info!(home = ?args.home, spec = ?args.spec, "vocoderd starting");
 
+    let sessions_root = args.home.join("sessions");
+
     let mut initial_router = Router::new();
     // Business machines mounted at boot (M3+: from profile composition).
     initial_router.handle(RouteIn::Mount {
         id: MachineId::new("goals"),
-        machine: Box::new(crate::machines::GoalsMachine::default()),
+        machine: Box::new(crate::machines::goals::GoalsMachine::default()),
+    });
+    initial_router.handle(RouteIn::Mount {
+        id: MachineId::new("session"),
+        machine: Box::new(crate::machines::session::SessionMachine::new(sessions_root.clone())),
+    });
+    initial_router.handle(RouteIn::Mount {
+        id: MachineId::new("workspace"),
+        machine: Box::new(crate::machines::workspace::WorkspaceMachine::new(
+            &args.home,
+            sessions_root.clone(),
+        )),
+    });
+    initial_router.handle(RouteIn::Mount {
+        id: MachineId::new("settings"),
+        machine: Box::new(crate::machines::settings::SettingsMachine::new(&args.home)),
     });
     let mut registry = vocoder_typert::dispatch::NamespaceRegistry::new();
     registry_owner_register(&mut registry, "goals", "goals");
+    registry_owner_register(&mut registry, "session", "session");
+    registry_owner_register(&mut registry, "workspace", "workspace");
+    registry_owner_register(&mut registry, "settings", "settings");
 
     let state = Arc::new(AppState {
         router: Mutex::new(initial_router),
@@ -247,16 +268,13 @@ async fn api_rpc(
     let outs = state.router.lock().handle(RouteIn::Deliver {
         to: owner_id.clone(),
         ev: MachineIn::Event {
-            name: EventName::new("vocoder/goals/call"),
+            name: EventName::new(crate::rpc::call_event(&namespace)),
             payload: serde_json::json!({
-                "agentId": req.payload.get("agent").cloned().unwrap_or(serde_json::Value::Null),
                 "method": method,
                 "args": req.payload.get("args").cloned().unwrap_or(serde_json::Value::Null),
             }),
         },
     });
-    // TODO(M2+): generalize to Dispatch { namespace, method, args } dispatched
-    // via the registry; for now goals is the proving namespace.
     let _ = owner_id;
 
     for out in outs {
