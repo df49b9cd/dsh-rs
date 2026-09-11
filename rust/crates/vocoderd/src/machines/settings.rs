@@ -257,15 +257,18 @@ impl PluginMachine for SettingsMachine {
 
         match method {
             "describe" => {
-                let namespaces: Vec<serde_json::Value> = self
+                // Catalog namespaces are visible even before any write, so
+                // the client can render known surfaces on first boot.
+                let mut names: std::collections::BTreeSet<String> = self
                     .document
                     .sections
                     .keys()
-                    .chain(self.bases.keys())
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .into_iter()
-                    .map(|ns| self.view_of(ns))
+                    .cloned()
                     .collect();
+                names.extend(self.bases.keys().cloned());
+                names.extend(catalog().iter().map(|e| e.ns.to_string()));
+                let namespaces: Vec<serde_json::Value> =
+                    names.iter().map(|ns| self.view_of(ns)).collect();
                 rpc::ok(serde_json::json!({
                     "writable": true,
                     "hasDocument": self.file.exists(),
@@ -353,14 +356,23 @@ mod tests {
     fn update_replace_conflict_flow() {
         let home = tempfile::tempdir().unwrap();
         let mut m = SettingsMachine::new(home.path());
-        let describe0 = call(&mut m, "describe", serde_json::json!({}));
-        assert!(describe0["value"]["namespaces"].as_array().unwrap().is_empty());
-
         let v = call(&mut m, "update", serde_json::json!({
             "ns": "ui", "patch": {"theme": {"mode": "dark"}}
         }));
         assert_eq!(v["value"]["revision"], 1);
         assert_eq!(v["value"]["value"]["theme"]["mode"], "dark");
+
+        let describe0 = call(&mut m, "describe", serde_json::json!({}));
+        let ns_names: Vec<&str> = describe0["value"]["namespaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|n| n["ns"].as_str())
+            .collect();
+        // catalog namespaces are visible pre-write; "ui" appears after write
+        for known in ["llm", "ui", "agent-default-model", "subagent-model-selection"] {
+            assert!(ns_names.contains(&known), "missing catalog ns {known}");
+        }
 
         // Stale expected revision conflicts.
         let c = call(&mut m, "update", serde_json::json!({
@@ -388,5 +400,30 @@ mod tests {
             ],
         }));
         assert_eq!(m1["value"]["value"], serde_json::json!({"a": {}}));
+    }
+
+    #[test]
+    fn secrets_are_redacted_and_reported() {
+        let home = tempfile::tempdir().unwrap();
+        let mut m = SettingsMachine::new(home.path());
+        let v = call(&mut m, "update", serde_json::json!({
+            "ns": "llm",
+            "patch": {"providers": {"anthropic": {"apiKey": "sk-secret", "models": []}}},
+        }));
+        assert!(v["ok"].as_bool().unwrap(), "{v}");
+        // Value ships with the key redacted…
+        assert_eq!(
+            v["value"]["value"]["providers"]["anthropic"]["apiKey"],
+            serde_json::Value::Null
+        );
+        // …and the secrets slot reports set-ness by path (dotted selector).
+        let secrets = v["value"]["secrets"].as_array().unwrap();
+        assert!(secrets.iter().any(|s| s["path"][0] == "providers" && s["set"] == true));
+
+        // User projection also redacted.
+        assert_eq!(
+            v["value"]["user"]["providers"]["anthropic"]["apiKey"],
+            serde_json::Value::Null
+        );
     }
 }
