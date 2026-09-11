@@ -40,7 +40,23 @@ for suite in "${SUITES[@]}"; do
         (cd "$ROOT/conformance/wire" && cargo test) || status=1
         ;;
     e2e-replay)
-        (cd "$ROOT/conformance/e2e-replay" && VOCODER_HOST="$HOST" ./run-e2e.sh) || status=1
+        # vocoderd must serve the web GUI; relaunch with --web-dist if needed.
+        if [ "$HOST" = vocoderd ] && ! curl -sf "$BASE/assets/" -o /dev/null; then
+            "$HERE/run.sh" "$HOST" stop || true
+            rm -rf "$CONFORMANCE_HOME"; mkdir -p "$CONFORMANCE_HOME"
+            exec 9<&0 < /dev/null
+            "$ROOT/rust/target/debug/vocoderd" serve \
+                --home "$CONFORMANCE_HOME" --spec "$ROOT/spec" \
+                --port "${CONFORMANCE_PORT:-3080}" \
+                --web-dist "$ROOT/dsh/apps/web/dist" &
+            WEB_PID=$!
+            for _ in $(seq 1 30); do curl -sf -o /dev/null "$BASE/" && break; sleep 1; done
+        fi
+        # Per-host cell report lands under $CONFORMANCE_HOME for the
+        # cell-diff step (compare $HOST vs the other host's prior run).
+        (cd "$ROOT/conformance/e2e-replay" && VOCODER_HOST="$HOST" ./run-e2e.sh) \
+            | tee "$CONFORMANCE_HOME/e2e-cells.jsonl" \
+            || status=1
         ;;
     session-replay)
         (cd "$ROOT/conformance/session-replay" 2>/dev/null && cargo test) \
