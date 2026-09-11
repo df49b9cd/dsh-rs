@@ -1,0 +1,11 @@
+[package]
+name = "vocoder-cordis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Sans-I/O plugin machines: PluginMachine trait, router, and tokio driver"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

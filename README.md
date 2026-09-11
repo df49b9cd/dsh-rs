@@ -4,7 +4,13 @@ A pure-Rust reimplementation of the [DeepSeek Harness](https://github.com/deepse
 backend (`vocoderd`), developed against a **machine-checked specification** extracted from the
 upstream TypeScript host — spec-driven strangler rewrite.
 
-See [PLAN.md](PLAN.md) for the full roadmap and phase exit gates.
+The architecture: **Sans-I/O plugin machines** — each dsh capability is a pure
+`handle(input) -> Vec<output>` state machine; one thin tokio driver performs all I/O.
+Plugin composition, RPC, and the session log share the same shape
+([docs/architecture.md](docs/architecture.md)). Correctness is a cell-level conformance
+matrix against the JS control host ([docs/conformance.md](docs/conformance.md)).
+
+See [PLAN.md](PLAN.md) for milestones and exit gates.
 
 ## Layout
 
@@ -21,9 +27,10 @@ harness/        Test orchestration
 conformance/    The verdict suite — black-box, host-agnostic, written against spec/ only
   wire/           Hand-written raw HTTP/WebSocket Typert protocol tests
   e2e-replay/     Adapter driving the upstream Playwright/Vitest e2e suite against any host
+  composition-replay/ Replays plugin interaction traces against PluginMachine impls
 rust/           Cargo workspace — the Rust backend itself
 tools/codegen/  spec/ → Rust code generator (DTOs, error codes, service traits)
-docs/           Project-local architecture notes
+docs/           architecture.md (Sans-I/O machines) · conformance.md (matrix)
 ```
 
 ## Command surface

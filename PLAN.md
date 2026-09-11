@@ -6,53 +6,72 @@ and the **durable session log** (`session.vN.jsonl[.zstd]` with adjacent migrati
 Vocoder extracts both into a committed, language-neutral spec and develops the Rust
 backend against a conformance suite derived from upstream's strong web e2e corpus.
 
-Golden rule: everything normative lives in `spec/` and is consumed by BOTH hosts —
-the JS host as control (it must pass its own spec), the Rust host as candidate.
+The implementation model is **Sans-I/O plugin machines**: every dsh capability is a
+pure state machine whose inputs and outputs are data, with one thin async driver at
+the edge. See [docs/architecture.md](docs/architecture.md); conformance axes and
+reporting shape are in [docs/conformance.md](docs/conformance.md).
 
-## M0 — Vanguard (this scaffold)
+Golden rule: everything normative lives in `spec/`, is generated from the pinned
+`dsh/` submodule, and is consumed by BOTH hosts — the JS host as control (it must
+match its own spec), the Rust host as candidate.
+
+## M0 — Vanguard
 
 - [x] Repo skeleton, `dsh/` submodule pin
-- [ ] `tools/` spec extractor: Typert descriptors + merged error-code/lookup maps → `spec/typert/`, `spec/events/`
-- [ ] Schema dump: each payload Zod → JSON Schema → `spec/schemas/`
-- [ ] Session-log spec: format constants + migration matrix → `spec/session-log/`, plus corpus replay interop harness reading `dsh/snapshots/`
-- [ ] `harness/runners/` host-runner interface (`dsh-js` control launcher working)
-- [ ] `conformance/` skeleton: one wire-level hello-world RPC test green against dsh-js
-- [ ] `rust/` empty Cargo workspace + `tools/codegen/` hello codegen
-- [ ] CI: spec-drift gate
+- [x] Rust toolchain pin (1.98.1, edition 2024), workspace inheritance
+- [ ] `tools/spec-extractor` real implementation: live Typert descriptors +
+  error codes + lookup/context maps + forwarded events → `spec/typert|events`
+- [ ] Schema dump: per-payload Zod → JSON Schema → `spec/schemas/`
+- [ ] Session-log spec: framing constants + migration matrix → `spec/session-log/`
+- [ ] `vocoder-cordis` crate: `PluginMachine` trait, router, tokio driver
+- [ ] `harness/runners/` control-host runner working (`dsh` boots)
+- [ ] `conformance/wire` first real cell green against control
+- [ ] CI: spec-drift + rust gates green
 
-**Exit:** `just conformance HOST=dsh` green; `spec/` committed and drift-checked.
+**Exit:** `just conformance HOST=dsh` green; `spec/` committed, drift-checked;
+one machined capability (e.g. `todo`) demonstrated end-to-end.
 
-## M1 — Wire gateway
+## M1 — Wire gateway & first machines
 
-Rust `axum` host implementing `/api` WS multiplexing, unary calls, streams,
-cancellation (`AbortSignal` ↔ `CancellationToken`), `RemoteError` carrier codes —
-against stub business services. **Green = `conformance/wire` suite**, cell-by-cell.
+- `vocoder-spec-api` codegen from `spec/` (DTOs, error codes, `PluginMachine`
+  service traits with `async_trait` façade)
+- axum WS `/api` multiplexor as a machine + driver integration
+- cancellation: `AbortSignal` ↔ `CancellationToken` as machine inputs
+- `conformance/wire` full endpoint coverage on both hosts; coverage report in CI
 
 ## M2 — Session log
 
-Rust read/write of `session.vN.jsonl[.zstd]`: generation selection, exclusive
-successor publication, adjacent migrations. Green = **interop**: Rust reads every
-committed snapshot generation; JS reads Rust-written successors.
+- Pure codecs: `session.vN.jsonl` framing, zstd, adjacent migrations
+- Generation selection + exclusive successor publication as a machine
+- Interop: Rust reads all `snapshots/` generations; JS reads Rust-written successors
 
-## M3 — Business and streaming parity
+**Exit:** replays + interop cells green; conformance matrix = wire + session.
 
-translate the API controllers behind descriptors (goals, sessions, workspace, …);
-serve built client assets; event forwarding. Green = **`e2e-replay` matrix**:
-upstream Playwright/Vitest web suite with cell-level pass diff vs. the dsh control.
+## M3 — Business parity
+
+- API controller machines (goals, sessions, workspace, settings) behind descriptors
+- Static client asset serving; `window.__DSH_BOOT__` boot manifest
+- `conformance/e2e-replay` adapter live; cell-level diff reporting vs control
+
+**Exit:** e2e diff report exists and shrinks release-over-release.
 
 ## M4 — Agent core
 
-Loop FSM, LLM streaming, tool seam, sandbox (native Landlock/seccomp — the Rust payoff).
+- Agent-loop machine: turn/step FSM, streaming, cancellation
+- LLM machine behind `spec/llm` (added to extractor in M1)
+- Tool seam + approval machine; sandbox machines (Landlock/seccomp native)
 
 ## M5 — Plugin interop
 
-Typert-over-subprocess plugin protocol ("vocoder plugin ABI"); optional rquickjs
-legacy island. Deferred until the core is stable.
+- Typert-over-subprocess machine ("vocoder plugin ABI") — already the default
+  shape; M5 is productionizing, not researching
+- Composition-replay axis reaches full profile coverage
+- Optional JS-compat island (rquickjs) scoped to `Out::SpawnScope` subtrees
 
 ## Spec parity gate (CI)
 
 ```
-extract-spec(dsh@pin) → diff against committed spec/ → fail on drift
+extract-spec(dsh@pin) → diff committed spec/ → fail on drift
 codegen rust bindings → cargo check
-conformance matrix: {dsh-js, vocoderd} × {wire, session-replay, e2e-replay}
+conformance: {dsh, vocoderd} × {wire, session, e2e, composition} → cell diff
 ```

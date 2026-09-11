@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/vocoderd",
     "crates/vocoder-spec-api",
+    "crates/vocoder-cordis",
 ]
 # tools/codegen joins as vocoder-codegen in M0 wiring.
 
