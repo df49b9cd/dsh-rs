@@ -244,7 +244,8 @@ async fn main() -> Result<()> {
 
 async fn index() -> impl IntoResponse {
     axum::response::Html(
-        "<!doctype html><title>vocoderd</title><h1>vocoderd is up</h1>".to_string(),
+        "<!doctype html>
+<html><head><title>vocoderd</title></head><body><h1>vocoderd is up</h1></body></html>".to_string(),
     )
 }
 

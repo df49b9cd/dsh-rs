@@ -345,19 +345,29 @@ impl SessionMachine {
             (Some(_), Some(_)) => unreachable!("rejected above"),
         };
         if let Some(existing) = self.find(&id) {
-            // Adopt: cwd must match when both are known.
-            if let (Some(want), Some(have)) = (&cwd, existing.cwd())
-                && want != &have
-            {
-                    return rpc::err_details(
-                        "session/conflict",
-                        format!("session {id} already exists with a different cwd"),
-                        serde_json::json!({
-                            "sessionId": id,
-                            "requestedCwd": want,
-                            "existingCwd": have,
-                        }),
-                    );
+            // Adopt: cwd must match when both are known. Compare canonical
+            // realpaths when both resolve on disk (mirrors dsh's candidate
+            // filtering of physically-mismatching homes); fall back to
+            // string equality for not-yet-real paths (tests, virtual cwds).
+            let cwd_matches = match (&cwd, existing.cwd()) {
+                (None, _) | (_, None) => true,
+                (Some(want), Some(have)) => {
+                    match (std::fs::canonicalize(want), std::fs::canonicalize(&have)) {
+                        (Ok(a), Ok(b)) => a == b,
+                        _ => want == &have,
+                    }
+                }
+            };
+            if !cwd_matches {
+                return rpc::err_details(
+                    "session/conflict",
+                    format!("session {id} already exists with a different cwd"),
+                    serde_json::json!({
+                        "sessionId": id,
+                        "requestedCwd": cwd.clone().unwrap_or_default(),
+                        "existingCwd": existing.cwd().unwrap_or_default(),
+                    }),
+                );
             }
             let preset = get_str!(req, "agentPreset");
             let mut v = serde_json::json!({ "sessionId": id });
@@ -1034,6 +1044,25 @@ mod tests {
         let (_dir, mut m, _registry) = machine();
         let r = call(&mut m, "create", serde_json::json!({"request": {"cwd": "/tmp/y"}}));
         let id = r["value"]["sessionId"].as_str().unwrap().to_string();
+
+    #[test]
+    fn create_conflict_realpath_via_symlink() {
+        let (_dir, mut m, _registry) = machine();
+        let base = tempfile::tempdir().unwrap();
+        let real = base.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, base.path().join("link")).unwrap();
+        let link = base.path().join("link").to_string_lossy().to_string();
+        let r1 = call(&mut m, "create", serde_json::json!({"request": {"sessionId": "s-rp", "cwd": link}}));
+        assert!(r1["ok"].as_bool().unwrap(), "{r1}");
+        // Adopt through the symlink's target: canonical paths match, no conflict.
+        let r2 = call(&mut m, "create", serde_json::json!({"request": {"sessionId": "s-rp", "cwd": real.to_string_lossy().to_string()}}));
+        assert!(r2["ok"].as_bool().unwrap(), "realpath-equal cwd must adopt: {r2}");
+        // A genuinely different directory still conflicts.
+        let other = tempfile::tempdir().unwrap();
+        let r3 = call(&mut m, "create", serde_json::json!({"request": {"sessionId": "s-rp", "cwd": other.path().to_string_lossy().to_string()}}));
+        assert_eq!(r3["error"]["code"], "session/conflict", "{r3}");
+    }
         let p = call(&mut m, "prompt", serde_json::json!({"request": {
             "sessionId": id,
             "requestId": "req-1",
