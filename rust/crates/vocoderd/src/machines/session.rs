@@ -167,11 +167,16 @@ pub struct SessionMachine {
     store: SessionStore,
     /// Runtime-only state by session id.
     state: BTreeMap<String, SessionState>,
+    /// Shared workspace registry for workspaceId → path resolution.
+    workspaces: std::sync::Arc<crate::registry::WorkspaceRegistryStore>,
 }
 
 impl SessionMachine {
-    pub fn new(root: PathBuf) -> Self {
-        Self { store: SessionStore::new(root), state: BTreeMap::new() }
+    pub fn new(
+        root: PathBuf,
+        workspaces: std::sync::Arc<crate::registry::WorkspaceRegistryStore>,
+    ) -> Self {
+        Self { store: SessionStore::new(root), state: BTreeMap::new(), workspaces }
     }
 
     fn find(&self, id: &str) -> Option<StoredSession> {
@@ -185,7 +190,9 @@ impl SessionMachine {
         self.store.write_generation(&session.dir, &rows)
     }
 
-    /// Wire summary for session/list.
+    /// Wire summary for session/list. Membership is derived from the
+    /// workspace registry (session listed under an owning workspace),
+    /// validated by cwd realpath matching the workspace path.
     fn summary(&self, s: &StoredSession) -> serde_json::Value {
         let state = self.state.get(&s.id);
         let mut v = serde_json::json!({
@@ -194,6 +201,17 @@ impl SessionMachine {
             "running": false,
             "blank": true,
         });
+        if let Some(cwd) = s.cwd() {
+            for ws in self.workspaces.find_by_path(&cwd) {
+                let listed = self.workspaces.read(|d| {
+                    d.records.get(&ws).map(|r| r.session_ids.contains(&s.id)).unwrap_or(false)
+                });
+                if listed {
+                    v["workspaceId"] = ws.into();
+                    break;
+                }
+            }
+        }
         if let Some(c) = s.cwd() {
             v["cwd"] = c.into();
         }
@@ -272,12 +290,22 @@ impl SessionMachine {
         let id = get_str!(req, "sessionId")
             .map(str::to_string)
             .unwrap_or_else(|| format!("session-{}", rpc::new_id()));
-        let cwd = cwd_req.map(str::to_string);
-        // Note: workspaceId resolution is delegated to the workspace machine
-        // in composition; here a request naming a workspace carries its path
-        // through session/workspace-attach-failed only when the caller's
-        // workspace has no path. Until the cross-machine lookup is wired we
-        // accept the request and create with cwd when supplied.
+        // Cross-machine: resolve workspaceId → canonical cwd via the shared
+        // workspace registry (mirrors dsh looking up ctx.workspaces here).
+        let cwd: Option<String> = match (workspace_id, cwd_req) {
+            (Some(ws), None) => match self.workspaces.path_of(ws) {
+                Some(p) => Some(p),
+                None => {
+                    return rpc::err_details(
+                        "workspace/not-found",
+                        format!("no such workspace: {ws}"),
+                        serde_json::json!({ "workspaceId": ws }),
+                    );
+                }
+            },
+            (None, c) => c.map(str::to_string),
+            (Some(_), Some(_)) => unreachable!("rejected above"),
+        };
         if let Some(existing) = self.find(&id) {
             // Adopt: cwd must match when both are known.
             if let (Some(want), Some(have)) = (&cwd, existing.cwd())
@@ -324,6 +352,17 @@ impl SessionMachine {
             return rpc::err("gateway/internal", format!("cannot write session log: {e}"));
         }
         self.state.entry(id.clone()).or_default();
+        if let Some(ws) = workspace_id {
+            // Attach (prepend) the new session under the owning workspace.
+            let _ = self.workspaces.mutate(|d| {
+                if let Some(rec) = d.records.get_mut(ws) {
+                    if !rec.session_ids.contains(&id) {
+                        rec.session_ids.insert(0, id.clone());
+                        rec.updated_at = now;
+                    }
+                }
+            });
+        }
         let mut v = serde_json::json!({ "sessionId": id });
         if let Some(p) = get_str!(req, "agentPreset") {
             v["agentPreset"] = p.into();
@@ -779,8 +818,50 @@ mod tests {
 
     fn machine() -> (tempfile::TempDir, SessionMachine) {
         let dir = tempfile::tempdir().unwrap();
-        let m = SessionMachine::new(dir.path().join("sessions"));
+        let registry = crate::registry::WorkspaceRegistryStore::open(dir.path());
+        let m = SessionMachine::new(dir.path().join("sessions"), registry);
         (dir, m)
+    }
+
+    #[test]
+    fn create_with_workspace_id_resolves_and_attaches() {
+        let (dir, mut m) = machine();
+        let registry = crate::registry::WorkspaceRegistryStore::open(dir.path());
+        let mut w = crate::machines::workspace::WorkspaceMachine::new(
+            registry,
+            dir.path().join("sessions"),
+        );
+        let wd = tempfile::tempdir().unwrap();
+        let wc = {
+            let outs = PluginMachine::handle(&mut w, MachineIn::Event {
+                name: EventName::new(rpc::call_event("workspace")),
+                payload: serde_json::json!({
+                    "method": "create",
+                    "args": { "request": { "path": wd.path().to_string_lossy().to_string() } },
+                }),
+            });
+            let MachineOut::Realize(vocoder_cordis::RealizeRequest::Raw(v)) = &outs[0] else { panic!() };
+            v["result"]["value"]["workspace"]["workspaceId"].as_str().unwrap().to_string()
+        };
+        let r = call(&mut m, "create", serde_json::json!({ "request": { "workspaceId": wc } }));
+        assert!(r["ok"].as_bool().unwrap(), "create failed: {r}");
+        let sid = r["value"]["sessionId"].as_str().unwrap().to_string();
+        // Session dir lands under the workspace path's project slug.
+        let cwd = wd.path().canonicalize().unwrap().to_string_lossy().to_string();
+        assert!(std::fs::metadata(
+            dir.path().join("sessions").join(format!("--{}--", cwd.replace('/', "-")))
+        ).is_ok());
+        // The workspace machine now reports it.
+        let f = {
+            let outs = PluginMachine::handle(&mut w, MachineIn::Event {
+                name: EventName::new(rpc::call_event("workspace")),
+                payload: serde_json::json!({ "method": "follow", "args": {} }),
+            });
+            let MachineOut::Realize(vocoder_cordis::RealizeRequest::Raw(v)) = &outs[0] else { panic!() };
+            v.clone()
+        };
+        let ids = &f["result"]["value"]["value"]["items"][0]["sessionIds"];
+        assert!(ids.as_array().unwrap().iter().any(|s| s == &sid));
     }
 
     fn call(m: &mut SessionMachine, method: &str, args: serde_json::Value) -> serde_json::Value {

@@ -1,6 +1,7 @@
 //! vocoderd — the Rust web host. Thin async driver over the Sans-I/O core.
 
 mod machines;
+mod registry;
 mod rpc;
 
 use std::net::SocketAddr;
@@ -75,6 +76,8 @@ async fn main() -> Result<()> {
     info!(home = ?args.home, spec = ?args.spec, "vocoderd starting");
 
     let sessions_root = args.home.join("sessions");
+    let workspace_registry =
+        crate::registry::WorkspaceRegistryStore::open(&args.home);
 
     let mut initial_router = Router::new();
     // Business machines mounted at boot (M3+: from profile composition).
@@ -84,12 +87,15 @@ async fn main() -> Result<()> {
     });
     initial_router.handle(RouteIn::Mount {
         id: MachineId::new("session"),
-        machine: Box::new(crate::machines::session::SessionMachine::new(sessions_root.clone())),
+        machine: Box::new(crate::machines::session::SessionMachine::new(
+            sessions_root.clone(),
+            workspace_registry.clone(),
+        )),
     });
     initial_router.handle(RouteIn::Mount {
         id: MachineId::new("workspace"),
         machine: Box::new(crate::machines::workspace::WorkspaceMachine::new(
-            &args.home,
+            workspace_registry.clone(),
             sessions_root.clone(),
         )),
     });
