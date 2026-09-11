@@ -1,5 +1,11 @@
-//! Generated Typert bindings — regenerated from `../../spec/` by `just codegen`.
-//! M0 stub: replaced by generated modules once the extractor emits real artifacts.
+//! Typert bindings for the Rust backend.
+//!
+//! `generated/` is produced by `just codegen` from committed `spec/` artifacts
+//! — do not edit by hand.
+
+pub mod generated;
+
+pub use generated::{error_codes, traits, types};
 
 /// Carrier-independent Remote failure. Mirrors `RemoteError` in
 /// `dsh/packages/typert/protocol`: code-discriminated, details by code.
@@ -12,14 +18,4 @@ pub struct RemoteError {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<serde_json::Value>,
-}
-
-/// One unary Remote invocation descriptor (wire shape; see
-/// `InvocationDescriptor` in `dsh/packages/typert/protocol/src/types.ts`).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct InvocationDescriptor {
-    /// Canonical endpoint, e.g. `goals.create`.
-    pub endpoint: String,
-    // TODO(M1): full descriptor fields once spec/ carries them.
 }

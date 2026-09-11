@@ -15,11 +15,11 @@ conformance HOST="vocoderd":
 
 # Regenerate Rust bindings from spec/ into rust/crates/vocoder-spec-api.
 codegen:
-    cargo run -p vocoder-codegen
+    cargo run --manifest-path tools/codegen/Cargo.toml -- generate
 
 # Emit docs/spec-coverage.md: spec endpoints x passing tests per host.
 coverage-report:
-    cargo run -p vocoder-codegen -- coverage-report
+    cargo run --manifest-path tools/codegen/Cargo.toml -- coverage-report
 
 # Rust housekeeping.
 build:

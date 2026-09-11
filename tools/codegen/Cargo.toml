@@ -1,0 +1,17 @@
+[package]
+name = "vocoder-codegen"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.98.1"
+license = "MIT"
+description = "Generate vocoder-spec-api Rust bindings from spec/ (Typert descriptors + JSON Schemas)"
+publish = false
+
+[[bin]]
+name = "vocoder-codegen"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
