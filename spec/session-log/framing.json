@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "source": "dsh/packages/session/session-persistence-jsonl/src/format.ts",
+  "layout": {
+    "root": "<sessions-root>/<projectDir>/<sessionDir>/",
+    "projectDir": "--<cwd with / \\ : replaced by -, truncated to 251 chars>-- or _no-cwd",
+    "sessionDir": "encodeSegment(sessionId): [A-Za-z0-9._-] literal; others ~(utf16 unit hex x4); '.' → ~002e, '..' → ~002e~002e"
+  },
+  "generations": {
+    "filename": "session[.vN].jsonl[.zstd] where v0 = session.jsonl, vN≥1 = session.vN.jsonl",
+    "rules": [
+      "committed generations are immutable: never renamed, replaced, deleted",
+      "open selects the numerically-highest canonical generation",
+      "successor is published via exclusive create/replace at vN+1",
+      "noncanonical names rejected: temp suffixes, uppercase, leading zeros, v0 tag"
+    ]
+  },
+  "framing": {
+    "format": "JSONL; one JSON value per line, UTF-8",
+    "compression": "optional zstd per-file; first zstd frame contains exactly the header line",
+    "defaultCompression": "zstd",
+    "tornTail": "reading truncates to the last complete line/frame"
+  },
+  "header": {
+    "row": 0,
+    "requiredKeys": ["type", "version", "id", "createdAt", "isSeeded", "delegationDepth"],
+    "optionalKeys": ["cwd", "parentSession", "origin", "agentPreset"],
+    "forbiddenKeys": ["sandboxMode", "approvalPolicy"],
+    "shape": {
+      "type": "literal 'session'",
+      "version": "non-negative integer",
+      "id": "string SessionId",
+      "createdAt": "epoch ms as safe integer ≥ 0",
+      "cwd": "absolute path string",
+      "parentSession": "SessionId string",
+      "isSeeded": "boolean",
+      "origin": "literal 'subagent'",
+      "delegationDepth": "integer ≥ 0",
+      "agentPreset": "string id"
+    },
+    "seededRule": "a seeded header (isSeeded:true) must be accompanied by a session/end-seed event whose handle.inheritedEventCount records the inherited prefix length; unseeded implies 0"
+  },
+  "event": {
+    "requiredKeys": ["type", "seq", "time", "data"],
+    "optionalKeys": ["ignorable", "sourceEventSeqs", "surfaceOp"],
+    "seqRule": "dense 0-based, contiguous from the first row after the header",
+    "surfaceOp": "'append' or {op:'replace', startSeq, endSeq}"
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "currentVersion": 3,
+  "source": "dsh/packages/session/session-format-catalog/src/generated.ts",
+  "chain": [
+    {
+      "from": 0, "to": 1,
+      "package": "@deepseek-ai/dsh-session-format-v0-to-v1",
+      "purpose": "Header normalization only: { …header, version: 1 }; no event transform"
+    },
+    {
+      "from": 1, "to": 2,
+      "package": "@deepseek-ai/dsh-session-format-v1-to-v2",
+      "purpose": "Seeded-session cut: introduces session/end-seed events carrying handle.inheritedEventCount; header physical cut becomes event-derived"
+    },
+    {
+      "from": 2, "to": 3,
+      "package": "@deepseek-ai/dsh-session-format-v2-to-v3",
+      "purpose": "Streaming system-prompt promotion, audited reference remap, canonical envelope + PTC vocabulary conversion; agentPreset 'code' → 'ptc' in headers"
+    }
+  ],
+  "migratorContract": {
+    "composition": "adjacent steps only; chain any supported source → current",
+    "validation": "target header asserted by target codec before commit (assertReleasedV3Header for v3)"
+  }
+}
