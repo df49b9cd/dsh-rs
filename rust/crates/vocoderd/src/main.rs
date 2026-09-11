@@ -1,5 +1,7 @@
 //! vocoderd — the Rust web host. Thin async driver over the Sans-I/O core.
 
+mod machines;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -42,6 +44,12 @@ struct ServeArgs {
     bind: String,
     #[arg(long, default_value_t = 3080)]
     port: u16,
+    /// Serve the built dsh web GUI from this directory (expects dist/index.html).
+    #[arg(long)]
+    web_dist: Option<std::path::PathBuf>,
+    /// Workspace-of-first-run display name in the injected boot payload.
+    #[arg(long, default_value = "vocoder")]
+    host_name: String,
 }
 
 /// Shared state across HTTP/WS handlers.
@@ -49,6 +57,8 @@ struct AppState {
     /// The machine tree; synchronized because handlers touch it from
     /// connection tasks.
     router: Mutex<Router>,
+    /// Namespace ownership lookup for RPC routing (goals, session, ...).
+    namespace_registry: Mutex<vocoder_typert::dispatch::NamespaceRegistry>,
 }
 
 #[tokio::main]
@@ -63,16 +73,40 @@ async fn main() -> Result<()> {
     let Cmd::Serve(args) = Cmd::parse();
     info!(home = ?args.home, spec = ?args.spec, "vocoderd starting");
 
+    let mut initial_router = Router::new();
+    // Business machines mounted at boot (M3+: from profile composition).
+    initial_router.handle(RouteIn::Mount {
+        id: MachineId::new("goals"),
+        machine: Box::new(crate::machines::GoalsMachine::default()),
+    });
+    let mut registry = vocoder_typert::dispatch::NamespaceRegistry::new();
+    registry_owner_register(&mut registry, "goals", "goals");
+
     let state = Arc::new(AppState {
-        router: Mutex::new(Router::new()),
+        router: Mutex::new(initial_router),
+        namespace_registry: Mutex::new(registry),
     });
 
-    let app = AxumRouter::new()
-        .route("/", get(index))
+    let app: AxumRouter<Arc<AppState>> = AxumRouter::new()
         .route("/api/remote.mux", any(ws_upgrade))
         .route("/api/{*endpoint}", post(api_rpc))
-        .route("/healthz", get(|| async { StatusCode::OK }))
-        .with_state(state);
+        .route("/healthz", get(|| async { StatusCode::OK }));
+
+    let app = if let Some(dist) = args.web_dist.clone() {
+        let boot = boot_script(&args);
+        let dist2 = dist.clone();
+        info!(dist = ?args.web_dist, "serving web GUI");
+        app.route("/", get(move || serve_index(dist.clone(), boot.clone())))
+            .nest_service(
+                "/assets",
+                tower_http::services::ServeDir::new(dist2.join("assets")),
+            )
+            .fallback_service(tower_http::services::ServeDir::new(dist2))
+    } else {
+        app.route("/", get(index))
+    };
+
+    let app = app.with_state(state);
 
     let addr: SocketAddr = format!("{}:{}", args.bind, args.port).parse()?;
     info!(%addr, "listening");
@@ -163,8 +197,8 @@ async fn ws_conn(mut socket: WebSocket, state: Arc<AppState>) {
 // ---------------------------------------------------------------------------
 
 async fn api_rpc(
-    State(_state): State<Arc<AppState>>,
-    axum::extract::Path(endpoint): axum::extract::Path<String>,
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(_endpoint): axum::extract::Path<String>,
     body: Bytes,
 ) -> impl IntoResponse {
     let respond_err = |rpc_id: String, code: &str, message: String| -> (StatusCode, String) {
@@ -193,13 +227,108 @@ async fn api_rpc(
         }
     };
 
-    // No business machines mounted yet: reported as a stable gateway error.
-    let _ = endpoint;
+    // Resolve the owning namespace through the registry, then the machine.
+    let namespace = req.method.split('/').next().unwrap_or_default().to_string();
+    let method = req.method.split('/').nth(1).unwrap_or_default().to_string();
+    // The registry lives in AppState directly for synchronous lookups.
+    let owner_id = state
+        .namespace_registry
+        .lock()
+        .owner_of(&namespace)
+        .cloned();
+    let Some(owner_id) = owner_id else {
+        return respond_err(
+            req.rpc_id.clone(),
+            "gateway/internal",
+            format!("no such namespace on this host: {namespace}"),
+        );
+    };
+
+    let outs = state.router.lock().handle(RouteIn::Deliver {
+        to: owner_id.clone(),
+        ev: MachineIn::Event {
+            name: EventName::new("vocoder/goals/call"),
+            payload: serde_json::json!({
+                "agentId": req.payload.get("agent").cloned().unwrap_or(serde_json::Value::Null),
+                "method": method,
+                "args": req.payload.get("args").cloned().unwrap_or(serde_json::Value::Null),
+            }),
+        },
+    });
+    // TODO(M2+): generalize to Dispatch { namespace, method, args } dispatched
+    // via the registry; for now goals is the proving namespace.
+    let _ = owner_id;
+
+    for out in outs {
+        if let RouteOut::Realize { request, .. } = out
+            && let vocoder_cordis::RealizeRequest::Raw(v) = request
+            && v.get("kind").and_then(|k| k.as_str()) == Some("rpc.result")
+        {
+            let result = v["result"].clone();
+            let body = if result["ok"].as_bool() == Some(true) {
+                encode_rpc_server_response(&ServerResponse {
+                    rpc_id: req.rpc_id.clone(),
+                    result: vocoder_typert::RpcResult::Ok {
+                        ok: vocoder_typert::OkTag(true),
+                        value: result["value"].clone(),
+                    },
+                })
+            } else {
+                encode_rpc_server_response(&ServerResponse {
+                    rpc_id: req.rpc_id.clone(),
+                    result: vocoder_typert::RpcResult::Err {
+                        ok: vocoder_typert::OkTag(false),
+                        error: serde_json::from_value(result["error"].clone()).unwrap(),
+                    },
+                })
+            };
+            return (StatusCode::OK, String::from_utf8(body).unwrap());
+        }
+    }
+
     respond_err(
         req.rpc_id.clone(),
         "gateway/internal",
-        "endpoint is not implemented on this host".to_string(),
+        "no result from business machine".into(),
     )
+}
+
+fn registry_owner_register(
+    registry: &mut vocoder_typert::dispatch::NamespaceRegistry,
+    namespace: &str,
+    owner: &str,
+) {
+    use vocoder_typert::dispatch::REGISTER_NAMESPACE;
+    registry.handle(MachineIn::Event {
+        name: EventName::new(REGISTER_NAMESPACE),
+        payload: serde_json::json!({ "namespace": namespace, "owner": owner }),
+    });
+}
+
+fn boot_script(args: &ServeArgs) -> String {
+    let payload = serde_json::json!({
+        "kind": "vocoder",
+        "host": { "home": args.home.display().to_string(), "name": args.host_name },
+    });
+    format!(
+        "<script>window.__DSH_BOOT__ = {};</script>",
+        serde_json::to_string(&payload).unwrap()
+    )
+}
+
+async fn serve_index(dist: std::path::PathBuf, boot: String) -> axum::response::Response {
+    let path = dist.join("index.html");
+    let html = match std::fs::read_to_string(&path) {
+        Ok(h) => h,
+        Err(e) => {
+            return axum::response::Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(format!("no index.html in dist: {e}").into())
+                .unwrap();
+        }
+    };
+    let html = html.replacen("<head>", &format!("<head>\n    {boot}\n  "), 1);
+    axum::response::Html(html).into_response()
 }
 
 fn uuid() -> String {

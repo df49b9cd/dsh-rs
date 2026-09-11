@@ -230,4 +230,5 @@ impl FrameError {
     }
 }
 
+pub mod dispatch;
 pub mod mux;
