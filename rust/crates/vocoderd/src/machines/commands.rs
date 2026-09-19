@@ -323,7 +323,10 @@ impl CommandsMachine {
             ),
             GoalVerb::Set(objective) => (
                 format!("Goal set: {objective}"),
-                Some(("create", serde_json::json!({ "objective": objective }))),
+                Some((
+                    "create",
+                    serde_json::json!({ "request": { "objective": objective } }),
+                )),
             ),
             GoalVerb::Edit(objective) => (
                 match self.goals.get(agent) {
@@ -406,7 +409,7 @@ impl CommandsMachine {
                     .unwrap_or_default()
                     .to_string();
                 let state = goal
-                    .get("state")
+                    .get("phase")
                     .and_then(|v| v.as_str())
                     .unwrap_or("active")
                     .to_string();
@@ -685,7 +688,9 @@ mod tests {
         relay(
             &mut goals,
             &mut commands,
-            serde_json::json!({ "agentId": "a1", "objective": "from rpc" }),
+            // `goals/create` carries the objective under `request`, as the spec
+            // declares and the control enforces.
+            serde_json::json!({ "agentId": "a1", "request": { "objective": "from rpc" } }),
         );
         let v = call(
             &mut commands,
