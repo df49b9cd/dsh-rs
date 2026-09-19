@@ -33,6 +33,24 @@ directly: it does not import dsh code. Each endpoint in the spec is a cell:
 Spec coverage report (`just coverage-report`) lists every spec endpoint and
 which cells pass per host, so drift shows as table changes.
 
+**Both hosts are green** (28 cells, 12 namespaces). The control run needs the
+auth cookie: the `dsh` host gates all of `/api` behind browser auth, so
+`CONFORMANCE_COOKIE_FILE` must point at the cookie `harness/runners/run.sh`
+mints, and a cell that omits it sees an HTML redirect rather than an envelope.
+Note also that the runner's `pnpm` deps re-check currently fails on this
+checkout (a lefthook `postinstall` tripping over a legacy submodule git-config
+entry); starting the host directly with
+`node --import tsx/esm apps/cli/src/bin.ts web` bypasses it.
+
+**One recorded divergence.** An unknown method is refused in two different
+shapes: the control answers a bare HTTP **404** (its router has no route for an
+unregistered method) while the candidate answers HTTP 200 with a typed
+`gateway/bad-request` envelope (it registers one catch-all `/api/{*endpoint}`
+route and judges everything in the gateway). The candidate's shape is the more
+useful one for a client, but it *is* a difference, so the cell asserts the
+invariant both satisfy — never a 5xx, never HTML, never a silent success — and
+documents the split rather than asserting one host's shape.
+
 ## Axis 2 — session log replay
 
 There is no `conformance/session-replay/` directory: the suite lives with the

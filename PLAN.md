@@ -47,8 +47,13 @@ run: see *Known gaps* below.
   so the façade is currently dead code. Adopting it is the remaining M1 work and
   retires the same untyped-JSON class of bug the `Raw` effect used to cause.
 - [ ] cancellation: `AbortSignal` ↔ `CancellationToken` as machine inputs
-- [ ] `conformance/wire` full endpoint coverage on both hosts — 27 cells cover
-  the implemented namespaces; the control-host (`dsh`) run has not been done
+- [x] `conformance/wire` endpoint coverage on both hosts — 28 cells over 12
+  namespaces, and the control-host (`dsh`) run is done: both hosts are green,
+  so the cells are now a parity check rather than a candidate-only smoke test.
+  Getting there fixed two harness defects and one candidate divergence (the
+  control's auth cookie was never sent; `settings/update` accepted namespaces
+  no plugin registers). One divergence is *recorded*, not resolved: an unknown
+  method is a bare 404 on the control and a typed envelope on the candidate.
 
 ## M2 — Session log
 
@@ -87,10 +92,9 @@ run: see *Known gaps* below.
 Honest state of the claims above, so the plan does not read as further along
 than it is:
 
-- **The `dsh` control-host run has never executed.** Every green number in this
-  file is `HOST=vocoderd`. The conformance claim is *parity* against the control,
-  and that half is unmeasured — `harness/runners/run.sh dsh` mints the auth cookie
-  but the suite has not been driven through it.
+- **The `dsh` control-host run for `wire` is now done** (see M1); the *other*
+  axes — `session-replay`, `e2e-replay`, `composition-replay` — are still
+  candidate-only, so their parity half remains unmeasured.
 - **`M1`'s generated traits are dead code** (see M1).
 - **e2e-replay does not replay upstream specs** (see M3), and its one failure is
   a real product gap (`__ModuleLoader__`), not a missing assertion.
