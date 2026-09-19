@@ -23,30 +23,28 @@
 //! order. A decision without its ask is unreadable; a second decision for one
 //! ask contradicts the first. Both are checked here rather than assumed.
 //!
-//! ## What is not built yet, and why it is not stubbed
+//! ## Who writes the audit rows, and why it is not this machine
 //!
-//! This machine is **mounted and subscribed**, so the waterfall is live and an
-//! emitted `approval/request` is genuinely answered. What does not exist is the
-//! *emitter*: upstream raises these from the tool executor, and tool execution
-//! is the rest of step 3. Until then nothing dispatches the event, which is why
-//! the audit row queue below is unread and `take_owed` has no consumer.
+//! The emitter is [`super::tool_exec`], and it writes the pair. This machine
+//! *mints the id* and returns it on the verdict (`approvalId`); the executor
+//! writes the rows, because it is what owns the turn's row ordering. An earlier
+//! shape had this machine queue the rows for a drain point that never existed —
+//! `owed` accumulated and `take_owed` had no caller — and while the emitter was
+//! missing nobody noticed. Two producers of one audit pair would be worse than
+//! none: `check_audit` rejects a `decided` without a matching `asked`, and a
+//! duplicate `decided` for one ask contradicts the first.
 //!
-//! That is deliberately not papered over with a synthetic ask. A machine that
-//! emitted its own approval requests would fill the log with questions no tool
-//! ever asked, and the audit checker would pass on them — turning a real gap
-//! into a green test.
+//! Splitting it this way also puts the id where its authority is: the id exists
+//! because a decision was made, and the decision is this machine's.
 //!
-//! The three behaviours that *can* be settled without a tool executor are
-//! settled and tested: the fail-closed outcome, the `never`-is-not-a-grant
-//! mapping, and the audit invariant across the committed corpus.
+//! ## What is not here
 //!
-//! ## One turn at a time, again
-//!
-//! `owed` accumulates rows the driver would publish. With no emitter it stays
-//! empty; once one exists, the drain point is `DispatchResult` for
-//! `approval/request` — the chain's verdict is known there and the rows can be
-//! written *after* the chain rather than during it, which is the only ordering
-//! that does not suspend inside an inline chain.
+//! An **interactive answerer**. This host composes none, so every ask lands on
+//! [`Outcome::Unavailable`] — the fail-closed answer, which denies. That is the
+//! documented behaviour rather than a gap, but it does mean the only asks this
+//! host can raise (a sandbox-escalation request, per
+//! [`super::tool::Gate`]) can never be granted here. A client-side answerer is
+//! what would change it.
 
 use std::collections::BTreeMap;
 
@@ -198,14 +196,6 @@ pub struct ApprovalMachine {
     /// Waterfall requests whose `approval/asked` row has been written, keyed by
     /// the request's own id so the decision can pair with it.
     pending: BTreeMap<String, Pending>,
-    /// Completed `(session, rows)` pairs to publish, drained by the driver.
-    ///
-    /// A queue rather than an immediate effect because a waterfall turn cannot
-    /// suspend: the chain runs inline within one router step, so asking the
-    /// driver to write mid-chain would both violate that and deadlock the
-    /// dispatch lock. The row is published when the chain's answer comes back
-    /// via `DispatchResult`.
-    owed: Vec<(String, Value)>,
     /// Counts asks, so an id is unique within a session without a clock.
     asks: u64,
 }
@@ -213,14 +203,6 @@ pub struct ApprovalMachine {
 impl ApprovalMachine {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// The rows this machine owes the log, drained by the driver.
-    ///
-    /// Unread until the tool executor emits an ask; see the module doc.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn take_owed(&mut self) -> Vec<(String, Value)> {
-        std::mem::take(&mut self.owed)
     }
 
     /// Decide one request against a policy.
@@ -273,37 +255,27 @@ impl PluginMachine for ApprovalMachine {
                 }
                 self.asks += 1;
                 let id = format!("approval-{}", self.asks);
-                let session = req.session.clone().unwrap_or_default();
                 let mut p = Pending {
                     id: id.clone(),
                     tool_name: req.tool_name.clone(),
                     call_id: req.call_id.clone(),
                 };
                 let outcome = Self::decide(req.policy);
-                // The ask is recorded before the decision, which is the order
-                // the log must show.
-                let mut asked = json!({
-                    "type": "approval/asked",
-                    "data": { "id": id, "toolName": req.tool_name },
-                });
-                if let Some(call_id) = &req.call_id {
-                    asked["data"]["callId"] = json!(call_id);
-                }
-                if let Some(reason) = &req.reason {
-                    asked["data"]["reason"] = json!(reason);
-                }
-                self.owed.push((session.clone(), asked));
-                self.owed.push((
-                    session,
-                    json!({
-                        "type": "approval/decided",
-                        "data": { "id": p.id, "outcome": outcome.as_str() },
-                    }),
-                ));
-                p.id = id;
+                p.id = id.clone();
                 self.pending.insert(p.id.clone(), p);
                 vec![MachineOut::WaterfallReturn {
-                    value: json!({ "outcome": outcome.as_str() }),
+                    value: json!({
+                        "outcome": outcome.as_str(),
+                        // The id travels with the verdict so the audit pair can
+                        // be written by whoever owns the log's ordering. This
+                        // machine mints the id because it makes the decision;
+                        // the executor writes the rows because it owns the turn.
+                        // Splitting it the other way — this machine queueing rows
+                        // for a drain point that does not exist — left `owed` with
+                        // no consumer and the pair unwritable.
+                        "approvalId": id,
+                        "reason": req.reason,
+                    }),
                 }]
             }
             _ => vec![],
@@ -427,16 +399,21 @@ mod tests {
         );
         assert_eq!(verdict["outcome"], "allowed-once");
         assert!(
-            m.take_owed().is_empty(),
-            "a re-returned claim is not a new ask"
+            verdict.get("approvalId").is_none(),
+            "a re-returned claim is not a new ask, so it mints no id: {verdict}"
         );
     }
 
-    /// Every ask writes its audit pair, in order, sharing one id.
+    /// Every ask mints one id and returns it on the verdict.
+    ///
+    /// The id rides the verdict rather than a row queue because the *executor*
+    /// writes the pair: this machine owns the decision, the executor owns the
+    /// log's ordering, and an id invented by the writer would not be the id the
+    /// decision was recorded under.
     #[test]
-    fn an_ask_writes_its_audit_pair_in_order() {
+    fn an_ask_mints_an_id_on_its_verdict() {
         let mut m = ApprovalMachine::new();
-        let (_, _) = waterfall(
+        let (verdict, _) = waterfall(
             &mut m,
             json!({
                 "toolName": "shell",
@@ -446,32 +423,30 @@ mod tests {
                 "policy": "ask",
             }),
         );
-        let owed = m.take_owed();
-        assert_eq!(owed.len(), 2, "{owed:?}");
-        let (_, asked) = &owed[0];
-        let (_, decided) = &owed[1];
-        assert_eq!(asked["type"], "approval/asked");
-        assert_eq!(decided["type"], "approval/decided");
-        assert_eq!(asked["data"]["toolName"], "shell");
-        assert_eq!(asked["data"]["callId"], "call_7");
-        assert_eq!(asked["data"]["reason"], "writes outside the workspace");
-        // One id, shared.
-        assert_eq!(asked["data"]["id"], decided["data"]["id"], "{owed:?}");
-        assert_eq!(decided["data"]["outcome"], "unavailable");
-        // Same session on both rows.
-        assert_eq!(owed[0].0, "s1");
-        assert_eq!(owed[1].0, "s1");
+        assert_eq!(verdict["outcome"], "unavailable");
+        assert_eq!(verdict["approvalId"], "approval-1");
+        assert_eq!(verdict["reason"], "writes outside the workspace");
+        // The row the executor would write from this verdict passes the checker.
+        let rows = vec![
+            json!({ "type": "approval/asked", "data": {
+                "id": verdict["approvalId"], "toolName": "shell", "callId": "call_7",
+            }}),
+            json!({ "type": "approval/decided", "data": {
+                "id": verdict["approvalId"], "outcome": verdict["outcome"],
+            }}),
+        ];
+        assert_eq!(check_audit(&rows), Ok(1));
     }
 
     /// Distinct asks get distinct ids, so two decisions cannot be confused.
     #[test]
     fn distinct_asks_get_distinct_ids() {
         let mut m = ApprovalMachine::new();
-        let _ = waterfall(&mut m, json!({ "toolName": "a", "sessionId": "s" }));
-        let _ = waterfall(&mut m, json!({ "toolName": "b", "sessionId": "s" }));
-        let owed = m.take_owed();
-        assert_eq!(owed.len(), 4);
-        assert_ne!(owed[0].1["data"]["id"], owed[2].1["data"]["id"]);
+        let (a, _) = waterfall(&mut m, json!({ "toolName": "a", "sessionId": "s" }));
+        let (b, _) = waterfall(&mut m, json!({ "toolName": "b", "sessionId": "s" }));
+        assert_ne!(a["approvalId"], b["approvalId"], "{a} vs {b}");
+        assert_eq!(a["approvalId"], "approval-1");
+        assert_eq!(b["approvalId"], "approval-2");
     }
 
     /// A payload missing the spec-required `toolName` is answered rather than
@@ -482,9 +457,9 @@ mod tests {
         let mut m = ApprovalMachine::new();
         let (verdict, _) = waterfall(&mut m, json!({ "sessionId": "s1" }));
         assert_eq!(verdict["outcome"], "unavailable", "{verdict}");
-        let owed = m.take_owed();
-        assert_eq!(owed.len(), 2);
-        assert_eq!(owed[0].1["data"]["toolName"], "");
+        // Still a complete ask, so still an id — the executor writes the pair
+        // and `toolName` is empty because the emitter sent none.
+        assert_eq!(verdict["approvalId"], "approval-1");
     }
 
     /// The audit checker accepts a well-formed pair and counts it.

@@ -72,6 +72,12 @@ pub fn realize_with(
         &request
         && let Some(body) = canned_body(url)
     {
+        // A `canned-seq://` route answers with a *different* body per call, which
+        // is what makes a multi-model-call turn testable: a tool-calling turn's
+        // second call is made because the first called a tool, so it cannot
+        // answer identically. A fresh directory per test keeps the counter
+        // process-global but per-test.
+        let _ = &body;
         // Streamed in slices, not handed over whole: a canned body that skipped
         // the sink would leave the incremental path untested for every
         // non-live test, which is the same vacuity one level down.
@@ -227,6 +233,24 @@ pub fn realize_with(
 /// `/chat` on the end and look in a directory that does not exist.
 #[cfg(test)]
 fn canned_body(url: &str) -> Option<String> {
+    if let Some(dir) = url.strip_prefix("canned-seq://") {
+        let mut dir = dir.to_string();
+        for suffix in ["/chat/completions", "/responses", "/messages"] {
+            if let Some(stripped) = dir.strip_suffix(suffix) {
+                dir = stripped.to_string();
+                break;
+            }
+        }
+        // The call number is process-global and keyed by directory, because the
+        // driver is stateless and a route cannot carry a counter.
+        static CALLS: std::sync::Mutex<std::collections::BTreeMap<String, usize>> =
+            std::sync::Mutex::new(std::collections::BTreeMap::new());
+        let mut calls = CALLS.lock().unwrap();
+        let n = calls.entry(dir.clone()).or_insert(0);
+        let path = format!("{dir}/body-{n}.txt");
+        *n += 1;
+        return std::fs::read_to_string(path).ok();
+    }
     let dir = url.strip_prefix("canned://")?;
     let mut dir = dir.to_string();
     for suffix in ["/chat/completions", "/responses", "/messages"] {

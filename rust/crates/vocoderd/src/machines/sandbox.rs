@@ -192,7 +192,7 @@ impl Denial {
 
 /// The filesystem fence: one mode, one workspace root, and the temp areas the
 /// mode's meaning includes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fence {
     mode: Mode,
     /// The workspace root, canonical.

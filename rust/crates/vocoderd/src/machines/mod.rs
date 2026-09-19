@@ -31,6 +31,7 @@ pub mod settings;
 pub mod skills;
 pub mod subagents;
 pub mod tool;
+pub mod tool_exec;
 pub mod workspace;
 pub mod workspace_files;
 

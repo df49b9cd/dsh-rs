@@ -58,6 +58,8 @@ use super::provider::{
     ProviderConfig, ProviderKind, ProviderStreamDecoder, SseDecoder, SseFrame, to_wire_request,
 };
 use super::readcache::{FsCache, Pending};
+use super::sandbox::{Fence, Mode};
+use super::tool_exec::{Executor, ExecutorOut};
 use crate::rpc;
 
 /// A configured provider route.
@@ -142,6 +144,12 @@ struct TurnState {
     /// not a reliable witness: the turn's own write invalidates it, so a
     /// re-entry after the write would compare against the wrong length.
     opened_with: usize,
+    /// The tool calls the step's reply made, waiting for their executor.
+    ///
+    /// On the turn state rather than the machine because it belongs to a turn: a
+    /// second turn must not inherit the first's calls, and the executor that
+    /// consumes them is created from this at the step that follows.
+    pending_calls: Option<Vec<super::tool::Call>>,
 }
 
 /// The live decode of a model call, as its bytes arrive.
@@ -473,6 +481,13 @@ enum Op {
         provider: String,
         body: String,
     },
+    /// A step's tool calls are running.
+    ///
+    /// The turn is held here, not in `Call`/`Settle`: the reply has settled and
+    /// its `assistant/message` is already written, but the step cannot close until
+    /// the calls it made have results. Holding the state is what lets the
+    /// executor's effects suspend and resume without losing the turn.
+    Tools { state: TurnState },
     /// The turn is over and its generation is being written. The answer waits
     /// for the write: reporting success before the rows are durable would let a
     /// client read a session that does not yet contain its own turn.
@@ -488,6 +503,19 @@ pub struct AgentMachine {
     op: Option<Op>,
     /// Finished request ids, so a redelivered call does not start a new turn.
     completed: BTreeMap<String, Value>,
+    /// The step's tool executor, while a step's calls are running.
+    ///
+    /// One per step rather than per turn: a step's calls are all made by one
+    /// `assistant/message` at one position, so the executor's own `position` is
+    /// fixed for its life.
+    exec: Option<Executor>,
+    /// The tool effect in flight: its id and what it was asked for.
+    ///
+    /// The effect's *kind* is remembered rather than recovered from the answer,
+    /// because `EffectResult` is untyped: a `ReadText` answer arriving for a
+    /// `WriteText` request would otherwise be read as one, and a tool would render
+    /// the wrong thing from real bytes.
+    tool_effect: Option<(vocoder_cordis::EffectId, super::tool_exec::Effect)>,
     /// The attempt id, revision and next index of the call that just settled.
     ///
     /// The `Live` that produced them is dropped when `settle` runs, but the
@@ -513,6 +541,8 @@ impl AgentMachine {
             op: None,
             completed: BTreeMap::new(),
             last_attempt: None,
+            exec: None,
+            tool_effect: None,
         }
     }
 
@@ -733,6 +763,25 @@ impl AgentMachine {
                         });
                     }
                 }
+                // A tool result is a *user-role* message on its own row type.
+                // Reading it here is what makes a tool-calling turn work at all:
+                // the next request has to answer the call it made, and a provider
+                // rejects a conversation with an unanswered tool call. The row is
+                // its own type rather than a `user/message` because the log
+                // distinguishes a human's input from a tool's output.
+                "tool/result" => {
+                    let Some(msg) = row.get("data").and_then(|d| d.get("message")) else {
+                        continue;
+                    };
+                    let items = content_items(msg);
+                    if !items.is_empty() {
+                        messages.push(ItemStreamMessage {
+                            role: Role::User,
+                            items,
+                            metadata: Default::default(),
+                        });
+                    }
+                }
                 "assistant/message" => {
                     let Some(msg) = row.pointer("/data/message") else {
                         continue;
@@ -775,6 +824,16 @@ impl AgentMachine {
                 model,
                 messages,
                 stream: true,
+                // The tools the host can actually execute. Offering a name with
+                // no implementation would produce a result reading `unknown
+                // tool`, which teaches the model the tool exists and is broken;
+                // see `tool::catalog` on why the set is closed.
+                //
+                // Every step offers them, which is what lets a turn continue
+                // across tool results: the model's next request carries the
+                // conversation *and* the same tool set, so a call it made is
+                // still callable when it decides what to do with the answer.
+                tools: super::tool::tool_definitions(),
                 ..Default::default()
             },
         ))
@@ -964,6 +1023,7 @@ impl AgentMachine {
             rows,
             fsm,
             opened_with,
+            pending_calls: None,
         };
         let call = self.apply(&mut state, outs);
         self.continue_turn(state, call)
@@ -1046,6 +1106,16 @@ impl AgentMachine {
                 provider,
                 body,
             }) => self.settle(state, provider, body),
+            // A tool step re-enters at the executor: either it still has calls to
+            // run, or they are done and the step may close.
+            Some(Op::Tools { mut state }) => {
+                if self.exec.as_ref().is_some_and(Executor::finished) {
+                    return self.close_tool_step(state);
+                }
+                let outs = self.drive_tools(&mut state);
+                self.op = Some(Op::Tools { state });
+                outs
+            }
             // A re-entry that arrives with the publish still pending re-issues
             // the write; the cache's `published` set makes that a no-op that
             // reports completion instead of a second generation.
@@ -1119,6 +1189,15 @@ impl AgentMachine {
                 message: "provider stream ended without a finish chunk".into(),
             },
         };
+        // A step that called tools runs them **before the step closes**, which is
+        // the order the corpus records: `assistant/message`, the calls, their
+        // results, then `step/end`. `step_reply` is what emits `step/end`, so the
+        // executor is entered first and the FSM is advanced once it finishes.
+        // Driving the tools after `continue_turn` instead would file them under
+        // the next step, which is a different durable claim about what happened.
+        if has_calls && reason.is_some() {
+            state.pending_calls = Some(super::tool_exec::calls_in(&message));
+        }
         let mut end_frames = vec![stream_event(
             &state.session,
             json!({
@@ -1133,10 +1212,246 @@ impl AgentMachine {
                 },
             }),
         )];
+        if state.pending_calls.is_some() {
+            self.op = Some(Op::Tools { state });
+            // The calls are captured; the executor is created and driven on the
+            // same re-entry that put the op in place.
+            let resumed = self.resume_op();
+            end_frames.extend(resumed);
+            return end_frames;
+        }
         let outs = state.fsm.step_reply(outcome, has_calls, false);
         let call = self.apply(&mut state, outs);
         end_frames.extend(self.continue_turn(state, call));
         end_frames
+    }
+
+    /// Feed a tool effect's answer back to the executor.
+    fn answer_tool(
+        &mut self,
+        mut state: TurnState,
+        effect: &super::tool_exec::Effect,
+        result: EffectResult,
+    ) -> Vec<MachineOut> {
+        use super::tool::{Answer, display_path};
+        let fence = self.fence_for(&state);
+        let answer = match result {
+            EffectResult::Text(text) => Ok(Answer::Text(text)),
+            EffectResult::Done => Ok(Answer::Done),
+            EffectResult::Stat {
+                canonical, is_dir, ..
+            } => Ok(Answer::Stat { canonical, is_dir }),
+            // A missing target is its own answer rather than a failure, because
+            // the tools branch on it: a `write` creates, a `read` refuses, and
+            // each says so in its own words.
+            EffectResult::Failed(vocoder_cordis::EffectError::NotFound) => Ok(Answer::NotFound),
+            EffectResult::Failed(e) => {
+                // The `read`/`edit` not-found wording is the tool layer's, so the
+                // path it names is the display path rather than the raw one.
+                let path = match effect {
+                    super::tool_exec::Effect::Stat { path }
+                    | super::tool_exec::Effect::Read { path }
+                    | super::tool_exec::Effect::Write { path, .. } => path,
+                };
+                let _ = display_path(&fence.root, path);
+                Ok(Answer::Failed(e.message()))
+            }
+            other => Err(format!("unexpected effect answer: {other:?}")),
+        };
+        let wants = match self.exec.as_mut() {
+            Some(exec) => exec.on_effect(effect, answer),
+            None => Vec::new(),
+        };
+        let mut outs = self.absorb_tool_wants(&mut state, wants);
+        // The executor either finished or wants another effect. Both paths park
+        // the turn back on the op first, so a suspension mid-step has a state to
+        // resume from.
+        if self.exec.as_ref().is_some_and(Executor::finished) {
+            outs.extend(self.close_tool_step(state));
+        } else {
+            let more = self.drive_tools(&mut state);
+            self.op = Some(Op::Tools { state });
+            outs.extend(more);
+        }
+        outs
+    }
+
+    /// Answer an approval waterfall the executor started.
+    fn on_verdict(&mut self, verdict: &Value) -> Vec<MachineOut> {
+        let Some(Op::Tools { state }) = self.op.take() else {
+            // A verdict for an ask this machine is not waiting on — a chain
+            // another machine started. Not an error; simply not ours.
+            return Vec::new();
+        };
+        let mut state = state;
+        let root = self.workspace_root(&state);
+        let wants = match self.exec.as_mut() {
+            Some(exec) => exec.on_verdict(verdict, &root),
+            None => Vec::new(),
+        };
+        let outs = self.absorb_tool_wants(&mut state, wants);
+        self.op = Some(Op::Tools { state });
+        outs
+    }
+
+    /// Close a step whose tool calls have all run, and advance the turn.
+    ///
+    /// This is where the reply the executor was holding finally reaches the FSM.
+    /// The step cannot close before its calls have results — `step_reply` is what
+    /// emits `step/end`, so for a tool-calling step it is called here rather than
+    /// in `settle`.
+    fn close_tool_step(&mut self, mut state: TurnState) -> Vec<MachineOut> {
+        self.exec = None;
+        self.tool_effect = None;
+        state.pending_calls = None;
+        // A tool call always continues the turn: the results are what the next
+        // step is for. `more_input` comes from the durable inbox fold, the same
+        // authority the FSM's own `has_pending` reads.
+        let more_input = Inbox::fold(&state.rows)
+            .map(|i| i.has_pending())
+            .unwrap_or(false);
+        let outs = state
+            .fsm
+            .step_reply(StepOutcome::Completed, true, more_input);
+        let call = self.apply(&mut state, outs);
+        self.continue_turn(state, call)
+    }
+
+    /// Run a step's tool calls, one at a time, in model order.
+    ///
+    /// The executor is pure and returns its wants; this maps them onto the
+    /// machine's vocabulary. Two details are load-bearing:
+    ///
+    /// - **`seq` is assigned here, not in the executor.** The log's length is the
+    ///   publisher's fact and a pure transition may not consult it, so each row
+    ///   the executor asks for is appended through [`Self::row`] and its assigned
+    ///   `seq` is fed back with [`Executor::observe_row`]. That is how a
+    ///   `tool/result` cites the `tool/call` row it answers — without it
+    ///   `sourceEventSeqs` would carry a number nothing reconciles.
+    /// - **Every row is announced**, like the turn's own rows, because the agent
+    ///   owns the log for this turn and a follower's event sequence has to be
+    ///   gap-free.
+    fn drive_tools(&mut self, state: &mut TurnState) -> Vec<MachineOut> {
+        let root = self.workspace_root(state);
+        let (turn, step) = state.fsm.position();
+        if self.exec.is_none() {
+            // A step's calls are made by one `assistant/message`, so the executor
+            // is created once, when that reply settles.
+            let calls = state.pending_calls.clone().unwrap_or_default();
+            self.exec = Some(Executor::new(calls, turn, step));
+        }
+        if self.exec.as_ref().is_some_and(Executor::finished) {
+            return Vec::new();
+        }
+        let fence = self.fence_for(state);
+        let wants = match self.exec.as_mut() {
+            Some(exec) => exec.begin(&root, &fence),
+            None => return Vec::new(),
+        };
+        self.absorb_tool_wants(state, wants)
+    }
+
+    /// Turn the executor's wants into machine outputs.
+    fn absorb_tool_wants(
+        &mut self,
+        state: &mut TurnState,
+        wants: Vec<ExecutorOut>,
+    ) -> Vec<MachineOut> {
+        let mut outs = Vec::new();
+        for want in wants {
+            match want {
+                ExecutorOut::Row { row_type, data } => {
+                    let appended = Self::row(&mut state.rows, &Draft { row_type, data });
+                    let seq = appended.get("seq").and_then(Value::as_f64).unwrap_or(0.0) as u64;
+                    if let Some(exec) = self.exec.as_mut() {
+                        exec.observe_row(row_type, seq);
+                    }
+                    outs.push(MachineOut::Dispatch {
+                        name: vocoder_cordis::EventName::new("session/event"),
+                        payload: json!({ "sessionId": state.session, "event": appended }),
+                        mode: vocoder_cordis::DispatchMode::Emit,
+                    });
+                }
+                ExecutorOut::Effect(effect) => outs.extend(self.realize_tool(&effect)),
+                ExecutorOut::Dispatch {
+                    name,
+                    payload,
+                    waterfall,
+                } => outs.push(MachineOut::Dispatch {
+                    name: vocoder_cordis::EventName::new(&name),
+                    payload,
+                    mode: if waterfall {
+                        vocoder_cordis::DispatchMode::Waterfall
+                    } else {
+                        vocoder_cordis::DispatchMode::Emit
+                    },
+                }),
+            }
+        }
+        outs
+    }
+
+    /// Issue the effect a tool call needs.
+    fn realize_tool(&mut self, effect: &super::tool_exec::Effect) -> Vec<MachineOut> {
+        use super::tool_exec::Effect;
+        let request = match effect {
+            Effect::Stat { path } => RealizeRequest::Stat { path: path.clone() },
+            Effect::Read { path } => RealizeRequest::ReadText { path: path.clone() },
+            Effect::Write { path, contents } => RealizeRequest::WriteText {
+                path: path.clone(),
+                contents: contents.clone(),
+            },
+        };
+        let id = self.cache.next_effect(&mut self.pending, &mut self.effects);
+        self.tool_effect = Some((id, effect.clone()));
+        vec![rpc::effect(id, request)]
+    }
+
+    /// The workspace root a session's tools resolve against.
+    ///
+    /// Read from the log's header row, which is where `session/create` recorded
+    /// the `cwd`. A session with none has no workspace, and the tools then resolve
+    /// against the machine's own root — a boot-time fact the driver resolved, so
+    /// the machine still reads no process state.
+    fn workspace_root(&self, state: &TurnState) -> String {
+        state
+            .rows
+            .first()
+            .and_then(|r| r.get("cwd"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| self.root.to_string_lossy().to_string())
+    }
+
+    /// The confinement fence for a session.
+    ///
+    /// The mode follows the session's own `approval/policy` row when it has one:
+    /// `never` means this host does not ask, which is the unattended stance and
+    /// pairs with the widest mode; `ask` pairs with the confined default. With no
+    /// row, the deployment default applies.
+    ///
+    /// **The policy is not switchable per session yet** — this host composes no
+    /// `permissionPresets` machine — so a session can carry a policy but nothing
+    /// can change it. That is a gap in the business surface, not in the fence, and
+    /// it is stated rather than implied because a reader would otherwise assume
+    /// the mapping is driven by a client.
+    fn fence_for(&self, state: &TurnState) -> Fence {
+        let mode = state
+            .rows
+            .iter()
+            .rev()
+            .find_map(|r| {
+                (r.get("type").and_then(Value::as_str) == Some("approval/policy"))
+                    .then(|| r.pointer("/data/policy").and_then(Value::as_str))
+                    .flatten()
+            })
+            .and_then(super::sandbox::Policy::parse)
+            .map(|p| match p {
+                super::sandbox::Policy::Never => Mode::DangerFullAccess,
+                super::sandbox::Policy::Ask => Mode::WorkspaceWrite,
+            })
+            .unwrap_or_else(Mode::default_mode);
+        Fence::new(mode, self.workspace_root(state))
     }
 }
 
@@ -1146,9 +1461,21 @@ impl PluginMachine for AgentMachine {
 
     fn handle(&mut self, ev: MachineIn) -> Vec<MachineOut> {
         match ev {
-            MachineIn::ServicesReady { .. } => vec![MachineOut::Subscribe {
-                name: vocoder_cordis::EventName::new(rpc::call_event("agent")),
-            }],
+            MachineIn::ServicesReady { .. } => vec![
+                MachineOut::Subscribe {
+                    name: vocoder_cordis::EventName::new(rpc::call_event("agent")),
+                },
+                // The verdicts of the approval waterfalls this machine starts.
+                // Without this subscription the ask would suspend forever: the
+                // chain's final value is delivered as a `DispatchResult`, and a
+                // machine that did not subscribe would never hear it.
+                MachineOut::Subscribe {
+                    name: vocoder_cordis::EventName::new("approval/request"),
+                },
+            ],
+            MachineIn::DispatchResult { name, value } if name.0 == "approval/request" => {
+                self.on_verdict(&value)
+            }
             MachineIn::Event { name, payload } if name.0 == rpc::call_event("agent") => {
                 let method = payload
                     .get("method")
@@ -1212,6 +1539,7 @@ impl AgentMachine {
         // mid-call settles when that call's answer arrives, so latching is
         // enough and no frame closers are forced here.
         let rows = match op {
+            Op::Tools { state } => Some(&mut state.rows),
             Op::Opening { .. } => None,
             Op::Call { state, .. } | Op::Settle { state, .. } => Some(&mut state.rows),
             Op::Publishing => None,
@@ -1384,6 +1712,27 @@ impl AgentMachine {
             // A late answer for an effect this machine already moved past.
             return vec![];
         };
+        // A tool effect's answer belongs to the executor, not the cache: the
+        // effect was issued for a *call*, and only the executor knows which one.
+        // Matched by effect id rather than by "a tool is in flight", because a
+        // late answer for a call the executor has already moved past would
+        // otherwise be applied to the next one.
+        if let (Op::Tools { .. }, Some((id, effect))) = (&op, self.tool_effect.clone()) {
+            if id == _id {
+                let state = match op {
+                    Op::Tools { state } => state,
+                    _ => unreachable!("matched above"),
+                };
+                self.tool_effect = None;
+                return self.answer_tool(state, &effect, result);
+            }
+            let state = match op {
+                Op::Tools { state } => state,
+                _ => unreachable!("matched above"),
+            };
+            self.op = Some(Op::Tools { state });
+            return vec![];
+        }
         match (op, result) {
             // A read or write answer for an opening or running turn. The cache
             // absorbs it and the op is re-entered.
@@ -1952,8 +2301,20 @@ mod tests {
 
     /// Rows of a session's newest generation.
     fn written_rows(sessions: &std::path::Path, session_id: &str) -> Vec<Value> {
+        written_rows_in(sessions, None, session_id)
+    }
+
+    /// The same, for a session whose header recorded a `cwd` — which is what a
+    /// tool-calling turn needs, since the tools resolve against a workspace.
+    fn written_rows_in(
+        sessions: &std::path::Path,
+        cwd: Option<&std::path::Path>,
+        session_id: &str,
+    ) -> Vec<Value> {
         let dir = sessions
-            .join(super::super::session::SessionStore::project_dir(None))
+            .join(super::super::session::SessionStore::project_dir(
+                cwd.map(|c| c.to_string_lossy()).as_deref(),
+            ))
             .join(super::super::session::SessionStore::encode_segment(
                 session_id,
             ));
@@ -1995,6 +2356,389 @@ mod tests {
         "\"completion_tokens\":36,\"total_tokens\":71}}\n\n",
         "data: [DONE]\n\n",
     );
+
+    /// A canned reply that calls `read` on a file, then answers.
+    ///
+    /// Two bodies because the turn has two model calls: the first proposes the
+    /// tool call, the second answers once the tool result is in the log. The
+    /// provider route is keyed by *call order*, which is what `canned_provider_seq`
+    /// sets up.
+    const READ_THEN_ANSWER: [&str; 2] = [
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],",
+            "\"created\":1,\"id\":\"c1\",\"model\":\"m\",\"object\":\"chat.completion.chunk\"}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",",
+            "\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"\"}}]},",
+            "\"finish_reason\":null,\"index\":0}],\"created\":1,\"id\":\"c1\",\"model\":\"m\",",
+            "\"object\":\"chat.completion.chunk\"}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,",
+            "\"function\":{\"arguments\":\"{\\\"file_path\\\":\\\"greeting.txt\\\"}\"}}]},",
+            "\"finish_reason\":null,\"index\":0}],\"created\":1,\"id\":\"c1\",\"model\":\"m\",",
+            "\"object\":\"chat.completion.chunk\"}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\",\"index\":0}],",
+            "\"created\":1,\"id\":\"c1\",\"model\":\"m\",\"object\":\"chat.completion.chunk\"}\n\n",
+            "data: [DONE]\n\n",
+        ),
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],",
+            "\"created\":1,\"id\":\"c2\",\"model\":\"m\",\"object\":\"chat.completion.chunk\"}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"DONE\"},\"finish_reason\":\"stop\",\"index\":0}],",
+            "\"created\":1,\"id\":\"c2\",\"model\":\"m\",\"object\":\"chat.completion.chunk\"}\n\n",
+            "data: [DONE]\n\n",
+        ),
+    ];
+
+    /// A route whose canned body changes per call, in order.
+    ///
+    /// A single canned body cannot express a tool-calling turn: the second model
+    /// call is made *because* the first called a tool, so it has to answer
+    /// differently. The bodies are written to numbered files and the route's
+    /// `base_url` advances a counter, which is what makes the second call's
+    /// request observably different from the first's.
+    fn canned_provider_seq(bodies: &[&'static str]) -> Route {
+        let dir = std::env::temp_dir().join(format!("voco-canned-{}", rpc::new_id()));
+        std::fs::create_dir_all(&dir).expect("canned dir");
+        for (i, body) in bodies.iter().enumerate() {
+            std::fs::write(dir.join(format!("body-{i}.txt")), body).expect("write body");
+        }
+        Route {
+            config: ProviderConfig {
+                id: "canned".into(),
+                kind: ProviderKind::OpenAiChat,
+                base_url: format!("canned-seq://{}", dir.to_string_lossy()),
+                model: "test-model".into(),
+                api_key_env: None,
+            },
+        }
+    }
+
+    /// A session whose header records a real workspace, so the tools have a root.
+    fn session_home_in(session_id: &str, cwd: &std::path::Path) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let sessions = dir.path().join("sessions");
+        let sdir = sessions
+            .join(super::super::session::SessionStore::project_dir(Some(
+                &cwd.to_string_lossy(),
+            )))
+            .join(super::super::session::SessionStore::encode_segment(
+                session_id,
+            ));
+        std::fs::create_dir_all(&sdir).expect("session dir");
+        let rows = vec![
+            json!({
+                "type": "session", "version": 3, "id": session_id, "createdAt": 0,
+                "cwd": cwd.to_string_lossy(),
+            }),
+            json!({
+                "type": "user/message", "seq": 0, "time": 0,
+                "data": {
+                    "content": [{ "type": "text", "text": "read greeting.txt" }],
+                    "source": { "kind": "user", "rpcId": "seed" },
+                    "role": "user", "id": "msg-seed",
+                },
+            }),
+        ];
+        let bytes = vocoder_session::encode_generation(&rows, false).expect("encode");
+        std::fs::write(
+            sdir.join(vocoder_session::generation_filename(0, false)),
+            bytes,
+        )
+        .expect("write header");
+        (dir, sessions)
+    }
+
+    /// **A tool call round-trips through the whole agent.** The model asks to read
+    /// a file, the executor runs it, the result lands in the log, and the turn
+    /// continues to a second model call that answers.
+    ///
+    /// This is the behaviour step 3 exists for. Before the executor, a
+    /// tool-calling reply opened a step with no results to send: the second
+    /// request carried the assistant's call and nothing answering it, which a
+    /// provider rejects.
+    #[test]
+    fn a_tool_call_runs_and_the_turn_continues_with_its_result() {
+        let work = tempfile::tempdir().expect("workspace");
+        std::fs::write(work.path().join("greeting.txt"), "hello\n").expect("file");
+        let session_id = "session-tools";
+        let (_home, sessions) = session_home_in(session_id, work.path());
+        let mut machine = AgentMachine::new(
+            sessions.clone(),
+            vec![canned_provider_seq(&READ_THEN_ANSWER)],
+        );
+        let _ = machine.handle(MachineIn::ServicesReady { keys: vec![] });
+
+        let outs = drive(
+            &mut machine,
+            MachineIn::Event {
+                name: vocoder_cordis::EventName::new(rpc::call_event("agent")),
+                payload: json!({
+                    "method": "run",
+                    "args": {
+                        "sessionId": session_id,
+                        "requestId": "req-tools",
+                        "content": [{ "type": "text", "text": "read greeting.txt" }],
+                    },
+                }),
+            },
+        );
+        assert!(
+            matches!(reply_of(&outs), RpcReply::Ok { .. }),
+            "the turn is accepted: {outs:?}"
+        );
+
+        let rows = written_rows_in(&sessions, Some(work.path()), session_id);
+        let types: Vec<&str> = rows
+            .iter()
+            .map(|r| r.get("type").and_then(Value::as_str).unwrap_or_default())
+            .collect();
+        // The whole turn: the tool call runs *inside* step 1, between the message
+        // that made it and the `step/end` that closes it.
+        assert_eq!(
+            types,
+            vec![
+                "session",
+                "user/message",
+                "agent/inbox/spliced",
+                "turn/start",
+                "step/start",
+                "assistant/message",
+                "tool/call",
+                "tool/result",
+                "step/end",
+                "step/start",
+                "assistant/message",
+                "step/end",
+                "turn/end",
+            ],
+            "unexpected frame sequence"
+        );
+
+        // The call is recorded with the model's own arguments, as text.
+        let call = rows
+            .iter()
+            .find(|r| r.get("type").and_then(Value::as_str) == Some("tool/call"))
+            .expect("the tool call row");
+        assert_eq!(call.pointer("/data/name"), Some(&json!("read")));
+        assert_eq!(call.pointer("/data/callId"), Some(&json!("call_1")));
+        assert_eq!(
+            call.pointer("/data/arguments"),
+            Some(&json!("{\"file_path\":\"greeting.txt\"}")),
+            "the arguments are the model's own text"
+        );
+        assert_eq!(call.pointer("/data/turn"), Some(&json!(1)));
+        assert_eq!(call.pointer("/data/step"), Some(&json!(1)));
+
+        // The result carries the real file's content in the upstream envelope,
+        // and cites the call row it answers.
+        let result = rows
+            .iter()
+            .find(|r| r.get("type").and_then(Value::as_str) == Some("tool/result"))
+            .expect("the tool result row");
+        let text = result
+            .pointer("/data/message/content/0/content/0/text")
+            .and_then(Value::as_str)
+            .expect("the result text");
+        assert!(
+            text.contains("1: hello"),
+            "the file's content reached the model: {text:?}"
+        );
+        assert!(
+            text.contains("(End of file - total 1 lines)"),
+            "the footer is the upstream wording: {text:?}"
+        );
+        assert_eq!(
+            result.pointer("/data/message/content/0/isError"),
+            Some(&json!(false))
+        );
+        // `sourceEventSeqs` names the `tool/call` row's own seq, which is what
+        // pairs the two after the fact.
+        let call_seq = call.get("seq").and_then(Value::as_f64).unwrap() as u64;
+        assert_eq!(
+            result.pointer("/data/sourceEventSeqs/0"),
+            Some(&json!(call_seq)),
+            "the result cites its call"
+        );
+        // The window's structured form persisted, so a UI card replays.
+        assert_eq!(
+            result.pointer("/data/meta/totalLines"),
+            Some(&json!(1)),
+            "{result}"
+        );
+
+        // The turn ran to a second model call that answered, which is the whole
+        // point: the tool result reached the next request.
+        let messages: Vec<&Value> = rows
+            .iter()
+            .filter(|r| r.get("type").and_then(Value::as_str) == Some("assistant/message"))
+            .collect();
+        assert_eq!(messages.len(), 2, "two model calls, two messages");
+        assert_eq!(
+            messages[1].pointer("/data/message/content/0/text"),
+            Some(&json!("DONE")),
+            "the second call's answer"
+        );
+        assert_eq!(
+            rows.last().unwrap().pointer("/data/reason/kind"),
+            Some(&json!("completed"))
+        );
+    }
+
+    /// A tool-calling turn's request carries the tools, and its second call
+    /// carries the answered result.
+    ///
+    /// The two claims are different and both matter: without the tool definitions
+    /// the model cannot call anything, and without the result item the second
+    /// request has a call with nothing answering it — which a real provider
+    /// rejects with a 400.
+    #[test]
+    fn the_request_offers_tools_and_the_next_one_carries_the_result() {
+        let work = tempfile::tempdir().expect("workspace");
+        std::fs::write(work.path().join("greeting.txt"), "hello\n").expect("file");
+        let session_id = "session-tools-req";
+        let (_home, sessions) = session_home_in(session_id, work.path());
+        let mut machine = AgentMachine::new(
+            sessions.clone(),
+            vec![canned_provider_seq(&READ_THEN_ANSWER)],
+        );
+        let _ = machine.handle(MachineIn::ServicesReady { keys: vec![] });
+        drive(
+            &mut machine,
+            MachineIn::Event {
+                name: vocoder_cordis::EventName::new(rpc::call_event("agent")),
+                payload: json!({
+                    "method": "run",
+                    "args": {
+                        "sessionId": session_id,
+                        "requestId": "req-tools-req",
+                        "content": [{ "type": "text", "text": "read greeting.txt" }],
+                    },
+                }),
+            },
+        );
+
+        // The request bodies the host actually sent, captured by the route's
+        // per-call canned bodies: the assertion is on what *was built*, not on
+        // what the machine holds.
+        let rows = written_rows_in(&sessions, Some(work.path()), session_id);
+        let req = machine
+            .canonical_request(&rows)
+            .expect("a request can be rebuilt from the log");
+        let (_, canonical) = req;
+        assert!(
+            canonical.tools.iter().any(|t| t.name == "read"),
+            "the tools are offered: {:?}",
+            canonical.tools.iter().map(|t| &t.name).collect::<Vec<_>>()
+        );
+        assert!(canonical.tools.iter().any(|t| t.name == "write"));
+        assert!(canonical.tools.iter().any(|t| t.name == "edit"));
+
+        // The conversation the second call would send carries the tool result as
+        // a *user* item — upstream's shape, and the only one a provider accepts
+        // for a tool outcome.
+        let items: Vec<String> = canonical
+            .messages
+            .iter()
+            .flat_map(|m| m.items.iter())
+            .map(|i| match i {
+                llm_dialect::items::ContentItem::ToolCall { name, .. } => format!("call:{name}"),
+                llm_dialect::items::ContentItem::ToolResult {
+                    tool_call_id,
+                    is_error,
+                    ..
+                } => format!("result:{tool_call_id}:{is_error}"),
+                llm_dialect::items::ContentItem::Text { .. } => "text".into(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert!(items.contains(&"call:read".to_string()), "{items:?}");
+        assert!(
+            items.contains(&"result:call_1:false".to_string()),
+            "the result is re-sent, not dropped: {items:?}"
+        );
+    }
+
+    /// A tool call rounds-trips through a turn and its row order is the
+    /// corpus's: the call *before* whatever the gate does with it.
+    ///
+    /// A denied call still records what the model asked for — a gate that
+    /// pre-empted the `tool/call` row would lose the only evidence the call
+    /// happened.
+    #[test]
+    fn a_denied_tool_call_is_still_recorded() {
+        let work = tempfile::tempdir().expect("workspace");
+        // A path outside the workspace, so the fence refuses the write.
+        let outside = work.path().join("..").join("escape.txt");
+        let session_id = "session-denied";
+        let (_home, sessions) = session_home_in(session_id, work.path());
+        let bodies: [&'static str; 2] = [
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],",
+                "\"created\":1,\"id\":\"c1\",\"model\":\"m\",\"object\":\"chat.completion.chunk\"}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_9\",",
+                "\"type\":\"function\",\"function\":{\"name\":\"write\",\"arguments\":",
+                "\"{\\\"file_path\\\":\\\"/etc/vocoder-escape\\\",\\\"content\\\":\\\"x\\\"}\"}}]},",
+                "\"finish_reason\":\"tool_calls\",\"index\":0}],\"created\":1,\"id\":\"c1\",",
+                "\"model\":\"m\",\"object\":\"chat.completion.chunk\"}\n\n",
+                "data: [DONE]\n\n",
+            ),
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"},\"finish_reason\":\"stop\",\"index\":0}],",
+                "\"created\":1,\"id\":\"c2\",\"model\":\"m\",\"object\":\"chat.completion.chunk\"}\n\n",
+                "data: [DONE]\n\n",
+            ),
+        ];
+        let mut machine = AgentMachine::new(sessions.clone(), vec![canned_provider_seq(&bodies)]);
+        let _ = machine.handle(MachineIn::ServicesReady { keys: vec![] });
+        drive(
+            &mut machine,
+            MachineIn::Event {
+                name: vocoder_cordis::EventName::new(rpc::call_event("agent")),
+                payload: json!({
+                    "method": "run",
+                    "args": {
+                        "sessionId": session_id,
+                        "requestId": "req-denied",
+                        "content": [{ "type": "text", "text": "write outside" }],
+                    },
+                }),
+            },
+        );
+
+        let rows = written_rows_in(&sessions, Some(work.path()), session_id);
+        let types: Vec<&str> = rows
+            .iter()
+            .map(|r| r.get("type").and_then(Value::as_str).unwrap_or_default())
+            .collect();
+        assert!(
+            types.contains(&"tool/call"),
+            "a denied call is still recorded: {types:?}"
+        );
+        let result = rows
+            .iter()
+            .find(|r| r.get("type").and_then(Value::as_str) == Some("tool/result"))
+            .expect("the refusal");
+        assert_eq!(
+            result.pointer("/data/message/content/0/isError"),
+            Some(&json!(true))
+        );
+        let text = result
+            .pointer("/data/message/content/0/content/0/text")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(
+            text.contains("[sandbox: file access denied under workspace-write mode]"),
+            "the denial names the mode: {text:?}"
+        );
+        // The refusal did not reach the filesystem.
+        assert!(!std::path::Path::new("/etc/vocoder-escape").exists());
+        // And the turn still completed: a refused call is the model's problem to
+        // work around, not a turn failure.
+        assert_eq!(
+            rows.last().unwrap().pointer("/data/reason/kind"),
+            Some(&json!("completed"))
+        );
+        let _ = outside;
+    }
 
     /// The whole turn, end to end, with no network: admission, the frame
     /// sequence, the recorded reply, and the packed stream.

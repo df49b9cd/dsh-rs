@@ -67,20 +67,18 @@ pub struct Call {
 }
 
 impl Call {
-    /// The `tool/call` row for this call, under an open turn and step.
+    /// The `tool/call` row's `data`, under an open turn and step.
     ///
     /// `callId` rather than `id`: the row's own identity is its `seq`, and the
-    /// model's id for the call is what the result has to cite.
-    pub fn row(&self, turn: u64, step: u64) -> Value {
+    /// model's id for the call is what the result has to cite. `data` rather than
+    /// the whole row because the row type is the executor's to name.
+    pub fn row_data(&self, turn: u64, step: u64) -> Value {
         json!({
-            "type": "tool/call",
-            "data": {
-                "turn": turn,
-                "step": step,
-                "callId": self.id,
-                "name": self.name,
-                "arguments": self.arguments,
-            },
+            "turn": turn,
+            "step": step,
+            "callId": self.id,
+            "name": self.name,
+            "arguments": self.arguments,
         })
     }
 }
@@ -266,7 +264,7 @@ impl Outcome {
     /// `sourceEventSeqs` cites the `tool/call` row, which is what lets a reader
     /// pair them after the fact; `surfaceOp: "append"` is the surface bookkeeping
     /// every corpus tool/result carries.
-    pub fn row(&self, turn: u64, step: u64, call: &Call, call_seq: u64) -> Value {
+    pub fn row_data(&self, turn: u64, step: u64, call: &Call, call_seq: u64) -> Value {
         let mut part = json!({
             "type": "tool-result",
             "toolCallId": call.id,
@@ -292,7 +290,7 @@ impl Outcome {
         if let Some(meta) = &self.meta {
             data["meta"] = meta.clone();
         }
-        json!({ "type": "tool/result", "data": data })
+        data
     }
 }
 
@@ -351,7 +349,7 @@ fn positive(args: &serde_json::Map<String, Value>, key: &str, default: u64) -> R
 ///
 /// Separated from rendering because the two are different questions and only one
 /// of them needs the file's bytes.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ReadWindow {
     pub path: String,
     pub offset: u64,
@@ -559,7 +557,7 @@ pub fn lang_from_path(path: &str) -> Option<&'static str> {
 }
 
 /// A `write` request after argument validation.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WriteRequest {
     pub path: String,
     pub contents: String,
@@ -612,7 +610,7 @@ pub fn write_outcome(
 }
 
 /// An `edit` request after argument validation.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EditRequest {
     pub path: String,
     pub old: String,
@@ -664,7 +662,7 @@ pub fn edit_request(arguments: &Arguments, root: &str) -> Result<EditRequest, St
 /// The three refusals are upstream's, and each is distinct because the model's
 /// correction differs: no match means a wrong `old_string`, several matches
 /// means the same, and neither is a filesystem error.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Edited {
     pub before: String,
     pub after: String,
@@ -760,6 +758,16 @@ pub enum Answer {
     Text(String),
     /// A write succeeded.
     Done,
+    /// A `Stat` resolved the target: its canonical path and whether it is a
+    /// directory.
+    ///
+    /// Carried rather than reduced to a bool because the *canonical* path is the
+    /// whole point of the effect for the fence: containment is judged against it,
+    /// not against the joined string (see [`super::sandbox`]).
+    Stat { canonical: String, is_dir: bool },
+    /// The target does not exist. Distinct from [`Self::Failed`] because the
+    /// tools branch on it: a `write` creates, a `read` refuses.
+    NotFound,
     /// The effect failed, with the message the driver rendered.
     Failed(String),
 }
@@ -1353,22 +1361,21 @@ mod tests {
             name: "read".into(),
             arguments: "{}".into(),
         };
-        let row = Outcome::text("hi").row(2, 3, &call, 14);
-        assert_eq!(row["type"], "tool/result");
-        assert_eq!(row["data"]["turn"], 2);
-        assert_eq!(row["data"]["step"], 3);
-        assert_eq!(row["data"]["message"]["role"], "user");
-        assert_eq!(row["data"]["message"]["source"]["callId"], "call_1");
-        assert_eq!(row["data"]["sourceEventSeqs"][0], 14);
-        assert_eq!(row["data"]["surfaceOp"], "append");
-        let part = &row["data"]["message"]["content"][0];
+        let data = Outcome::text("hi").row_data(2, 3, &call, 14);
+        assert_eq!(data["turn"], 2);
+        assert_eq!(data["step"], 3);
+        assert_eq!(data["message"]["role"], "user");
+        assert_eq!(data["message"]["source"]["callId"], "call_1");
+        assert_eq!(data["sourceEventSeqs"][0], 14);
+        assert_eq!(data["surfaceOp"], "append");
+        let part = &data["message"]["content"][0];
         assert_eq!(part["type"], "tool-result");
         assert_eq!(part["toolCallId"], "call_1");
         assert_eq!(part["isError"], false);
 
-        let call_row = call.row(2, 3);
-        assert_eq!(call_row["data"]["callId"], "call_1");
-        assert_eq!(call_row["data"]["name"], "read");
+        let call_row = call.row_data(2, 3);
+        assert_eq!(call_row["callId"], "call_1");
+        assert_eq!(call_row["name"], "read");
     }
 
     /// The catalog is a closed set, and every entry has a name and a schema.
