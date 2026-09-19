@@ -23,12 +23,14 @@ pub mod message_feedback;
 pub mod plugin_inventory;
 pub mod provider;
 pub mod readcache;
+pub mod sandbox;
 pub mod session;
 pub mod session_feedback;
 pub mod session_references;
 pub mod settings;
 pub mod skills;
 pub mod subagents;
+pub mod tool;
 pub mod workspace;
 pub mod workspace_files;
 
