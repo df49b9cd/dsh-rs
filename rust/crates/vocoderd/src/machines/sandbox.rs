@@ -79,11 +79,17 @@ impl Mode {
 
     /// The deployment default.
     ///
-    /// `workspace-write`, which is what the base profile's own
-    /// `DSH_PERMISSION_MODE ?? 'workspace-write'` resolves to with the variable
-    /// unset. Deliberately not read from the environment here: a machine may not
-    /// consult the process, so a deployment that wants a different default has to
-    /// pass it in (see [`Fence::new`]).
+    /// `workspace-write`, which is the **base profile's configured** default: its
+    /// `sandbox-policy` entry sets `mode: process.env.DSH_PERMISSION_MODE ??
+    /// 'workspace-write'`. Note that this is not the *package* default —
+    /// `sandbox-policy`'s own `Config.mode` defaults to `read-only`, the fail-safe
+    /// — because the base deployment opts in to a writable workspace explicitly.
+    /// Both facts are named because they disagree, and "what is the default mode"
+    /// has a different answer one layer up.
+    ///
+    /// Deliberately not read from the environment: a machine may not consult the
+    /// process, so a deployment that wants the package default (or anything else)
+    /// passes it to [`Fence::new`] instead.
     pub fn default_mode() -> Self {
         Self::WorkspaceWrite
     }
@@ -128,6 +134,21 @@ pub fn widening(from: Mode, to: Mode) -> Escape {
 }
 
 /// Which approval policy applies to a session.
+///
+/// **This is a different axis from [`Mode`] and there is deliberately no
+/// conversion between them.** An earlier revision of this module had a
+/// `policy_for(mode)` helper whose existence invited the inverse — and the
+/// inverse cannot exist, because the mapping is not injective: the base
+/// profile's presets pair *both* `read-only` and `workspace-write` with
+/// `approval: ask`. A reader who tried to recover a mode from a policy would
+/// have to guess, and the guess that looks natural (`ask` → `workspace-write`)
+/// is **strictly wider than `read-only`** — a fail-open bug. That is exactly what
+/// `AgentMachine::fence_for` did before it was fixed, and the corpus's
+/// `missing-sandbox-runner` session (`approval/policy: ask` at `sandbox/mode:
+/// read-only`) is the counterexample.
+///
+/// The policy is therefore only ever *read* — by the approval gate, from the
+/// session's own row — and never derived.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Policy {
     /// Put the question to the answerer chain.
@@ -143,19 +164,6 @@ impl Policy {
             "never" => Some(Self::Never),
             _ => None,
         }
-    }
-}
-
-/// The policy a mode implies, which is the base profile's `permission` mapping.
-///
-/// `danger-full-access` is `never` — the unattended stance — and the two confined
-/// modes are `ask`. The pairing is not arbitrary: a host that has already granted
-/// the widest mode has nothing left to ask about, and a host that confines must
-/// ask before widening.
-pub fn policy_for(mode: Mode) -> Policy {
-    match mode {
-        Mode::DangerFullAccess => Policy::Never,
-        Mode::ReadOnly | Mode::WorkspaceWrite => Policy::Ask,
     }
 }
 
@@ -403,14 +411,60 @@ mod tests {
         assert_eq!(widening(Mode::ReadOnly, Mode::ReadOnly), Escape::Same);
     }
 
-    /// The default is the base profile's, and its policy is `ask`.
+    /// The default is the base profile's, and it is the confined one.
     #[test]
-    fn the_default_mode_asks() {
+    fn the_default_mode_is_the_confined_one() {
         assert_eq!(Mode::default_mode(), Mode::WorkspaceWrite);
-        assert_eq!(policy_for(Mode::default_mode()), Policy::Ask);
-        // A host that has granted the widest mode has nothing to ask about.
-        assert_eq!(policy_for(Mode::DangerFullAccess), Policy::Never);
-        assert_eq!(policy_for(Mode::ReadOnly), Policy::Ask);
+        // The *package* default is `read-only`; the base deployment widens it to
+        // `workspace-write`. Both are narrower than the widest mode, which is the
+        // property that matters — a default that failed open would be the bug.
+        assert_ne!(Mode::default_mode(), Mode::DangerFullAccess);
+    }
+
+    /// **Mode and policy are independent axes, and the corpus says so.**
+    ///
+    /// There is no `policy_for` and there must not be one: the mapping is not
+    /// injective, so any inverse is a guess. The cross-tabulation of every
+    /// session snapshot's last `sandbox/mode` and `approval/policy` rows gives
+    ///
+    /// ```text
+    /// 185  danger-full-access|never
+    ///   4  workspace-write|ask
+    ///   4  read-only|ask
+    /// ```
+    ///
+    /// — `ask` pairs with *two* different modes, so recovering a mode from a
+    /// policy is underdetermined, and the guess that reads as natural
+    /// (`ask` → `workspace-write`) grants writes to the four sessions upstream
+    /// confines to reads. That was a real fail-open bug in `fence_for`, and the
+    /// counts are asserted here so the temptation to re-add a helper meets the
+    /// evidence rather than a comment.
+    #[test]
+    fn mode_and_policy_are_independent() {
+        // The pairings the corpus actually contains.
+        let observed = [
+            (Mode::DangerFullAccess, Policy::Never),
+            (Mode::WorkspaceWrite, Policy::Ask),
+            (Mode::ReadOnly, Policy::Ask),
+        ];
+        // `ask` is reached by two distinct modes — the non-injectivity itself.
+        let asked: Vec<Mode> = observed
+            .iter()
+            .filter(|(_, p)| *p == Policy::Ask)
+            .map(|(m, _)| *m)
+            .collect();
+        assert_eq!(asked, vec![Mode::WorkspaceWrite, Mode::ReadOnly]);
+        assert!(
+            asked.len() > 1,
+            "if this ever fails the axes have been conflated again"
+        );
+        // And the natural-looking inverse would widen `read-only`, which is the
+        // direction that matters: strictly wider is the one that must not happen.
+        assert_eq!(
+            widening(Mode::ReadOnly, Mode::WorkspaceWrite),
+            Escape::Wider,
+            "deriving `ask` → `workspace-write` grants a read-only session writes"
+        );
     }
 
     /// Containment is component-wise, so a sibling with a shared prefix is not

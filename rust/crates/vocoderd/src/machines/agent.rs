@@ -1425,31 +1425,46 @@ impl AgentMachine {
 
     /// The confinement fence for a session.
     ///
-    /// The mode follows the session's own `approval/policy` row when it has one:
-    /// `never` means this host does not ask, which is the unattended stance and
-    /// pairs with the widest mode; `ask` pairs with the confined default. With no
-    /// row, the deployment default applies.
+    /// **The mode comes from `sandbox/mode`, never from `approval/policy`.** They
+    /// are two independent axes and conflating them is a fail-open bug, which is
+    /// what an earlier version of this function did:
     ///
-    /// **The policy is not switchable per session yet** — this host composes no
-    /// `permissionPresets` machine — so a session can carry a policy but nothing
-    /// can change it. That is a gap in the business surface, not in the fence, and
-    /// it is stated rather than implied because a reader would otherwise assume
-    /// the mapping is driven by a client.
+    /// - `approval/policy` decides whether a request to *widen* is put to a human.
+    /// - `sandbox/mode` decides what the fence actually permits right now.
+    ///
+    /// The corpus proves they are independent. `missing-sandbox-runner` and
+    /// `partial-landlock-child-failure` both run at **`read-only`** — the most
+    /// restrictive mode there is — while carrying `approval/policy: ask`. Reading
+    /// the policy as if it were the mode derived `workspace-write` for both, i.e.
+    /// it *granted writes to sessions upstream confines to reads*. The base
+    /// profile's own `permission` presets table shows the axes pairing
+    /// consistently and yet not identically: `read-only` and `workspace-write`
+    /// are both `approval: ask`, so the policy cannot distinguish them.
+    ///
+    /// The mode is the last `sandbox/mode` row, which is the projection upstream
+    /// folds (`sandbox-policy/src/session-mode.ts`: "the LAST such event is the
+    /// session's override"). With no row, the deployment default applies — and
+    /// upstream's own default is `read-only` (`sandbox-policy`'s
+    /// `Config.mode` default), which is why [`Mode::default_mode`] is the
+    /// confined one rather than the widest.
+    ///
+    /// **Nothing writes `sandbox/mode` yet.** Upstream's write path is
+    /// `permissionPresets`, which this host does not compose and which no wire
+    /// descriptor carries — the presets are applied in-process, not over the
+    /// gateway. So a session can only ever run at the default here. Stated rather
+    /// than implied, because a reader would otherwise assume a client can switch
+    /// modes.
     fn fence_for(&self, state: &TurnState) -> Fence {
         let mode = state
             .rows
             .iter()
             .rev()
             .find_map(|r| {
-                (r.get("type").and_then(Value::as_str) == Some("approval/policy"))
-                    .then(|| r.pointer("/data/policy").and_then(Value::as_str))
+                (r.get("type").and_then(Value::as_str) == Some("sandbox/mode"))
+                    .then(|| r.pointer("/data/mode").and_then(Value::as_str))
                     .flatten()
             })
-            .and_then(super::sandbox::Policy::parse)
-            .map(|p| match p {
-                super::sandbox::Policy::Never => Mode::DangerFullAccess,
-                super::sandbox::Policy::Ask => Mode::WorkspaceWrite,
-            })
+            .and_then(Mode::parse)
             .unwrap_or_else(Mode::default_mode);
         Fence::new(mode, self.workspace_root(state))
     }
@@ -2663,6 +2678,138 @@ mod tests {
     /// A denied call still records what the model asked for — a gate that
     /// pre-empted the `tool/call` row would lose the only evidence the call
     /// happened.
+    /// **A session at `read-only` denies a write even when its approval policy is
+    /// `ask`.**
+    ///
+    /// This is the fail-open bug in miniature, and it is pinned because the
+    /// version of `fence_for` that read `approval/policy` would have *granted*
+    /// this write. The corpus's `missing-sandbox-runner` and
+    /// `partial-landlock-child-failure` sessions carry `approval/policy: ask` while
+    /// running at `read-only`; deriving the mode from the policy gave them
+    /// `workspace-write`, which is strictly wider than what upstream permits.
+    ///
+    /// The two axes are independent by construction — `read-only` and
+    /// `workspace-write` are *both* `approval: ask` in the base profile's presets
+    /// table — so no mapping between them can be correct.
+    #[test]
+    fn a_read_only_session_denies_a_write_whatever_its_approval_policy_says() {
+        let work = tempfile::tempdir().expect("workspace");
+        let session_id = "session-read-only";
+        let (_home, sessions) = session_home_in(session_id, work.path());
+        // The session's own mode row, which is the authority.
+        append_mode_row(&sessions, work.path(), session_id, "read-only");
+
+        let write_body: &'static str = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_ro\",",
+            "\"type\":\"function\",\"function\":{\"name\":\"write\",\"arguments\":",
+            "\"{\\\"file_path\\\":\\\"inside.txt\\\",\\\"content\\\":\\\"x\\\"}\"}}]},",
+            "\"finish_reason\":\"tool_calls\",\"index\":0}],\"created\":1,\"id\":\"c1\",",
+            "\"model\":\"m\",\"object\":\"chat.completion.chunk\"}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let answer_body: &'static str = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"},\"finish_reason\":\"stop\",\"index\":0}],",
+            "\"created\":1,\"id\":\"c2\",\"model\":\"m\",\"object\":\"chat.completion.chunk\"}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut machine = AgentMachine::new(
+            sessions.clone(),
+            vec![canned_provider_seq(&[write_body, answer_body])],
+        );
+        let _ = machine.handle(MachineIn::ServicesReady { keys: vec![] });
+        drive(
+            &mut machine,
+            MachineIn::Event {
+                name: vocoder_cordis::EventName::new(rpc::call_event("agent")),
+                payload: json!({
+                    "method": "run",
+                    "args": {
+                        "sessionId": session_id,
+                        "requestId": "req-read-only",
+                        "content": [{ "type": "text", "text": "write inside" }],
+                    },
+                }),
+            },
+        );
+
+        let rows = written_rows_in(&sessions, Some(work.path()), session_id);
+        let result = rows
+            .iter()
+            .find(|r| r.get("type").and_then(Value::as_str) == Some("tool/result"))
+            .expect("the refusal");
+        assert_eq!(
+            result.pointer("/data/message/content/0/isError"),
+            Some(&json!(true)),
+            "a read-only session must refuse the write: {result}"
+        );
+        let text = result
+            .pointer("/data/message/content/0/content/0/text")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(
+            text.contains("read-only"),
+            "the denial names read-only, not workspace-write: {text:?}"
+        );
+        // **The file was not created.** This is the assertion that would have
+        // failed before the fix: the write was *inside* the workspace, so only
+        // the mode — not containment — could have stopped it.
+        assert!(
+            !work.path().join("inside.txt").exists(),
+            "read-only denied the write"
+        );
+    }
+
+    /// Append a `sandbox/mode` row to a session's newest generation.
+    ///
+    /// The row is the authority `fence_for` reads, so a test that wants a session
+    /// in a non-default mode has to write one — which is also the honest picture:
+    /// nothing in this host writes it, so the only way a mode arrives is from a
+    /// log that already carried one (a resumed session, or a delegation seed).
+    fn append_mode_row(
+        sessions: &std::path::Path,
+        cwd: &std::path::Path,
+        session_id: &str,
+        mode: &str,
+    ) {
+        let dir = sessions
+            .join(super::super::session::SessionStore::project_dir(Some(
+                &cwd.to_string_lossy(),
+            )))
+            .join(super::super::session::SessionStore::encode_segment(
+                session_id,
+            ));
+        let listing: Vec<String> = std::fs::read_dir(&dir)
+            .map(|e| {
+                e.flatten()
+                    .map(|x| x.path().to_string_lossy().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let dir_str = dir.to_string_lossy().to_string();
+        let (_, path) =
+            super::super::session::SessionStore::latest_generation_in(&dir_str, &listing)
+                .expect("a generation");
+        let bytes = std::fs::read(&path).expect("read generation");
+        let mut rows = vocoder_session::decode_generation(
+            &bytes,
+            super::super::session::SessionStore::is_compressed(&path),
+        )
+        .expect("decode");
+        let seq = rows.len().saturating_sub(1) as f64;
+        rows.push(json!({
+            "type": "sandbox/mode",
+            "seq": seq,
+            "time": 0,
+            "data": { "mode": mode },
+        }));
+        let bytes = vocoder_session::encode_generation(&rows, false).expect("encode");
+        std::fs::write(
+            dir.join(vocoder_session::generation_filename(1, false)),
+            bytes,
+        )
+        .expect("write generation");
+    }
+
     #[test]
     fn a_denied_tool_call_is_still_recorded() {
         let work = tempfile::tempdir().expect("workspace");
