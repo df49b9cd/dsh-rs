@@ -122,6 +122,23 @@ impl FsCache {
         self.chosen.clear();
     }
 
+    /// Drop the cached walk so the next read re-walks the tree.
+    ///
+    /// Needed by a **read-only** machine: the automatic invalidation below
+    /// fires only when *this* machine publishes a write, so a machine that
+    /// never writes keeps its first walk forever and never sees files another
+    /// machine created. `subagents` is exactly that shape — it enumerates
+    /// sessions the `session` machine writes — so it must invalidate per call.
+    ///
+    /// Clears `requested` for the root as well, or the re-walk would
+    /// short-circuit to an empty tree.
+    pub fn invalidate_tree(&mut self) {
+        self.tree = None;
+        if let Some(root) = self.root.clone() {
+            self.requested.remove(&root);
+        }
+    }
+
     /// Remember a value the post-write re-run must replay.
     ///
     /// Distinct from [`Self::choose`]: that pins a *decision* so a re-run makes

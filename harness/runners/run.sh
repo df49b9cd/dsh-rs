@@ -42,7 +42,14 @@ dsh)
             sleep 1
         done
         [ -n "$TOKEN_URL" ] || { echo "dsh did not print a token URL on $PORT" >&2; exit 1; }
-        H=$(curl -sI -H "Accept: text/html" "$TOKEN_URL" | awk -F': *' 'BEGIN{IGNORECASE=1} /^set-cookie:/ { sub(/;.*/, "", $2); print $2; exit }')
+        # A **GET whose headers we keep** (`-D -`), not `curl -I`. The token
+        # exchange is a one-shot GET that answers with the `set-cookie` for the
+        # browser session; a HEAD request does not return it, which is why this
+        # step used to fail with "token exchange produced no set-cookie" while
+        # the host itself was healthy. `-o /dev/null` drops the body, and the
+        # full cookie value is written — it is ~224 bytes, and a truncated one
+        # yields a 401 and non-JSON bodies downstream.
+        H=$(curl -s -D - -o /dev/null "$TOKEN_URL" | awk -F': ' 'BEGIN{IGNORECASE=1} /^set-cookie:/{sub(/;.*/,"",$2); print $2; exit}')
         [ -n "$H" ] || { echo "token exchange produced no set-cookie" >&2; exit 1; }
         echo "$H" > "$DSH_HOME/conformance.cookie"
         echo "dsh ready on $PORT (auth cookie at $DSH_HOME/conformance.cookie)"

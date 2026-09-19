@@ -144,6 +144,10 @@ impl PluginMachine for MuxSessionMachine {
                         .and_then(|v| v.as_str())
                         .unwrap_or("RemoteError")
                         .into(),
+                    code: payload
+                        .get("code")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
                     message: payload
                         .get("message")
                         .and_then(|v| v.as_str())

@@ -103,10 +103,21 @@ pub fn decode_rpc_server_response(bytes: &[u8]) -> Result<ServerResponse, FrameE
 pub type StreamId = String;
 
 /// Failure body for one errored stream.
+///
+/// `code` is a **first-class field**, because a client branches on it and the
+/// control host answers it at `error.code` — e.g. `session/not-found` for a
+/// follow of an unknown session, `gateway/invocation-unavailable` for a stream
+/// on a namespace that exports nothing. It was previously smuggled into
+/// `message` as a parenthetical, which a client could only recover by parsing
+/// prose. `name` stays separate: it classifies the error (`RemoteError`), and
+/// the control omits it on stream frames, so neither host may rely on it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamFailure {
     pub name: String,
+    /// Stable `<domain>/<reason>` code, mirroring `RemoteError.code`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<serde_json::Value>,

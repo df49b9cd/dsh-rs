@@ -45,23 +45,25 @@ pub fn stream_end(stream_id: &str) -> MachineOut {
     })
 }
 
-/// Terminate a stream with a RemoteError-shaped failure. The Typert error
-/// code rides inside `details.code`, mirroring dsh's stream failure.
+/// Terminate a stream with a RemoteError-shaped failure.
+///
+/// The code rides at `error.code`, which is where the control host puts it and
+/// where a client reads it. It used to be folded into `details.code` *and*
+/// parenthesised into the message, so the only way a client could branch on it
+/// was to parse prose — and `details.code` carried the literal string
+/// `"RemoteError"` (the *name*) rather than the code.
 pub fn stream_error(
     stream_id: &str,
     code: &str,
     message: impl Into<String>,
     details: Option<serde_json::Value>,
 ) -> MachineOut {
-    let mut details = details.unwrap_or(serde_json::json!({}));
-    if let Some(obj) = details.as_object_mut() {
-        obj.insert("code".into(), code.into());
-    }
     MachineOut::Stream(StreamFrame::Error {
         stream_id: stream_id.to_string(),
         name: "RemoteError".into(),
+        code: code.to_string(),
         message: message.into(),
-        details,
+        details: details.unwrap_or(serde_json::json!({})),
     })
 }
 

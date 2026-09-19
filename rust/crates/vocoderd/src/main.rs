@@ -6,6 +6,7 @@ mod driver;
 mod machines;
 mod registry;
 mod rpc;
+mod validate;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -183,12 +184,14 @@ impl AppState {
                 vocoder_cordis::StreamFrame::Error {
                     stream_id,
                     name,
+                    code,
                     message,
                     details,
                 } => vocoder_typert::StreamServerMessage::Error {
                     stream_id,
                     error: vocoder_typert::StreamFailure {
                         name,
+                        code: Some(code),
                         message,
                         details: Some(details).filter(|d| !d.is_null()),
                     },
@@ -334,6 +337,20 @@ async fn main() -> Result<()> {
         id: MachineId::new("$events"),
         machine: Box::new(crate::machines::events::EventsMachine::default()),
     });
+    initial_router.handle(RouteIn::Mount {
+        id: MachineId::new("agentTeams"),
+        machine: Box::new(crate::machines::agent_teams::AgentTeamsMachine::default()),
+    });
+    initial_router.handle(RouteIn::Mount {
+        id: MachineId::new("llm"),
+        machine: Box::new(crate::machines::llm::LlmMachine),
+    });
+    initial_router.handle(RouteIn::Mount {
+        id: MachineId::new("subagents"),
+        machine: Box::new(crate::machines::subagents::SubagentsMachine::new(
+            sessions_root.clone(),
+        )),
+    });
     let mut registry = vocoder_typert::dispatch::NamespaceRegistry::new();
     registry_owner_register(&mut registry, "goals", "goals");
     registry_owner_register(&mut registry, "session", "session");
@@ -354,6 +371,9 @@ async fn main() -> Result<()> {
         "sessionReferenceResolver",
     );
     registry_owner_register(&mut registry, "$events", "$events");
+    registry_owner_register(&mut registry, "agentTeams", "agentTeams");
+    registry_owner_register(&mut registry, "llm", "llm");
+    registry_owner_register(&mut registry, "subagents", "subagents");
 
     // `pluginInventory` is mounted last and takes its answer from the two facts
     // that only exist now: the mounted machine tree and the namespace registry.
@@ -530,10 +550,15 @@ async fn ws_conn(mut socket: WebSocket, state: Arc<AppState>) {
                                     stream_id,
                                     error: vocoder_typert::StreamFailure {
                                         name: "RemoteError".into(),
-                                        message: format!(
-                                            "no such namespace on this host: {namespace}"
+                                        code: Some(
+                                            "gateway/invocation-unavailable".into(),
                                         ),
-                                        details: None,
+                                        message: format!(
+                                            "typert gateway: {endpoint}: no active Remote method exports this endpoint"
+                                        ),
+                                        details: Some(serde_json::json!({
+                                            "endpoint": endpoint,
+                                        })),
                                     },
                                 };
                                 let text = String::from_utf8(
@@ -559,11 +584,13 @@ async fn ws_conn(mut socket: WebSocket, state: Arc<AppState>) {
                             });
                             state.route_stream_outs(outs);
                         }
-                        let text = String::from_utf8(vocoder_typert::encode_stream_server(
-                            &StreamServerMessage::End { stream_id },
-                        ))
-                        .unwrap();
-                        let _ = socket.send(Message::Text(text.into())).await;
+                        // **No `end` frame in reply.** The cancel *is* the
+                        // stream's termination: upstream's pump only sends
+                        // `end` when its source completed on its own, guarded
+                        // by `if (!active.abort.signal.aborted)`
+                        // (`packages/api/gateway/src/stream-server.ts:166`).
+                        // Replying `end` after a cancel invents a second
+                        // termination for a stream the client already closed.
                     }
                     Err(_) => break, // malformed frame: close connection
                 }
@@ -606,21 +633,6 @@ async fn api_rpc(
     axum::extract::Path(_endpoint): axum::extract::Path<String>,
     body: Bytes,
 ) -> impl IntoResponse {
-    let respond_err = |rpc_id: String, code: &str, message: String| -> (StatusCode, String) {
-        let bytes = encode_rpc_server_response(&ServerResponse {
-            rpc_id,
-            result: RpcResult::Err {
-                ok: vocoder_typert::OkTag(false),
-                error: RpcError {
-                    code: code.into(),
-                    message,
-                    details: None,
-                },
-            },
-        });
-        (StatusCode::OK, String::from_utf8(bytes).unwrap())
-    };
-
     let req: ClientRequest = match decode_rpc_client_request(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -649,17 +661,55 @@ async fn api_rpc(
         );
     };
 
+    // The dispatch boundary: check the args against the spec'd descriptor
+    // *before* the machine sees them, which is where the control host does its
+    // own checks and why it answers `arguments-invalid`/`input-invalid` rather
+    // than whatever the machine would have said about a malformed payload.
+    let args = req
+        .payload
+        .get("args")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if let Some(rejection) = crate::validate::check(&namespace, &method, &args) {
+        return crate::validate::respond(req.rpc_id.clone(), &rejection);
+    }
+
     let outs = state.pump(
         &owner_id,
         MachineIn::Event {
             name: EventName::new(crate::rpc::call_event(&namespace)),
             payload: serde_json::json!({
                 "method": method,
-                "args": req.payload.get("args").cloned().unwrap_or(serde_json::Value::Null),
+                "args": args,
             }),
         },
     );
 
+    respond(outs, req.rpc_id)
+}
+
+/// A typed gateway failure, as the HTTP response.
+///
+/// A free function rather than a closure because the dispatch boundary uses it
+/// from more than one place now — the envelope check, the namespace lookup, and
+/// the argument validator all answer through it.
+fn respond_err(rpc_id: String, code: &str, message: String) -> (StatusCode, String) {
+    let bytes = encode_rpc_server_response(&ServerResponse {
+        rpc_id,
+        result: RpcResult::Err {
+            ok: vocoder_typert::OkTag(false),
+            error: RpcError {
+                code: code.into(),
+                message,
+                details: None,
+            },
+        },
+    });
+    (StatusCode::OK, String::from_utf8(bytes).unwrap())
+}
+
+/// Turn a machine's outputs into the HTTP response.
+fn respond(outs: Vec<RouteOut>, rpc_id: String) -> (StatusCode, String) {
     for out in outs {
         let RouteOut::Reply { reply, .. } = out else {
             continue;
@@ -685,14 +735,14 @@ async fn api_rpc(
             }
         };
         let body = encode_rpc_server_response(&ServerResponse {
-            rpc_id: req.rpc_id.clone(),
+            rpc_id: rpc_id.clone(),
             result,
         });
         return (StatusCode::OK, String::from_utf8(body).unwrap());
     }
 
     respond_err(
-        req.rpc_id.clone(),
+        rpc_id,
         "gateway/internal",
         "no result from business machine".into(),
     )

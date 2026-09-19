@@ -12,6 +12,12 @@ SUITES=("${@:-wire e2e-replay session-replay interop}")
 [ "${#SUITES[@]}" -eq 0 ] || [ "${SUITES[0]}" = "wire e2e-replay session-replay interop" ] && SUITES=(wire e2e-replay session-replay interop)
 
 export CONFORMANCE_HOME="$ROOT/.scratch/${HOST}-home"
+# The suites read the control's auth cookie from this path (see
+# `conformance/wire/tests/*.rs`). It was never exported, so every control run
+# needed the cookie passed by hand and `./run-conformance.sh dsh wire` could
+# not work as a one-command parity check. vocoderd is loopback-trusted and
+# simply ignores the file when it is absent.
+export CONFORMANCE_COOKIE_FILE="$CONFORMANCE_HOME/conformance.cookie"
 rm -rf "$CONFORMANCE_HOME"; mkdir -p "$CONFORMANCE_HOME"
 
 echo "== starting host: $HOST"
@@ -23,13 +29,25 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Readiness: poll the base URL until it answers.
+# Readiness: poll until the host answers. For the control that means *with*
+# the auth cookie — an unauthenticated `GET /` answers 401, so probing it
+# bare would never succeed and the run would die at "did not become ready"
+# even though the host was up. (vocoderd is loopback-trusted and ignores the
+# cookie, so one form works for both.)
 BASE="${CONFORMANCE_BASE_URL:-http://127.0.0.1:3080}"
+COOKIE_FILE="$CONFORMANCE_COOKIE_FILE"
+probe() {
+    if [ -f "$COOKIE_FILE" ]; then
+        curl -sf -o /dev/null -H "cookie: $(cat "$COOKIE_FILE")" "$BASE/"
+    else
+        curl -sf -o /dev/null "$BASE/"
+    fi
+}
 for _ in $(seq 1 60); do
-    curl -sf -o /dev/null "$BASE/" && break
+    probe && break
     sleep 1
 done
-curl -sf -o /dev/null "$BASE/" || { echo "host $HOST did not become ready" >&2; exit 1; }
+probe || { echo "host $HOST did not become ready" >&2; exit 1; }
 echo "== host ready at $BASE"
 
 status=0
@@ -59,8 +77,15 @@ for suite in "${SUITES[@]}"; do
             || status=1
         ;;
     session-replay)
-        (cd "$ROOT/conformance/session-replay" 2>/dev/null && cargo test) \
-            || { echo "session-replay: not yet scaffolded (M0 pending)"; }
+        # There is no `conformance/session-replay/` directory: the suite lives
+        # with the codec it tests, in `rust/crates/vocoder-session/tests/
+        # interop.rs`, and asserts both directions (Rust reads every
+        # `dsh/snapshots/session` generation; the JS stack reads a
+        # vocoderd-written home — see the `interop` branch below). The label
+        # used to say "not yet scaffolded (M0 pending)", which was both wrong
+        # and misleading: the assertions exist and pass.
+        (cd "$ROOT/rust" && cargo test -p vocoder-session) \
+            || { echo "session-replay: rust/crates/vocoder-session/tests/interop.rs failed"; status=1; }
         ;;
     interop)
         # Only meaningful for the Rust host: drive a few writes, then let

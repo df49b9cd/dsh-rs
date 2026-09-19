@@ -50,7 +50,8 @@
               "type": "unknown",
               "note": "toJSONSchema threw"
             }
-          }
+          },
+          "acceptsUndefined": true
         }
       ],
       "result": {
@@ -6858,7 +6859,8 @@
               "type": "unknown",
               "note": "toJSONSchema threw"
             }
-          }
+          },
+          "acceptsUndefined": true
         }
       ],
       "result": {
@@ -7349,7 +7351,8 @@
               "type": "unknown",
               "note": "toJSONSchema threw"
             }
-          }
+          },
+          "acceptsUndefined": true
         }
       ],
       "result": {
@@ -7731,7 +7734,8 @@
               "type": "unknown",
               "note": "toJSONSchema threw"
             }
-          }
+          },
+          "acceptsUndefined": true
         }
       ],
       "result": {
@@ -8060,7 +8064,8 @@
               "type": "unknown",
               "note": "toJSONSchema threw"
             }
-          }
+          },
+          "acceptsUndefined": true
         }
       ],
       "result": {

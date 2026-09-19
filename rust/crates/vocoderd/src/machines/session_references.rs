@@ -251,7 +251,7 @@ impl SessionReferencesMachine {
 ///
 /// A rename appends, so the last such row wins — the same fold a projection
 /// snapshot would hold. A session renamed twice is titled by the second name.
-fn folded_title(rows: &[serde_json::Value]) -> Option<String> {
+pub fn folded_title(rows: &[serde_json::Value]) -> Option<String> {
     rows.iter()
         .filter(|row| row.get("type").and_then(|v| v.as_str()) == Some("session/title"))
         .filter_map(|row| {

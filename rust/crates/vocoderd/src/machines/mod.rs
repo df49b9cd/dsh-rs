@@ -4,12 +4,14 @@
 //! "vocoder/<ns>/call" events and realizes its rpc.result outputs.
 
 pub mod agent_presets;
+pub mod agent_teams;
 pub mod commands;
 pub mod credentials;
 pub mod directory_picker;
 pub mod events;
 pub mod file_references;
 pub mod goals;
+pub mod llm;
 pub mod message_feedback;
 pub mod plugin_inventory;
 pub mod readcache;
@@ -18,6 +20,7 @@ pub mod session_feedback;
 pub mod session_references;
 pub mod settings;
 pub mod skills;
+pub mod subagents;
 pub mod workspace;
 pub mod workspace_files;
 

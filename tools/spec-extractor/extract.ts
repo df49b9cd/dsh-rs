@@ -38,6 +38,13 @@ function paramOf(p) {
     codec: codecOf(p.codec),
   }
   if (p.lookup) out.lookup = p.lookup
+  // `acceptsUndefined` is how the descriptor encodes "this wire field may be
+  // absent" (`packages/typert/protocol/src/types.ts`). Dropping it made every
+  // parameter look required, which a consumer validating at the boundary would
+  // then enforce against callers the control accepts — the difference between
+  // `settings/update` succeeding and answering `arguments-invalid` for a
+  // missing `expectedRevision`.
+  if (p.acceptsUndefined === true) out.acceptsUndefined = true
   return out
 }
 

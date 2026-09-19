@@ -5,7 +5,7 @@
 
 pub mod generated;
 
-pub use generated::{error_codes, traits, types};
+pub use generated::{error_codes, traits, types, validate};
 
 /// Carrier-independent Remote failure. Mirrors `RemoteError` in
 /// `dsh/packages/typert/protocol`: code-discriminated, details by code.

@@ -201,6 +201,10 @@ pub enum StreamFrame {
     Error {
         stream_id: String,
         name: String,
+        /// Stable `<domain>/<reason>` code. A client branches on this, and the
+        /// control host puts it at `error.code`, so it is a field rather than
+        /// something recovered from `message`.
+        code: String,
         message: String,
         details: Payload,
     },

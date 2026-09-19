@@ -75,6 +75,43 @@ paper over. Each asserts the invariant *both* hosts meet:
 | `goals/complete` with a `ref` that names no goal | `gateway/internal` "no current goal" | `goal/not-found` |
 | `sessionReferenceResolver/candidates` for an unknown agent | `session/not-found` | empty array |
 | `directoryPicker/pick` | **blocks forever** on a native dialog | `directory-picker/unavailable` |
+| `session/follow` after a `cancel` | no `end` frame — the cancel *is* the termination | (was: an `end` frame) |
+| A live follow frame for a prompted message | `agent/inbox/spliced` (a live loop appends it) | `user/message` (no loop yet; M4) |
+
+
+**The 2026-09-19 implementation pass found five more candidate defects**, all by
+running the control rather than reading either host. Each is now fixed and
+covered by a cell:
+
+1. **`subagents/list` refused an unknown parent** with
+   `subagent/parent-unavailable`. The control returns `{entries: [],
+   parentAvailable: false}` in a *successful* catalog, and `parentAvailable` is
+   a required field — so the candidate's answer was schema-invalid.
+2. **`subagents/prompt` accepted a `request` the descriptor rejects.** The
+   required keys are `requestId, parentSessionId, childSessionId, mode,
+   delivery, content`, with `mode` a `const`. The candidate validated none of
+   them; the control answers `arguments-invalid`/`input-invalid`.
+3. **`subagents/prompt` checked the child before the parent**, reversing two
+   answers the control distinguishes. Admission to the parent comes first.
+4. **`subagents/interruptByParent` refused an unknown child.** Upstream's
+   `interrupt` is a no-op without a continuation service and its contract
+   accepts absent targets, so the control answers `{accepted: true}`.
+5. **Stream failures buried the error code in `message`** (and put the literal
+   `"RemoteError"` in `details.code`), where the control puts it at
+   `error.code`. `StreamFailure` now carries `code` as a real field.
+
+Three *cell* defects surfaced at the same time, the same class the settings
+cells fell into: `session/prompt` was called without the spec'd `mode`; the
+stream `error` frames were asserted to carry a `name` field the control omits;
+and the workspace-increment cell hardcoded a title that a second run in one
+home collides with.
+
+**The `streams_spec` suite never sent the auth cookie** — neither on the WS
+upgrade nor in its `rpc` helper — so every cell failed 401 against the control
+and reported 0/8. It now reads `CONFORMANCE_COOKIE_FILE` like the other suites,
+and `run-conformance.sh` exports it (it never had), which is what makes
+`./run-conformance.sh dsh wire` a genuine one-command parity check rather than
+a documented procedure.
 
 The last one is why `endpoints_spec.rs` carries a per-request timeout: without
 it the matrix hangs instead of reporting, which is precisely the failure mode a
@@ -85,10 +122,12 @@ host*, not as passing.
 ## Axis 2 — session log replay
 
 There is no `conformance/session-replay/` directory: the suite lives with the
-codec it tests, in `rust/crates/vocoder-session/tests/interop.rs` (and
-`run-conformance.sh`'s `session-replay` branch reports it as not yet
-scaffolded). Promoting it to a real suite directory is open work; the
-assertions themselves are the two below.
+codec it tests, in `rust/crates/vocoder-session/tests/interop.rs`, and
+`run-conformance.sh`'s `session-replay` branch now runs it there (it used to
+report "not yet scaffolded (M0 pending)", which was wrong — the assertions
+existed and passed). Promoting it to a real suite directory is still open, but
+it is tidiness rather than a gap; the assertions themselves are the two
+below.
 
 - **read interop**: `dsh/snapshots/**/session.vN.jsonl[.zstd]` must decode under
   the Rust reader with identical projected messages.

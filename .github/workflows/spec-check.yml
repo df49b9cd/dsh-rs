@@ -50,4 +50,47 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with: { workspaces: "tools/codegen -> target" }
       - run: just codegen
-      - run: git diff --exit-code -- rust/crates/vocoder-spec-api
+      # `docs/spec-coverage.md` is generated too, and is committed for the
+      # same reason the bindings are: a stale table is a claim about coverage
+      # that no longer holds. Gating only `vocoder-spec-api` let one land.
+      - run: just coverage-report
+      - run: |
+          git diff --exit-code -- \
+            rust/crates/vocoder-spec-api \
+            docs/spec-coverage.md
+
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      # The **candidate half** of the wire axis. This is deliberately not
+      # parity: the control run needs the dsh host's browser-auth token dance
+      # (`harness/runners/run.sh dsh`), which is a local procedure, so parity
+      # stays the check you run by hand. What this job catches is a candidate
+      # that regresses against the spec'd contract on its own — which is the
+      # weaker claim, and is labelled as such rather than being mistaken for
+      # the stronger one.
+      - uses: actions/checkout@v4
+        with: { submodules: true }
+      - uses: extractions/setup-just@v2
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: "rust -> target" }
+      - run: cargo build --workspace
+        working-directory: rust
+      - name: Start vocoderd
+        run: |
+          mkdir -p "$RUNNER_TEMP/vocoderd-home"
+          rust/target/debug/vocoderd serve \
+            --home "$RUNNER_TEMP/vocoderd-home" \
+            --spec spec --port 3080 &
+          for _ in $(seq 1 60); do
+            curl -sf -o /dev/null http://127.0.0.1:3080/ && exit 0
+            sleep 1
+          done
+          echo "vocoderd did not become ready" >&2
+          exit 1
+      - name: Wire cells
+        run: cargo test
+        working-directory: conformance/wire
+        env:
+          CONFORMANCE_BASE_URL: http://127.0.0.1:3080

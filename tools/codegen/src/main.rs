@@ -39,6 +39,13 @@ struct Parameter {
     wire: String,
     codec: Option<Codec>,
     lookup: Option<String>,
+    /// The descriptor's `acceptsUndefined`: this wire field may be **absent**.
+    ///
+    /// Not the same as "the schema permits null" — it is the extractor's record
+    /// of `T | undefined` on the source parameter, and an absent field is what
+    /// the control accepts. A parameter without it is a required arg.
+    #[serde(default, rename = "acceptsUndefined")]
+    accepts_undefined: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -190,8 +197,190 @@ fn generate() -> Result<()> {
     }
     write_rust_src(&out_dir.join("traits.rs"), &traits_rs)?;
 
+    // --- per-endpoint argument descriptors ---------------------------------
+    //
+    // A machine's `handle` is sync and pure, so it cannot deserialize a DTO
+    // per call without either doing untyped JSON poking (what this replaces)
+    // or inverting the machine contract to `async_trait`. Instead the *spec*
+    // becomes data: this table says, for each endpoint, which wire args exist,
+    // which are required, and what shape each value must have. The dispatch
+    // boundary consults it before a machine sees the args, which is where the
+    // control host's own boundary checks live.
+    //
+    // The layers this encodes are the two the spec actually carries:
+    //   1. arg names vs the descriptor      → gateway/arguments-invalid
+    //   2. a value vs its codec's schema    → gateway/input-invalid
+    // A third layer exists on the control (`gateway/bad-request` with
+    // `details.issues` for ids violating a `min(1)` the *zod* schema declares)
+    // but the extracted JSON Schema does not carry `minLength`, so it is not
+    // derivable here and lives in the machines that need it.
+    let mut validate_rs = String::from(
+        "// GENERATED from spec/typert/remote.json — do not edit.\n\
+         //! Per-endpoint argument descriptors, used by the dispatch boundary.\n\
+         //!\n\
+         //! See `vocoderd/src/validate.rs` for how these are applied.\n\
+         #![allow(clippy::all)]\n\n",
+    );
+    validate_rs.push_str(
+        "/// The shape a wire value must have to satisfy its codec's schema.\n\
+         #[derive(Debug, Clone, Copy, PartialEq, Eq)]\n\
+         pub enum WireShape {\n\
+         \x20   /// Any JSON value (`unknown` / no `type`).\n\
+         \x20   Any,\n\
+         \x20   String,\n\
+         \x20   Number,\n\
+         \x20   Boolean,\n\
+         \x20   Array,\n\
+         \x20   Object,\n\
+         \x20   /// `const` — the one value it may take.\n\
+         \x20   Const(&'static str),\n\
+         \x20   /// An `enum` of string values.\n\
+         \x20   Enum(&'static [&'static str]),\n\
+         \x20   /// An `anyOf`/`oneOf` union; the value must satisfy at least one.\n\
+         \x20   Union(&'static [WireShape]),\n\
+         }\n\n",
+    );
+    validate_rs.push_str(
+        "/// One wire argument of one endpoint.\n\
+         #[derive(Debug, Clone, Copy)]\n\
+         pub struct ArgSpec {\n\
+         \x20   /// The argument's **wire** name (not always its source name).\n\
+         \x20   pub wire: &'static str,\n\
+         \x20   pub required: bool,\n\
+         \x20   pub shape: WireShape,\n\
+         }\n\n",
+    );
+    validate_rs.push_str(
+        "/// One endpoint's argument list.\n\
+         #[derive(Debug, Clone, Copy)]\n\
+         pub struct EndpointSpec {\n\
+         \x20   pub namespace: &'static str,\n\
+         \x20   pub method: &'static str,\n\
+         \x20   pub args: &'static [ArgSpec],\n\
+         }\n\n",
+    );
+
+    // Shape literals must outlive the table, so each distinct one is emitted as
+    // a `const` and referenced by name.
+    let mut shape_consts: BTreeMap<String, String> = BTreeMap::new();
+    let mut const_id = 0usize;
+    fn shape_expr(
+        schema: &serde_json::Value,
+        consts: &mut BTreeMap<String, String>,
+        id: &mut usize,
+    ) -> String {
+        const STRING: &str = "WireShape::String";
+        const NUMBER: &str = "WireShape::Number";
+        const BOOLEAN: &str = "WireShape::Boolean";
+        const ARRAY: &str = "WireShape::Array";
+        const OBJECT: &str = "WireShape::Object";
+        const ANY: &str = "WireShape::Any";
+
+        // `allOf: [x, {}]` is how the extractor wraps branded types; the first
+        // member carries the real shape.
+        if let Some(inner) = schema.get("allOf").and_then(|v| v.as_array()) {
+            let first = inner.iter().find(|v| v.as_object().is_some_and(|o| !o.is_empty()));
+            return match first {
+                Some(f) => shape_expr(f, consts, id),
+                None => ANY.to_string(),
+            };
+        }
+        if let Some(c) = schema.get("const").and_then(|v| v.as_str()) {
+            let name = format!("C{}", *id);
+            *id += 1;
+            consts.insert(name.clone(), format!("WireShape::Const({c:?})"));
+            return format!("/*shape*/{name}");
+        }
+        if let Some(vals) = schema.get("enum").and_then(|v| v.as_array()) {
+            let listed: Vec<String> = vals
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(|v| format!("{v:?}"))
+                .collect();
+            let name = format!("C{}", *id);
+            *id += 1;
+            consts.insert(
+                name.clone(),
+                format!("WireShape::Enum(&[{}])", listed.join(", ")),
+            );
+            return format!("/*shape*/{name}");
+        }
+        for key in ["anyOf", "oneOf"] {
+            if let Some(vals) = schema.get(key).and_then(|v| v.as_array()) {
+                let parts: Vec<String> =
+                    vals.iter().map(|v| shape_expr(v, consts, id)).collect();
+                let name = format!("C{}", *id);
+                *id += 1;
+                consts.insert(
+                    name.clone(),
+                    format!("WireShape::Union(&[{}])", parts.join(", ")),
+                );
+                return format!("/*shape*/{name}");
+            }
+        }
+        match schema.get("type").and_then(|t| t.as_str()) {
+            Some("string") => STRING.to_string(),
+            Some("number") | Some("integer") => NUMBER.to_string(),
+            Some("boolean") => BOOLEAN.to_string(),
+            Some("array") => ARRAY.to_string(),
+            Some("object") => OBJECT.to_string(),
+            _ => ANY.to_string(),
+        }
+    }
+
+    let mut table = String::new();
+    let mut endpoints_sorted: Vec<&Endpoint> = spec.endpoints.iter().collect();
+    endpoints_sorted.sort_by(|a, b| {
+        (&a.namespace, &a.method).cmp(&(&b.namespace, &b.method))
+    });
+    for ep in &endpoints_sorted {
+        let args: Vec<String> = ep
+            .parameters
+            .iter()
+            .map(|p| {
+                let shape = p
+                    .codec
+                    .as_ref()
+                    .and_then(|c| c.schema.as_ref())
+                    .map(|s| shape_expr(s, &mut shape_consts, &mut const_id))
+                    .unwrap_or_else(|| "WireShape::Any".to_string());
+                format!(
+                    "ArgSpec {{ wire: {wire:?}, required: {req}, shape: {shape} }}",
+                    wire = p.wire,
+                    req = !p.accepts_undefined,
+                    shape = shape.replace("/*shape*/", ""),
+                )
+            })
+            .collect();
+        table.push_str(&format!(
+            "    EndpointSpec {{ namespace: {ns:?}, method: {m:?}, args: &[{args}] }},\n",
+            ns = ep.namespace,
+            m = ep.method,
+            args = args.join(", "),
+        ));
+    }
+
+    // Shape consts first, then the table that references them.
+    validate_rs.push_str("// Shape literals (referenced by the table below).\n");
+    for (name, value) in &shape_consts {
+        validate_rs.push_str(&format!("const {name}: WireShape = {value};\n"));
+    }
+    validate_rs.push_str("\n/// Every endpoint the spec declares, sorted by namespace then method.\n");
+    validate_rs.push_str("pub static ENDPOINTS: &[EndpointSpec] = &[\n");
+    validate_rs.push_str(&table);
+    validate_rs.push_str("];\n\n");
+    validate_rs.push_str(
+        "/// Look up one endpoint's argument descriptor.\n\
+         pub fn endpoint(namespace: &str, method: &str) -> Option<&'static EndpointSpec> {\n\
+         \x20   ENDPOINTS\n\
+         \x20       .iter()\n\
+         \x20       .find(|e| e.namespace == namespace && e.method == method)\n\
+         }\n",
+    );
+    write_rust_src(&out_dir.join("validate.rs"), &validate_rs)?;
+
     // --- mod.rs ------------------------------------------------------------
-    let mod_rs = "// GENERATED — do not edit.\npub mod error_codes;\npub mod traits;\npub mod types;\n";
+    let mod_rs = "// GENERATED — do not edit.\npub mod error_codes;\npub mod traits;\npub mod types;\npub mod validate;\n";
     write_rust_src(&out_dir.join("mod.rs"), mod_rs)?;
 
     // Summary
@@ -241,6 +430,9 @@ fn coverage_report() -> Result<()> {
         ("sessionFeedback", "session_feedback.rs"),
         ("sessionReferenceResolver", "session_references.rs"),
         ("pluginInventory", "plugin_inventory.rs"),
+        ("llm", "llm.rs"),
+        ("subagents", "subagents.rs"),
+        ("agentTeams", "agent_teams.rs"),
     ]
     .into_iter()
     .map(|(ns, file)| {
@@ -295,21 +487,29 @@ fn coverage_report() -> Result<()> {
     let mut md = String::new();
     md.push_str("# Spec coverage report\n\n");
     md.push_str(
-        "Generated by `just coverage-report`. `implemented` = the vocoderd machine's match arm exists; '…^` marks stream endpoints covered only by streams_spec cells, and `(M4)` flags endpoints whose behavior is a stub pending the agent core.\n\n",
+        "Generated by `just coverage-report`. `implemented` = the vocoderd machine's match arm exists; '…^` marks stream endpoints covered only by streams_spec cells; `(M4)` flags behavior gated on the agent core, and `(native OS)` flags behavior gated on a native picker this host does not have.\n\n",
     );
     md.push_str("| Endpoint | Mode | Implemented by vocoderd |\n|---|---|---|\n");
 
     let mut total = 0;
     let mut have = 0;
+    // Endpoints whose *behavior* is a stub. Two distinctions matter here,
+    // because lumping them together overstates the gap:
+    //
+    // - **Pending the agent core.** These need a live turn (or an agent
+    //   registry) to mean anything, so they answer a typed refusal or a no-op
+    //   acceptance until M4 lands.
+    // - **Pending OS integration.** Nothing about these depends on an agent
+    //   loop; they need a native picker that a loopback host does not have.
+    //   `session/modelCatalog` is neither — it is fully implemented, reading
+    //   the llm machine's registry, and was stale in this list.
     let m4_stubs = [
         "session/attachment",
         "session/cancel",
-        "session/modelCatalog",
-        "session/openWorkspacePath",
-        "session/canOpenWorkspacePath",
         "session/selectModel",
         "session/updateQueue",
     ];
+    let os_stubs = ["session/openWorkspacePath", "session/canOpenWorkspacePath"];
     for ep in &spec.endpoints {
         let fq = format!("{}/{}", ep.namespace, ep.method);
         let implemented = implemented
@@ -321,6 +521,8 @@ fn coverage_report() -> Result<()> {
         }
         let mark = if m4_stubs.contains(&fq.as_str()) {
             "yes, stub (M4)"
+        } else if os_stubs.contains(&fq.as_str()) {
+            "yes, stub (native OS)"
         } else if implemented {
             "yes"
         } else {

@@ -2,3 +2,4 @@
 pub mod error_codes;
 pub mod traits;
 pub mod types;
+pub mod validate;

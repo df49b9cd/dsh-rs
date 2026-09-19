@@ -24,7 +24,11 @@ match its own spec), the Rust host as candidate.
 - [x] Schema dump: per-payload Zod → JSON Schema → `spec/schemas/`
 - [x] Session-log spec: framing constants + migration matrix → `spec/session-log/` (extractor: `tools/spec-extractor/session-log.ts` with dsh-behavior probes)
 - [x] `vocoder-cordis` crate: `PluginMachine` trait, router, tokio driver
-- [ ] `harness/runners/` control-host runner working (`dsh` boots)
+- [x] `harness/runners/` control-host runner working (`dsh` boots). Two bugs
+  were in the way, both in the harness rather than the host: the token exchange
+  used `curl -I` (a HEAD, which returns no `set-cookie`), and readiness polled
+  `/` *without* the cookie, which the control 401s. Both fixed; `run.sh dsh
+  start` now succeeds and `./run-conformance.sh dsh wire` is one command.
 - [x] `conformance/wire` first real cell green against control
 - [x] CI: spec-drift + rust gates green
 
@@ -42,13 +46,34 @@ run: see *Known gaps* below.
   service traits with `async_trait` façade) — generates deterministically and is
   gated by CI (`just codegen` must be a no-op on a clean tree)
 - [x] axum WS `/api` multiplexor as a machine + driver integration
-- [ ] the generated service traits are **not yet adopted**: machines extract args
-  with `rpc::arg_str(&req, "path")` rather than routing through the spec'd DTOs,
-  so the façade is currently dead code. Adopting it is the remaining M1 work and
-  retires the same untyped-JSON class of bug the `Raw` effect used to cause.
+- [x] argument validation at the dispatch boundary, from the spec. The
+  original item said to "adopt the generated service traits"; measured, that
+  would not have delivered it — the generated types dropped
+  `additionalProperties: false`, turned `const` into plain `String`, mapped
+  branded ids to `serde_json::Value`, and the traits are `async fn(&self)`
+  while machines are sync `handle(&mut self)` (`driver.rs` documents that as
+  deliberate). What landed instead: `vocoder-spec-api`'s generated
+  `validate` table plus `vocoderd/src/validate.rs`, which check a call's args
+  against the endpoint's descriptor *before* the machine sees them — where the
+  control does its own. It reproduces the control's two spec-derivable layers
+  (`gateway/arguments-invalid`, `gateway/input-invalid`); the third
+  (`bad-request` + `details.issues` for a `min(1)` the zod schema declares) is
+  not derivable because the extracted JSON Schema carries no `minLength`, and
+  lives in the machines that need it.
+- [x] the spec extractor was dropping `acceptsUndefined`, which made every
+  optional parameter look required. Five are affected (`settings/update`'s
+  `expectedRevision` among them); the boundary would have refused calls the
+  control accepts.
+- The generated `traits.rs` façade is still unused. With the validator in
+  place the untyped-extraction class is covered, so this is now a choice rather
+  than a gap — machines stay sync and pure.
 - [ ] cancellation: `AbortSignal` ↔ `CancellationToken` as machine inputs
-- [x] `conformance/wire` endpoint coverage on both hosts — 34 cells over 16
-  namespaces, and the control-host (`dsh`) run is done: both hosts are green,
+- [x] `conformance/wire` endpoint coverage on both hosts — 45 cells, and both
+  hosts are green on every one of them, run as
+  `./run-conformance.sh {dsh,vocoderd} wire`. Extending coverage to `llm` and
+  `subagents` and running the control found **five more candidate defects**
+  (listed in [docs/conformance.md](docs/conformance.md)), the same way the first
+  control run did:
   so the cells are now a parity check rather than a candidate-only smoke test.
   The first genuine control run found **four candidate defects** that
   candidate-only testing could not (the `goals/*` shapes, `session/page`
@@ -148,10 +173,22 @@ problems than a credential.
 Honest state of the claims above, so the plan does not read as further along
 than it is:
 
-- **The `dsh` control-host run for `wire` is now done** (see M1); the *other*
-  axes — `session-replay`, `e2e-replay`, `composition-replay` — are still
-  candidate-only, so their parity half remains unmeasured.
-- **`M1`'s generated traits are dead code** (see M1).
+- **The `dsh` control-host run for `wire` is now done and is one command**
+  (see M0/M1); the *other* axes — `e2e-replay`, `composition-replay` — are
+  still candidate-only, so their parity half remains unmeasured.
+  `session-replay` is not an axis with two hosts: its assertions are pure
+  file-level interop (each side reads what the other wrote), so there is no
+  control comparison to make.
+- **`M1`'s cancellation item is folded into M4** rather than dropped: a turn
+  FSM with no cancel input cannot express upstream's streaming-cancellation
+  contract, so it is a prerequisite for the first agent-loop step, not
+  parallel cleanup.
+- **`agentTeams` has no wire cell.** Upstream's agent-team Remote lives in an
+  experimental profile layer the default web profile does not compose, so the
+  control 404s the whole namespace and a cell would compare against a host that
+  has no such endpoint. Covered by unit tests in `machines/agent_teams.rs`.
+- **The generated `traits.rs` façade is still unused** (see M1) — now a choice
+  rather than a gap, since the validator covers the untyped-extraction class.
 - **e2e-replay does not replay upstream specs** (see M3). Two independent gaps
   block it, both larger than a credential: the missing `__ModuleLoader__`
   pipeline (M5) and the in-process `launchWebScaffold` that 60 of the 98 specs

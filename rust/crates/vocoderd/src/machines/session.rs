@@ -235,6 +235,49 @@ impl StoredSession {
             .and_then(|v| v.as_str())
             .map(str::to_string)
     }
+
+    /// The session's `origin`, e.g. `"subagent"`.
+    ///
+    /// A subagent child is identified by *two* header facts together — this and
+    /// [`Self::parent`] — which is why both are exposed rather than a single
+    /// `is_subagent` predicate: a session whose parent is set but whose origin
+    /// is not `subagent` is an ordinary forked session, and conflating them
+    /// would list a fork as a child.
+    pub fn origin(&self) -> Option<String> {
+        self.header
+            .rest
+            .get("origin")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    }
+
+    /// The direct parent session recorded in this session's header.
+    pub fn parent(&self) -> Option<String> {
+        self.header
+            .rest
+            .get("parentSession")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    }
+
+    /// How a subagent child may be addressed after its first turn.
+    ///
+    /// `continuable` when the header says so; `one-shot` otherwise, which is
+    /// the default upstream's own descriptor declares for a child that records
+    /// no continuation facts. Unknown spellings fall back to `one-shot` rather
+    /// than passing through: an unrecognized value is not a third mode, and
+    /// `prompt` must not accept a delivery on the strength of one.
+    pub fn subagent_mode(&self) -> String {
+        match self
+            .header
+            .rest
+            .get("subagentMode")
+            .and_then(|v| v.as_str())
+        {
+            Some("continuable") => "continuable".to_string(),
+            _ => "one-shot".to_string(),
+        }
+    }
     /// The session's creation time, from its header.
     ///
     /// Public because it is already a wire value in two places — `session/list`
@@ -246,20 +289,6 @@ impl StoredSession {
             .get("createdAt")
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0)
-    }
-    fn parent(&self) -> Option<String> {
-        self.header
-            .rest
-            .get("parentSession")
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-    }
-    fn origin(&self) -> Option<String> {
-        self.header
-            .rest
-            .get("origin")
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
     }
 }
 
@@ -991,7 +1020,15 @@ impl SessionMachine {
         let session_id = match address_session_id(body.get("address")) {
             Ok(id) => id,
             Err(e) => {
-                return Ok(vec![rpc::stream_error(&stream_id, "RemoteError", e, None)]);
+                // A malformed address is a bad request; the driver-level
+                // `address_session_id` error text is the message, the code is
+                // the gateway's.
+                return Ok(vec![rpc::stream_error(
+                    &stream_id,
+                    "gateway/bad-request",
+                    e,
+                    None,
+                )]);
             }
         };
         match self.follow_snapshot_value(&session_id) {
@@ -999,10 +1036,12 @@ impl SessionMachine {
                 self.follow_streams.insert(stream_id.clone(), session_id);
                 Ok(vec![rpc::stream_item(&stream_id, snapshot)])
             }
+            // The code goes in `error.code`, where the control puts it; the
+            // message stays prose a human can read.
             Err(SnapshotError::NotFound(details)) => Ok(vec![rpc::stream_error(
                 &stream_id,
-                "RemoteError",
-                format!("no such session: {session_id} (session/not-found)"),
+                "session/not-found",
+                format!("session \"{session_id}\" not found"),
                 Some(details),
             )]),
             // The re-run resumes here once the tree and log are cached.
@@ -1330,13 +1369,12 @@ impl SessionMachine {
         Ok(rpc::ok(serde_json::json!({ "sessionId": child_id })))
     }
 
+    /// The model catalog the client's picker renders.
+    ///
+    /// Answered from the llm machine's static registry rather than a local
+    /// copy, so the two endpoints a client calls during boot cannot disagree.
     fn model_catalog(&self) -> Vec<MachineOut> {
-        rpc::ok(serde_json::json!({
-            "default": { "provider": "auto", "model": "auto" },
-            "routableProviders": [],
-            "groups": [],
-            "failures": [],
-        }))
+        rpc::ok(crate::machines::llm::model_catalog())
     }
 
     fn select_model(
