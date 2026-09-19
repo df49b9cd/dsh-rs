@@ -12,7 +12,7 @@ Every conformance run is a cell in this matrix:
 | Axis | Suite | What it treats the host as |
 |---|---|---|
 | `conformance/wire` | Hand-written black-box tests over `/api` WS | Byte-level protocol implementation |
-| `conformance/session-replay` | Feed session events; assert log files + projections | Event-sourced store |
+| session interop | Feed session events; assert log files + projections | Event-sourced store |
 | `conformance/e2e-replay` | Upstream Playwright/Vitest web suite | Full application |
 | `conformance/composition-replay` | Replay recorded plugin `In` traces | Plugin-machine tree |
 
@@ -35,8 +35,11 @@ which cells pass per host, so drift shows as table changes.
 
 ## Axis 2 — session log replay
 
-`conformance/session-replay/` drives the session-log plane independently of
-serving HTTP. Two sub-suites:
+There is no `conformance/session-replay/` directory: the suite lives with the
+codec it tests, in `rust/crates/vocoder-session/tests/interop.rs` (and
+`run-conformance.sh`'s `session-replay` branch reports it as not yet
+scaffolded). Promoting it to a real suite directory is open work; the
+assertions themselves are the two below.
 
 - **read interop**: `dsh/snapshots/**/session.vN.jsonl[.zstd]` must decode under
   the Rust reader with identical projected messages.
@@ -57,12 +60,28 @@ Both are pure file-level assertions — no host needs to run.
 3. emits **cell diffs** against the control run (`test X passed under JS but
    failed under vocoderd`).
 
+**What actually exists today** (the above is the M3 target, not the current
+state): `conformance/e2e-replay/e2e-client.mjs` is a 59-line standalone smoke
+test with four hand-written cells — shell boots, root mounts, no console errors,
+boot payload observed. It does not reuse the upstream `.e2e.ts` specs, and there
+is no control comparison or `adapter.ts` yet. Current baseline against vocoderd:
+3/4 cells pass; the failure is real and informative — the GUI aborts with
+`window.__ModuleLoader__ bootstrap facade is missing`, i.e. vocoderd injects
+`__DSH_BOOT__` but not the module-loader facade the shell requires.
+
 Real-API cases self-skip without `DEEPSEEK_API_KEY`, like upstream; the recorded
 snapshot corpus (`snapshots/web`) is the default fidelity source.
 
 ## Axis 4 — composition replay
 
 This is the new lever unlocked by plugin-as-machine ([architecture.md](architecture.md)).
+
+**Status**: the replay runner is built (`rust/crates/vocoderd/src/composition.rs`,
+golden traces in `conformance/composition-replay/trace/{session,workspace}.jsonl`,
+replayed as machine tests and negative-checked against trace mutation). What is
+not built is *capture*: the traces are currently hand-authored rather than
+recorded from an instrumented JS host, and there is one pair, not one per
+profile. The steps below describe the full axis.
 
 1. **Trace**: an instrumented JS host logs, per plugin, every input it receives
    (`inject` resolution, events arriving, disposal) and every output it issues
@@ -79,18 +98,22 @@ premature disposal.
 ## Where golden traces live
 
 ```
-harness/fixtures/
-  composition/web.profile.trace.jsonl
-  composition/hot-reload-plugin.trace.jsonl
+conformance/composition-replay/trace/
+  session.jsonl               # hand-authored today; recorded from JS at M5
+  workspace.jsonl
 dsh/snapshots/**              # upstream session + web e2e goldens, pinned
 conformance/**/expected/      # local goldens owned by the suite
 ```
 
+`harness/fixtures/` is currently empty; it is reserved for shared workspaces and
+wire captures once a suite needs them.
+
 ## CI shape (target)
 
 ```
-spec-drift gate           (just spec-check)
-rust build/test/clippy    (cargo)
+spec-drift gate           (just spec-check)   — live
+rust build/test/fmt/clippy (cargo)            — live, -D warnings
+codegen-drift             (just codegen)      — live
 wire:        {dsh, vocoderd} × cells
 session:     interop both directions
 e2e-replay:  JS suite × {dsh control, vocoderd candidate}   → cell diff = 0

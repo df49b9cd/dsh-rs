@@ -28,16 +28,27 @@ match its own spec), the Rust host as candidate.
 - [x] `conformance/wire` first real cell green against control
 - [x] CI: spec-drift + rust gates green
 
-**Exit:** `just conformance HOST=dsh` green; `spec/` committed, drift-checked;
-one machined capability (e.g. `todo`) demonstrated end-to-end.
+**Exit:** met. `spec/` is committed and drift-checked; `vocoder-cordis` carries
+the machine trait + router; wire cells run green against vocoderd (27/27,
+verified stable across repeated runs); and three namespaces — `session`,
+`workspace`, `goals` — are machined end-to-end (create/prompt/rename/page,
+workspace CRUD + follow increments, goal lifecycle) with golden composition
+traces replayed as tests. The `HOST=dsh` half of the exit gate has **not** been
+run: see *Known gaps* below.
 
 ## M1 — Wire gateway & first machines
 
-- `vocoder-spec-api` codegen from `spec/` (DTOs, error codes, `PluginMachine`
-  service traits with `async_trait` façade)
-- axum WS `/api` multiplexor as a machine + driver integration
-- cancellation: `AbortSignal` ↔ `CancellationToken` as machine inputs
-- `conformance/wire` full endpoint coverage on both hosts; coverage report in CI
+- [x] `vocoder-spec-api` codegen from `spec/` (DTOs, error codes, `PluginMachine`
+  service traits with `async_trait` façade) — generates deterministically and is
+  gated by CI (`just codegen` must be a no-op on a clean tree)
+- [x] axum WS `/api` multiplexor as a machine + driver integration
+- [ ] the generated service traits are **not yet adopted**: machines extract args
+  with `rpc::arg_str(&req, "path")` rather than routing through the spec'd DTOs,
+  so the façade is currently dead code. Adopting it is the remaining M1 work and
+  retires the same untyped-JSON class of bug the `Raw` effect used to cause.
+- [ ] cancellation: `AbortSignal` ↔ `CancellationToken` as machine inputs
+- [ ] `conformance/wire` full endpoint coverage on both hosts — 27 cells cover
+  the implemented namespaces; the control-host (`dsh`) run has not been done
 
 ## M2 — Session log
 
@@ -50,8 +61,11 @@ one machined capability (e.g. `todo`) demonstrated end-to-end.
 ## M3 — Business parity
 
 - API controller machines (goals, sessions, workspace, settings) behind descriptors
-- Static client asset serving; `window.__DSH_BOOT__` boot manifest
-- `conformance/e2e-replay` adapter live; cell-level diff reporting vs control
+- [x] Static client asset serving (`--web-dist`); `window.__DSH_BOOT__` boot manifest
+- [ ] `window.__ModuleLoader__` bootstrap facade — the shell aborts without it,
+  which is the one failing e2e cell today
+- [ ] `conformance/e2e-replay` adapter live; cell-level diff reporting vs control
+  (today it is a 4-cell boot smoke test, not the upstream-suite replay)
 
 **Exit:** e2e diff report exists and shrinks release-over-release.
 
@@ -67,6 +81,22 @@ one machined capability (e.g. `todo`) demonstrated end-to-end.
   shape; M5 is productionizing, not researching
 - Composition-replay axis reaches full profile coverage
 - Optional JS-compat island (rquickjs) scoped to `Out::SpawnScope` subtrees
+
+## Known gaps
+
+Honest state of the claims above, so the plan does not read as further along
+than it is:
+
+- **The `dsh` control-host run has never executed.** Every green number in this
+  file is `HOST=vocoderd`. The conformance claim is *parity* against the control,
+  and that half is unmeasured — `harness/runners/run.sh dsh` mints the auth cookie
+  but the suite has not been driven through it.
+- **`M1`'s generated traits are dead code** (see M1).
+- **e2e-replay does not replay upstream specs** (see M3), and its one failure is
+  a real product gap (`__ModuleLoader__`), not a missing assertion.
+- **Composition traces are hand-authored**, not recorded from JS (see M5).
+- **`session-replay` has no suite directory**; its tests live in
+  `rust/crates/vocoder-session/tests/interop.rs`.
 
 ## Spec parity gate (CI)
 

@@ -31,40 +31,85 @@ pub trait PluginMachine {
 | `apply(ctx)` body | The transitions out of `Waiting`, emitting the machine's registrations. |
 | `ctx.on('agent/pre-step', f)` | `Out::Subscribe { event, handler }`; matching events come back as `In::Event`. |
 | `ctx.emit('custom/e', v)` | `Out::Emit { event, value }`; driver routes to every subscriber machine. |
-| `ctx.effect(f)` | `Out::Effect { compensate }` — the saga step; stored for disposal. |
+| `ctx.effect(f)` | `Out::Compensate { label }` — the saga step; stored for disposal. (The doc's earlier `Effect { compensate }` closure form was never built; see *Status* below.) |
 | waterfall listener | `Out::Subscribe { mode: Waterfall }`; driver chains machines, `next()` = pass current value to next machine, return = short-circuit. |
 | plugin unmount | `In::DisposeRequested` → machine `handle()` emits all outstanding compensations → driver removes the machine. |
-| per-agent scope | `Out::SpawnScope { children }` — see *Nesting* below. |
+| per-agent scope | *not built* — flat mounts only; `Out::SpawnScope` lands with M5. |
 
 ## Nesting: machines whose outputs are machines
 
 Just as Sans-I/O protocols chain (datagram→connection→stream in `quinn-proto`),
-a machine's output may itself be a child machine:
+a machine's output may itself be a child machine. This is the target shape for
+scoped compositions (M5); today the router mounts machines flat and
+`MachineOut` has no `SpawnScope` variant yet — see *Status vs this document*
+below.
+
+## Effects: the one way a machine touches the world
+
+A machine may not call `std::fs`, `std::net`, or `std::process`. When it needs
+the world touched it emits a typed effect and awaits the answer:
 
 ```rust
-pub enum Out<M: PluginMachine> {
-    RegisterService { key: ServiceKey, service: Box<dyn Service> },
-    Subscribe { event: EventName, handler: Handler },
-    Effect { compensate: Box<dyn FnOnce() -> Vec<Out<M>>> },
-    Emit { event: EventName, payload: Value },
-    /// Spawn a scoped child composition (a Cordis fiber).
-    SpawnScope { router: RouterConfig, children: Vec<Box<dyn PluginMachine<In = M::In, Out = M::Out>>> },
+enum RealizeRequest {
+    Log { level: String, message: String },
+    ReadText { path: String },     ReadBytes { path: String },
+    WriteText { path: String, contents: String },
+    WriteBytes { path: String, contents: Vec<u8> },
+    CreateDirAll { path: String },
+    Stat { path: String },         ListDir { path: String },
+    ListTree { path: String },     SendText { text: String },
+    OpenStream { .. },             CancelStream { stream_id: String },
 }
 ```
 
-The driver walks the tree; a parent machine's outputs either target the world
-(open a socket, spawn a subprocess) or a child (forward an event). Rollback is
-composable: "cancel a scope" = feed `DisposeRequested` downward, gather every
-compensation output, remove the subtree.
+`vocoderd`'s driver (`src/driver.rs`) is the only code that performs I/O. The
+match over `RealizeRequest` is exhaustive with no catch-all, which is what makes
+*"every output needs a driver implementation"* a compile error rather than a
+convention. (An earlier `Raw(Payload)` escape hatch inverted this — machines
+minted `{"kind": "rpc.result"}` and the driver re-discovered the shape by string
+matching. It is gone.)
 
-Depth budget: composition saga → machine → wire codec, rarely deeper. If a layer
-has no event vocabulary of its own it stays a function, not a machine.
+**Suspension.** A machine that awaits an effect returns the request and is
+re-entered with the answer under the same `EffectId`, which the *machine*
+assigns (monotonically, per machine) so a replayed input sequence yields
+identical ids. Handlers therefore look synchronous while awaiting: they are
+re-run from the top, and their reads are served from
+[`machines/readcache.rs`](../rust/crates/vocoderd/src/machines/readcache.rs).
+Two rules make that termination-safe and correct:
+
+- **One datum per resume**, and the cache only grows — so each re-run gets
+  strictly further. `requested`/`published` stop a re-run from re-asking.
+- **A re-run must not re-decide anything a previous attempt already committed to
+  the world.** Session create's id, its generation version, fork's timestamp,
+  prompt's event seq: all are pinned per operation (`choose`), because
+  re-deriving a version from a filesystem the write already changed publishes a
+  new generation on every resume.
+
+Because a machine holds one suspended operation, effect loops are serialized at
+the driver — concurrent pumps would cross their suspensions.
+
+## Status vs this document
+
+The doctrine above is enforced; the *composition* layer is not fully built.
+
+| Concept | State |
+|---|---|
+| `handle(in) -> Vec<out>`, pure machines | enforced |
+| Typed effects, exhaustive driver match | enforced |
+| Machine-assigned `EffectId`, replayable | enforced |
+| Router-as-machine, waterfalls/bail, disposal | built |
+| `Out::Effect { compensate }` (saga closure) | **amended**: `Compensate { label }` — a string, no closure; enough for current teardown |
+| `Out::SpawnScope { children }` | **not built** — flat mounts only; lands with M5 |
+| `RegisterService { service: Box<dyn Service> }` | **amended**: carries a `ServiceKey` only |
+
+Where this document says "should" about the last three rows, treat it as design
+intent, not description.
 
 ## Architecture layers
 
 ```
 ┌─────────────────────────────────────────────┐
-│  driver (tokio shim, the ONLY async code)   │  realizes Out::*, feeds In::*
+│  driver (tokio) — the ONLY code doing I/O   │  realizes RealizeRequest, routes
 ├─────────────────────────────────────────────┤
 │  router: static wiring + scoped children    │  routes Out → In of others
 ├─────────────────────────────────────────────┤
@@ -81,7 +126,8 @@ has no event vocabulary of its own it stays a function, not a machine.
   `fn encode(Frame) -> Bytes`. Fuzzable, no I/O.
 - **Machines** are the novel application: each dsh capability becomes one.
 - **Router** is itself a machine (see below).
-- **Driver** is the only async code (~40 lines), realizing `RouteOut::Realize`.
+- **Driver** (`rust/crates/vocoderd/src/driver.rs` + the handlers in `main.rs`) is the only
+  code that performs I/O: it realizes `RealizeRequest`s and routes frames.
 
 ## Router-as-machine
 
@@ -110,8 +156,10 @@ collapses to *how `In`/`Out` serialize*.
    them into the Rust machine and diff `Out`s. Black-box plugin parity without
    reading upstream plugin source.
 3. **Composition traces**: sequence of `Out`s a full profile boot produces, captured
-   from JS, replayed against the Rust tree — the conformance matrix from PLAN.md
-   gains a third axis: `composition-replay`.
+   from JS, replayed against the Rust machine. Partly built: the runner and golden
+   traces for `session`/`workspace` exist (`rust/crates/vocoderd/src/composition.rs`,
+   `conformance/composition-replay/trace/`), replayed as machine tests. Full profile
+   boot capture (web/headless/sdk/acp) is M5.
 4. **Saga rollback proofs**: a half-failed boot is a scripted input sequence;
    rollback correctness is a property test over arbitrary failure injection.
 
