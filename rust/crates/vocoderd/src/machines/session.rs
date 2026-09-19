@@ -228,7 +228,7 @@ pub struct StoredSession {
 }
 
 impl StoredSession {
-    fn cwd(&self) -> Option<String> {
+    pub fn cwd(&self) -> Option<String> {
         self.header
             .rest
             .get("cwd")
@@ -962,7 +962,10 @@ impl SessionMachine {
         req: &serde_json::Value,
     ) -> Result<Vec<MachineOut>, Vec<MachineOut>> {
         let stream_id = stream_id_of(req);
-        let session_id = match address_session_id(req.get("address")) {
+        // The driver hands the whole `args` (so lookup parameters survive), so
+        // the request body may be nested under `request`; accept both shapes.
+        let body = req.get("request").unwrap_or(req);
+        let session_id = match address_session_id(body.get("address")) {
             Ok(id) => id,
             Err(e) => {
                 return Ok(vec![rpc::stream_error(&stream_id, "RemoteError", e, None)]);

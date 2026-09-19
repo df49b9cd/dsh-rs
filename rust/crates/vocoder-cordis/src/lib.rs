@@ -99,6 +99,15 @@ impl EffectError {
     }
 }
 
+/// One directory entry, as the file browser needs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirEntry {
+    pub name: String,
+    /// `"file"` | `"dir"` | `"symlink"` — the wire vocabulary.
+    pub kind: String,
+    pub bytes: u64,
+}
+
 /// What the driver observed when performing an effect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EffectResult {
@@ -108,11 +117,23 @@ pub enum EffectResult {
     Bytes(Vec<u8>),
     /// `ListDir` succeeded: the immediate entry names, sorted.
     Entries(Vec<String>),
+    /// `ListDirDetailed` succeeded, sorted by name.
+    DirEntries(Vec<DirEntry>),
     /// `ListTree` succeeded: every descendant file path, sorted. Paths are
     /// absolute and lexicographic, so a parent always precedes its children.
     Paths(Vec<String>),
-    /// `Stat` succeeded. `canonical` is the resolved realpath.
-    Stat { canonical: String, is_dir: bool },
+    /// `Stat` or `ReadRange` succeeded. `canonical` is the resolved realpath;
+    /// `bytes` is the size and `version` a change token (mtime-derived), which
+    /// the file API hands to clients so a stale read is detectable.
+    Stat {
+        canonical: String,
+        is_dir: bool,
+        bytes: u64,
+        version: String,
+    },
+    /// `ReadRange` succeeded: `data` is the requested slice, `eof` whether the
+    /// slice reached the end of the file.
+    Range { data: Vec<u8>, eof: bool },
     /// `WriteText` / `CreateDirAll` succeeded.
     Done,
     /// The effect failed.
@@ -267,6 +288,13 @@ pub enum RealizeRequest {
     ReadText { path: String },
     /// Read a file as raw bytes.
     ReadBytes { path: String },
+    /// Read a byte range of a file: `limit == None` means to end of file.
+    /// `offset` past EOF yields empty content rather than an error.
+    ReadRange {
+        path: String,
+        offset: u64,
+        limit: Option<u64>,
+    },
     /// Write a file as UTF-8 text, creating parent directories. Atomic
     /// (temp + rename) — session generations rely on this.
     WriteText { path: String, contents: String },
@@ -283,6 +311,8 @@ pub enum RealizeRequest {
     Stat { path: String },
     /// List the immediate entry names of a directory.
     ListDir { path: String },
+    /// List a directory with per-entry kind and size, for the file browser.
+    ListDirDetailed { path: String },
     /// Recursively list every file beneath `path`, as absolute paths.
     ///
     /// The session namespace needs this: discovering whether a directory holds

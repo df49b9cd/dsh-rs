@@ -239,6 +239,10 @@ fn coverage_report() -> Result<()> {
         root.join("rust/crates/vocoderd/src/machines/goals.rs"),
     )
     .context("goals machine source")?;
+    let workspace_files_src = fs::read_to_string(
+        root.join("rust/crates/vocoderd/src/machines/workspace_files.rs"),
+    )
+    .context("workspace_files machine source")?;
 
     // Every wire method name this source matches on. Handles the
     // `"a" | "b" | "c" => …` alternation form: reading only the first literal
@@ -279,6 +283,7 @@ fn coverage_report() -> Result<()> {
     let workspace = methods_of(&workspace_src);
     let settings = methods_of(&settings_src);
     let goals = methods_of(&goals_src);
+    let workspace_files = methods_of(&workspace_files_src);
 
     let mut md = String::new();
     md.push_str("# Spec coverage report\n\n");
@@ -305,6 +310,7 @@ fn coverage_report() -> Result<()> {
             "workspace" => workspace.contains(ep.method.as_str()),
             "settings" => settings.contains(ep.method.as_str()),
             "goals" => goals.contains(ep.method.as_str()),
+            "workspaceFiles" => workspace_files.contains(ep.method.as_str()),
             "$events" => false, // gateway-internal, not in the business registry
             _ => false,
         };

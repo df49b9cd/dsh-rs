@@ -31,6 +31,10 @@ pub enum InFlight {
     Read(String),
     /// A path resolution, keyed by `stat:<path>`.
     Stat(String),
+    /// A ranged read, keyed by `range:<path>:<offset>:<limit>`.
+    Range(String),
+    /// A detailed directory listing, keyed by the directory path.
+    DirDetailed(String),
     /// A file being published. The path is already in `published`, so the
     /// variant carries no payload — it exists to attribute the answer.
     Write,
@@ -50,13 +54,19 @@ pub struct FsCache {
     /// Paths already requested, so a re-run never asks for the same datum
     /// twice (which would spin against the effect cap).
     pub requested: BTreeSet<String>,
-    /// Requests that came back failed, by key, with the driver's message. Kept
-    /// so a re-run treats them as absent instead of re-requesting.
-    pub failed: BTreeMap<String, String>,
+    /// Requests that came back failed, by key. Kept so a re-run treats them as
+    /// resolved instead of re-requesting — and keeping the `EffectError` rather
+    /// than its message preserves the absent/other distinction, which is what
+    /// decides between `workspace-file/not-found` and a gateway error.
+    pub failed: BTreeMap<String, vocoder_cordis::EffectError>,
     /// The effect currently in flight.
     pub in_flight: Option<InFlight>,
     /// `Stat` answers, keyed by `stat:<path>`.
     pub stats: BTreeMap<String, EffectResult>,
+    /// Ranged-read answers, keyed by `range:<path>:<offset>:<limit>`.
+    pub ranges: BTreeMap<String, EffectResult>,
+    /// Detailed directory listings, keyed by directory path.
+    pub dirs: BTreeMap<String, Vec<vocoder_cordis::DirEntry>>,
     /// Paths this machine has already asked the driver to publish, so a re-run
     /// cannot double-write the same generation.
     pub published: BTreeSet<String>,
@@ -278,15 +288,29 @@ impl FsCache {
                 }
                 false
             }
+            EffectResult::Range { .. } => {
+                if let Some(InFlight::Range(key)) = self.in_flight.take() {
+                    self.ranges.insert(key, result);
+                }
+                false
+            }
+            EffectResult::DirEntries(entries) => {
+                if let Some(InFlight::DirDetailed(dir)) = self.in_flight.take() {
+                    self.dirs.insert(dir, entries);
+                }
+                false
+            }
             // A failure is remembered against whatever was in flight, so the
             // re-run treats it as absent rather than re-requesting forever.
             EffectResult::Failed(e) => match self.in_flight.take() {
                 Some(InFlight::Read(path)) => {
-                    self.failed.insert(path, e.message());
+                    self.failed.insert(path, e);
                     false
                 }
-                Some(InFlight::Stat(key)) => {
-                    self.failed.insert(key, e.message());
+                Some(InFlight::Stat(key))
+                | Some(InFlight::Range(key))
+                | Some(InFlight::DirDetailed(key)) => {
+                    self.failed.insert(key, e);
                     false
                 }
                 // A failed publish must not be marked done, or the caller

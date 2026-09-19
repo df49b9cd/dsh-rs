@@ -9,6 +9,7 @@ pub mod readcache;
 pub mod session;
 pub mod settings;
 pub mod workspace;
+pub mod workspace_files;
 
 /// Epoch milliseconds (f64 like JS).
 pub fn session_now_ms() -> f64 {

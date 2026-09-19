@@ -93,6 +93,18 @@ pub fn realize(request: RealizeRequest) -> Option<EffectResult> {
             Ok(()) => EffectResult::Done,
             Err(e) => EffectResult::Failed(io_err(&e)),
         },
+        RealizeRequest::ReadRange {
+            path,
+            offset,
+            limit,
+        } => match read_range(std::path::Path::new(&path), offset, limit) {
+            Ok((data, eof)) => EffectResult::Range { data, eof },
+            Err(e) => EffectResult::Failed(io_err(&e)),
+        },
+        RealizeRequest::ListDirDetailed { path } => match list_dir_detailed(&path) {
+            Ok(entries) => EffectResult::DirEntries(entries),
+            Err(e) => EffectResult::Failed(io_err(&e)),
+        },
         RealizeRequest::Stat { path } => match std::fs::metadata(&path) {
             // Existence-then-resolve, so a dangling symlink reports NotFound
             // rather than resolving to a path that no longer exists. Every
@@ -101,6 +113,8 @@ pub fn realize(request: RealizeRequest) -> Option<EffectResult> {
                 Ok(canonical) => EffectResult::Stat {
                     canonical: canonical.to_string_lossy().to_string(),
                     is_dir: meta.is_dir(),
+                    bytes: meta.len(),
+                    version: version_token(&meta),
                 },
                 Err(e) => EffectResult::Failed(io_err(&e)),
             },
@@ -149,6 +163,73 @@ fn list_tree(root: &std::path::Path) -> std::io::Result<Vec<String>> {
         }
     }
     out.sort();
+    Ok(out)
+}
+
+/// A change token for a file, derived from size + mtime.
+///
+/// Not a content hash: the file API's contract is "tell me if it changed since
+/// this token", and mtime is what the filesystem gives cheaply. Equal tokens
+/// therefore mean "probably unchanged", which is the intended strength.
+fn version_token(meta: &std::fs::Metadata) -> String {
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{:x}-{:x}", mtime, meta.len())
+}
+
+/// Read `limit` bytes from `offset` (to EOF when `limit` is `None`).
+///
+/// Returns `(data, eof)`. An offset past EOF is an empty read at EOF, not an
+/// error: a client paging a truncated file should see the end, not a fault.
+fn read_range(
+    path: &std::path::Path,
+    offset: u64,
+    limit: Option<u64>,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let total = f.metadata()?.len();
+    if offset >= total {
+        return Ok((Vec::new(), true));
+    }
+    f.seek(SeekFrom::Start(offset))?;
+    let want = match limit {
+        Some(n) => (total - offset).min(n),
+        None => total - offset,
+    };
+    let mut buf = vec![0u8; want as usize];
+    f.read_exact(&mut buf)?;
+    Ok((buf, offset + want >= total))
+}
+
+/// Immediate entries of `dir` with kind and size, sorted by name.
+fn list_dir_detailed(path: &str) -> std::io::Result<Vec<vocoder_cordis::DirEntry>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        // `file_type` does not follow symlinks, so a link reports as a link
+        // rather than as whatever it points at — which is what a file browser
+        // must show.
+        let ft = entry.file_type()?;
+        let kind = if ft.is_dir() {
+            "dir"
+        } else if ft.is_symlink() {
+            "symlink"
+        } else {
+            "file"
+        };
+        let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        out.push(vocoder_cordis::DirEntry {
+            name: entry.file_name().to_string_lossy().to_string(),
+            kind: kind.to_string(),
+            bytes,
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(out)
 }
 

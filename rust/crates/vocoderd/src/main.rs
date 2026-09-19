@@ -253,6 +253,12 @@ async fn main() -> Result<()> {
         )),
     });
     initial_router.handle(RouteIn::Mount {
+        id: MachineId::new("workspaceFiles"),
+        machine: Box::new(
+            crate::machines::workspace_files::WorkspaceFilesMachine::new(sessions_root.clone()),
+        ),
+    });
+    initial_router.handle(RouteIn::Mount {
         id: MachineId::new("$events"),
         machine: Box::new(crate::machines::events::EventsMachine::default()),
     });
@@ -264,6 +270,7 @@ async fn main() -> Result<()> {
     registry_owner_register(&mut registry, "goals", "goals");
     registry_owner_register(&mut registry, "session", "session");
     registry_owner_register(&mut registry, "workspace", "workspace");
+    registry_owner_register(&mut registry, "workspaceFiles", "workspaceFiles");
     registry_owner_register(&mut registry, "settings", "settings");
     registry_owner_register(&mut registry, "$events", "$events");
 
@@ -378,9 +385,14 @@ async fn ws_conn(mut socket: WebSocket, state: Arc<AppState>) {
                                     },
                                 );
                                 mine.insert(stream_id.clone());
+                                // `args` as sent, so lookup parameters
+                                // (`workspaceFileScopeId`) survive alongside
+                                // `request` — they are siblings on the wire,
+                                // and a machine that needs one cannot see it
+                                // otherwise. Machines that want just the
+                                // request body read `request` from it.
                                 let request = payload
                                     .get("args")
-                                    .and_then(|a| a.get("request"))
                                     .cloned()
                                     .unwrap_or(payload.clone());
                                 // Through the pump, not a bare Deliver: opening a
