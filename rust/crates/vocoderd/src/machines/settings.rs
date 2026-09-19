@@ -89,7 +89,11 @@ fn redacted_secrets(entry: &CatalogEntry, value: &serde_json::Value) -> Vec<serd
 /// Deep-redact a section: any string value under a secret selector path is
 /// replaced by null (dsh never ships secret material to the wire).
 fn redact_section(entry: &CatalogEntry, value: &serde_json::Value) -> serde_json::Value {
-    fn walk(v: &serde_json::Value, path: &mut Vec<String>, selectors: &[&str]) -> serde_json::Value {
+    fn walk(
+        v: &serde_json::Value,
+        path: &mut Vec<String>,
+        selectors: &[&str],
+    ) -> serde_json::Value {
         let here = path.join(".");
         if selectors.iter().any(|s| secret_match(s, &here)) && !v.is_object() && !v.is_array() {
             return serde_json::Value::Null;
@@ -148,7 +152,11 @@ impl SettingsMachine {
                 d
             })
             .unwrap_or_default();
-        Self { file, document, bases: std::collections::BTreeMap::new() }
+        Self {
+            file,
+            document,
+            bases: std::collections::BTreeMap::new(),
+        }
     }
 
     fn persist(&self) -> Result<(), String> {
@@ -164,7 +172,12 @@ impl SettingsMachine {
     }
 
     fn view_of(&self, ns: &str) -> serde_json::Value {
-        let user = self.document.sections.get(ns).cloned().unwrap_or(serde_json::json!({}));
+        let user = self
+            .document
+            .sections
+            .get(ns)
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
         let base = self.bases.get(ns).cloned();
         let mut value = serde_json::json!({});
         if let Some(b) = &base {
@@ -172,7 +185,7 @@ impl SettingsMachine {
         }
         rpc::deep_merge(&mut value, &user);
         let revision = self.document.revisions.get(ns).copied().unwrap_or(0);
-        let entry = catalog().into_iter().find(|e| e.ns == ns);
+        let entry = catalog().iter().find(|e| e.ns == ns);
         // Secret material is never shipped: redact in both value and user
         // projections and report redaction slots separately.
         let (value, user, secrets) = match entry {
@@ -252,19 +265,18 @@ impl PluginMachine for SettingsMachine {
         if name.0 != rpc::call_event("settings") {
             return vec![];
         }
-        let method = payload.get("method").and_then(|v| v.as_str()).unwrap_or_default();
+        let method = payload
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         let args = payload.get("args").cloned().unwrap_or_default();
 
         match method {
             "describe" => {
                 // Catalog namespaces are visible even before any write, so
                 // the client can render known surfaces on first boot.
-                let mut names: std::collections::BTreeSet<String> = self
-                    .document
-                    .sections
-                    .keys()
-                    .cloned()
-                    .collect();
+                let mut names: std::collections::BTreeSet<String> =
+                    self.document.sections.keys().cloned().collect();
                 names.extend(self.bases.keys().cloned());
                 names.extend(catalog().iter().map(|e| e.ns.to_string()));
                 let namespaces: Vec<serde_json::Value> =
@@ -293,7 +305,10 @@ impl PluginMachine for SettingsMachine {
             }
             "replace" => {
                 let ns = rpc::arg_str(&args, "ns").unwrap_or_default().to_string();
-                let section = args.get("section").cloned().unwrap_or(serde_json::json!({}));
+                let section = args
+                    .get("section")
+                    .cloned()
+                    .unwrap_or(serde_json::json!({}));
                 let expected = rpc::arg_u64(&args, "expectedRevision");
                 if !section.is_object() {
                     return rpc::err_details(
@@ -331,7 +346,10 @@ impl PluginMachine for SettingsMachine {
                 "no agent preset directory available",
                 serde_json::json!({ "agentPreset": args.get("agentPreset").cloned().unwrap_or_default(), "available": [] }),
             ),
-            other => rpc::err("gateway/bad-request", format!("unsupported settings method: {other}")),
+            other => rpc::err(
+                "gateway/bad-request",
+                format!("unsupported settings method: {other}"),
+            ),
         }
     }
 }
@@ -356,9 +374,13 @@ mod tests {
     fn update_replace_conflict_flow() {
         let home = tempfile::tempdir().unwrap();
         let mut m = SettingsMachine::new(home.path());
-        let v = call(&mut m, "update", serde_json::json!({
-            "ns": "ui", "patch": {"theme": {"mode": "dark"}}
-        }));
+        let v = call(
+            &mut m,
+            "update",
+            serde_json::json!({
+                "ns": "ui", "patch": {"theme": {"mode": "dark"}}
+            }),
+        );
         assert_eq!(v["value"]["revision"], 1);
         assert_eq!(v["value"]["value"]["theme"]["mode"], "dark");
 
@@ -370,35 +392,56 @@ mod tests {
             .filter_map(|n| n["ns"].as_str())
             .collect();
         // catalog namespaces are visible pre-write; "ui" appears after write
-        for known in ["llm", "ui", "agent-default-model", "subagent-model-selection"] {
+        for known in [
+            "llm",
+            "ui",
+            "agent-default-model",
+            "subagent-model-selection",
+        ] {
             assert!(ns_names.contains(&known), "missing catalog ns {known}");
         }
 
         // Stale expected revision conflicts.
-        let c = call(&mut m, "update", serde_json::json!({
-            "ns": "ui", "patch": {"theme": {"mode": "light"}}, "expectedRevision": 9
-        }));
+        let c = call(
+            &mut m,
+            "update",
+            serde_json::json!({
+                "ns": "ui", "patch": {"theme": {"mode": "light"}}, "expectedRevision": 9
+            }),
+        );
         assert_eq!(c["error"]["code"], "settings/conflict");
         assert_eq!(c["error"]["details"]["actual"], 1);
 
         // Matching revision applies.
-        let v2 = call(&mut m, "update", serde_json::json!({
-            "ns": "ui", "patch": {"theme": {"mode": "light"}}, "expectedRevision": 1
-        }));
+        let v2 = call(
+            &mut m,
+            "update",
+            serde_json::json!({
+                "ns": "ui", "patch": {"theme": {"mode": "light"}}, "expectedRevision": 1
+            }),
+        );
         assert_eq!(v2["value"]["revision"], 2);
 
         // Replace resets the section.
-        let r = call(&mut m, "replace", serde_json::json!({ "ns": "ui", "section": {} }));
+        let r = call(
+            &mut m,
+            "replace",
+            serde_json::json!({ "ns": "ui", "section": {} }),
+        );
         assert_eq!(r["value"]["value"], serde_json::json!({}));
 
         // Mutate set/unset.
-        let m1 = call(&mut m, "mutate", serde_json::json!({
-            "ns": "ui",
-            "ops": [
-                {"op": "set", "path": ["a", "b"], "value": 3},
-                {"op": "unset", "path": ["a", "b"]},
-            ],
-        }));
+        let m1 = call(
+            &mut m,
+            "mutate",
+            serde_json::json!({
+                "ns": "ui",
+                "ops": [
+                    {"op": "set", "path": ["a", "b"], "value": 3},
+                    {"op": "unset", "path": ["a", "b"]},
+                ],
+            }),
+        );
         assert_eq!(m1["value"]["value"], serde_json::json!({"a": {}}));
     }
 
@@ -406,10 +449,14 @@ mod tests {
     fn secrets_are_redacted_and_reported() {
         let home = tempfile::tempdir().unwrap();
         let mut m = SettingsMachine::new(home.path());
-        let v = call(&mut m, "update", serde_json::json!({
-            "ns": "llm",
-            "patch": {"providers": {"anthropic": {"apiKey": "sk-secret", "models": []}}},
-        }));
+        let v = call(
+            &mut m,
+            "update",
+            serde_json::json!({
+                "ns": "llm",
+                "patch": {"providers": {"anthropic": {"apiKey": "sk-secret", "models": []}}},
+            }),
+        );
         assert!(v["ok"].as_bool().unwrap(), "{v}");
         // Value ships with the key redacted…
         assert_eq!(
@@ -418,7 +465,11 @@ mod tests {
         );
         // …and the secrets slot reports set-ness by path (dotted selector).
         let secrets = v["value"]["secrets"].as_array().unwrap();
-        assert!(secrets.iter().any(|s| s["path"][0] == "providers" && s["set"] == true));
+        assert!(
+            secrets
+                .iter()
+                .any(|s| s["path"][0] == "providers" && s["set"] == true)
+        );
 
         // User projection also redacted.
         assert_eq!(

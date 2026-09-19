@@ -10,6 +10,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { submodules: true }
+      - uses: extractions/setup-just@v2
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with: { node-version: "24", cache: pnpm, cache-dependency-path: dsh/pnpm-lock.yaml }
@@ -19,7 +20,34 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
+      # submodules: interop.rs reads dsh/snapshots/session and asserts on the
+      # generation count, so a submodule-less checkout panics.
       - uses: actions/checkout@v4
+        with: { submodules: true }
       - uses: dtolnay/rust-toolchain@1.98.1
-      - run: cargo build --workspace && cargo test --workspace
+        with: { components: rustfmt, clippy }
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: "rust -> target" }
+      - name: fmt
+        run: cargo fmt --all --check
         working-directory: rust
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+        working-directory: rust
+      - name: build + test
+        run: cargo build --workspace && cargo test --workspace
+        working-directory: rust
+
+  codegen-drift:
+    runs-on: ubuntu-latest
+    steps:
+      # Generated bindings are committed; regenerating must be a no-op. This
+      # is the gate that makes `just codegen` trustworthy as a build step.
+      - uses: actions/checkout@v4
+      - uses: extractions/setup-just@v2
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with: { components: rustfmt }
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: "tools/codegen -> target" }
+      - run: just codegen
+      - run: git diff --exit-code -- rust/crates/vocoder-spec-api

@@ -1,13 +1,12 @@
-/target
+# Rust / cargo build outputs. Unanchored so it covers the workspace at
+# rust/target as well as the satellite crates (conformance/wire, tools/codegen).
+# The dsh/ submodule is a gitlink, so its own build outputs are handled there.
+target/
+
+# Conformance + harness scratch (per-run $CONFORMANCE_HOME lives here)
 .scratch/
+
+# JS workspace (dsh submodule deps; kept for any tooling run from the root)
 node_modules/
 __pycache__/
 *.tsbuildinfo
-/rust/target/
-/rust/Cargo.lock
-
-# conformance build outputs
-/conformance/*/target/
-
-# codegen build outputs (keep the tree out of the repo)
-/tools/codegen/target/

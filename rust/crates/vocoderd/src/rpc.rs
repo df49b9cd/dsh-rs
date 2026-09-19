@@ -66,18 +66,22 @@ pub fn stream_error(
 
 /// Success result output.
 pub fn ok(value: serde_json::Value) -> Vec<MachineOut> {
-    vec![MachineOut::Realize(RealizeRequest::Raw(serde_json::json!({
-        "kind": "rpc.result",
-        "result": { "ok": true, "value": value },
-    })))]
+    vec![MachineOut::Realize(RealizeRequest::Raw(
+        serde_json::json!({
+            "kind": "rpc.result",
+            "result": { "ok": true, "value": value },
+        }),
+    ))]
 }
 
 /// Failure result; code is a Typert RemoteError code.
 pub fn err(code: &str, message: impl Into<String>) -> Vec<MachineOut> {
-    vec![MachineOut::Realize(RealizeRequest::Raw(serde_json::json!({
-        "kind": "rpc.result",
-        "result": { "ok": false, "error": { "code": code, "message": message.into() } },
-    })))]
+    vec![MachineOut::Realize(RealizeRequest::Raw(
+        serde_json::json!({
+            "kind": "rpc.result",
+            "result": { "ok": false, "error": { "code": code, "message": message.into() } },
+        }),
+    ))]
 }
 
 /// Failure with a typed details payload (RemoteErrorDetailsMap entries).
@@ -86,10 +90,12 @@ pub fn err_details(
     message: impl Into<String>,
     details: serde_json::Value,
 ) -> Vec<MachineOut> {
-    vec![MachineOut::Realize(RealizeRequest::Raw(serde_json::json!({
-        "kind": "rpc.result",
-        "result": { "ok": false, "error": { "code": code, "message": message.into(), "details": details } },
-    })))]
+    vec![MachineOut::Realize(RealizeRequest::Raw(
+        serde_json::json!({
+            "kind": "rpc.result",
+            "result": { "ok": false, "error": { "code": code, "message": message.into(), "details": details } },
+        }),
+    ))]
 }
 
 /// Extract a string arg.
@@ -175,7 +181,9 @@ fn set_path(
             obj.insert(seg.clone(), value.clone());
             return Ok(());
         }
-        let next = obj.entry(seg.clone()).or_insert_with(|| serde_json::json!({}));
+        let next = obj
+            .entry(seg.clone())
+            .or_insert_with(|| serde_json::json!({}));
         if !next.is_object() {
             *next = serde_json::json!({});
         }
@@ -221,32 +229,52 @@ mod tests {
     fn merge_replaces_arrays_merges_objects() {
         let mut t = serde_json::json!({"a": {"x": 1, "y": 2}, "b": [1, 2], "c": 3});
         deep_merge(&mut t, &serde_json::json!({"a": {"y": 20}, "b": [9]}));
-        assert_eq!(t, serde_json::json!({"a": {"x": 1, "y": 20}, "b": [9], "c": 3}));
+        assert_eq!(
+            t,
+            serde_json::json!({"a": {"x": 1, "y": 20}, "b": [9], "c": 3})
+        );
     }
 
     #[test]
     fn mutate_set_unset() {
         let mut s = serde_json::json!({});
-        apply_mutate_op(&mut s, &serde_json::json!({"op": "set", "path": ["a", "b"], "value": 3}))
-            .unwrap();
+        apply_mutate_op(
+            &mut s,
+            &serde_json::json!({"op": "set", "path": ["a", "b"], "value": 3}),
+        )
+        .unwrap();
         assert_eq!(s, serde_json::json!({"a": {"b": 3}}));
-        apply_mutate_op(&mut s, &serde_json::json!({"op": "unset", "path": ["a", "b"]})).unwrap();
+        apply_mutate_op(
+            &mut s,
+            &serde_json::json!({"op": "unset", "path": ["a", "b"]}),
+        )
+        .unwrap();
         assert_eq!(s, serde_json::json!({"a": {}}));
         // Absent unset path is satisfied.
-        apply_mutate_op(&mut s, &serde_json::json!({"op": "unset", "path": ["x", "y"]})).unwrap();
+        apply_mutate_op(
+            &mut s,
+            &serde_json::json!({"op": "unset", "path": ["x", "y"]}),
+        )
+        .unwrap();
     }
 
     #[test]
     fn mutate_root_set_requires_object() {
         let mut s = serde_json::json!({"k": 1});
         assert!(
-            apply_mutate_op(&mut s, &serde_json::json!({"op": "set", "path": [], "value": {"n": 2}}))
-                .is_ok()
+            apply_mutate_op(
+                &mut s,
+                &serde_json::json!({"op": "set", "path": [], "value": {"n": 2}})
+            )
+            .is_ok()
         );
         assert_eq!(s, serde_json::json!({"n": 2}));
         assert!(
-            apply_mutate_op(&mut s, &serde_json::json!({"op": "set", "path": [], "value": 4}))
-                .is_err()
+            apply_mutate_op(
+                &mut s,
+                &serde_json::json!({"op": "set", "path": [], "value": 4})
+            )
+            .is_err()
         );
     }
 

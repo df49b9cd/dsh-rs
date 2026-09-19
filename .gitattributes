@@ -1,0 +1,16 @@
+# Generated trees. Kept in the repo so they are reviewable, but collapsed in
+# diffs and excluded from language stats — a regeneration can touch hundreds of
+# lines mechanically.
+#
+# NOTE: spec/ is deliberately NOT marked generated. It is the normative contract
+# this project is built against; its diffs must stay visible.
+rust/crates/vocoder-spec-api/src/generated/** linguist-generated=true
+docs/spec-coverage.md                        linguist-generated=true
+
+# zstd-compressed session generations are binary; do not attempt text diffs.
+*.jsonl.zstd binary
+
+# Golden JSONL traces and fixtures: normal text, explicit LF so trace captures
+# from any host hash identically.
+*.jsonl text eol=lf
+conformance/composition-replay/trace/*.jsonl text eol=lf

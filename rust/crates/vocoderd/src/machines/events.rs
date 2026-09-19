@@ -22,30 +22,27 @@ impl PluginMachine for EventsMachine {
     type Out = MachineOut;
 
     fn handle(&mut self, ev: MachineIn) -> Vec<MachineOut> {
-        match &ev {
-            MachineIn::ServicesReady { .. } => {
-                // Subscribe to every forwarded catalog event minus waterfall
-                // modes (approval/* requires the $events/result round-trip —
-                // deferred to M4's approval machine).
-                let catalog: &[&str] = &[
-                    "agent-preset/selected",
-                    "api-session/activity",
-                    "api-session/added",
-                    "api-session/error",
-                    "api-session/removed",
-                    "api-session/status",
-                    "commands/change",
-                    "credentials/reference-updated",
-                    "goal/activation-changed",
-                ];
-                return catalog
-                    .iter()
-                    .map(|e| MachineOut::Subscribe {
-                        name: vocoder_cordis::EventName::new(*e),
-                    })
-                    .collect();
-            }
-            _ => {}
+        if let MachineIn::ServicesReady { .. } = &ev {
+            // Subscribe to every forwarded catalog event minus waterfall
+            // modes (approval/* requires the $events/result round-trip —
+            // deferred to M4's approval machine).
+            let catalog: &[&str] = &[
+                "agent-preset/selected",
+                "api-session/activity",
+                "api-session/added",
+                "api-session/error",
+                "api-session/removed",
+                "api-session/status",
+                "commands/change",
+                "credentials/reference-updated",
+                "goal/activation-changed",
+            ];
+            return catalog
+                .iter()
+                .map(|e| MachineOut::Subscribe {
+                    name: vocoder_cordis::EventName::new(*e),
+                })
+                .collect();
         }
         let MachineIn::Event { name, payload } = &ev else {
             return vec![];

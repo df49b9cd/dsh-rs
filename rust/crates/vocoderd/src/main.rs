@@ -1,10 +1,10 @@
 //! vocoderd — the Rust web host. Thin async driver over the Sans-I/O core.
 
+#[cfg(test)]
+mod composition;
 mod machines;
 mod registry;
 mod rpc;
-#[cfg(test)]
-mod composition;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -166,8 +166,7 @@ async fn main() -> Result<()> {
     info!(home = ?args.home, spec = ?args.spec, "vocoderd starting");
 
     let sessions_root = args.home.join("sessions");
-    let workspace_registry =
-        crate::registry::WorkspaceRegistryStore::open(&args.home);
+    let workspace_registry = crate::registry::WorkspaceRegistryStore::open(&args.home);
 
     let mut initial_router = Router::new();
     // Business machines mounted at boot (M3+: from profile composition).
@@ -247,7 +246,8 @@ async fn main() -> Result<()> {
 async fn index() -> impl IntoResponse {
     axum::response::Html(
         "<!doctype html>
-<html><head><title>vocoderd</title></head><body><h1>vocoderd is up</h1></body></html>".to_string(),
+<html><head><title>vocoderd</title></head><body><h1>vocoderd is up</h1></body></html>"
+            .to_string(),
     )
 }
 
@@ -477,10 +477,10 @@ async fn api_rpc(
     });
     let (stream_outs, rpc_outs): (Vec<_>, Vec<_>) = outs.into_iter().partition(|o| {
         matches!(&o, RouteOut::Realize { request: vocoder_cordis::RealizeRequest::Raw(v), .. }
-            if matches!(
-                v.get("kind").and_then(|k| k.as_str()),
-                Some("stream.item" | "stream.end" | "stream.error")
-            ))
+        if matches!(
+            v.get("kind").and_then(|k| k.as_str()),
+            Some("stream.item" | "stream.end" | "stream.error")
+        ))
     });
     state.route_stream_outs(stream_outs);
     let outs = rpc_outs;

@@ -52,7 +52,9 @@ pub fn replay_trace(
                         }
                         vars.insert(
                             var.clone(),
-                            cur.as_str().expect("captured value must be a string").to_string(),
+                            cur.as_str()
+                                .expect("captured value must be a string")
+                                .to_string(),
                         );
                     }
                 }

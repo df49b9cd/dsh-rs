@@ -53,7 +53,7 @@ impl PluginMachine for NamespaceRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vocoder_cordis::{EventName, MachineIn, PluginMachine as _};
+    use vocoder_cordis::{EventName, MachineIn};
 
     #[test]
     fn register_and_lookup() {

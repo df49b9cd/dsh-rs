@@ -91,20 +91,23 @@ impl SessionStore {
             return out;
         };
         for project in projects.flatten() {
-            let Ok(sessions) = std::fs::read_dir(project.path()) else { continue };
+            let Ok(sessions) = std::fs::read_dir(project.path()) else {
+                continue;
+            };
             for session in sessions.flatten() {
                 let dir = session.path();
                 if !dir.is_dir() {
                     continue;
                 }
-                let Some(version) = vocoder_session::latest_generation(&dir).ok().flatten()
-                else {
+                let Some(version) = vocoder_session::latest_generation(&dir).ok().flatten() else {
                     continue;
                 };
                 let Some(path) = vocoder_session::generation_path(&dir, version) else {
                     continue;
                 };
-                let Ok(header) = vocoder_session::read_header(&path) else { continue };
+                let Ok(header) = vocoder_session::read_header(&path) else {
+                    continue;
+                };
                 out.push(StoredSession {
                     id: header
                         .rest
@@ -150,16 +153,32 @@ pub struct StoredSession {
 
 impl StoredSession {
     fn cwd(&self) -> Option<String> {
-        self.header.rest.get("cwd").and_then(|v| v.as_str()).map(str::to_string)
+        self.header
+            .rest
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
     }
     fn created_at(&self) -> f64 {
-        self.header.rest.get("createdAt").and_then(|v| v.as_f64()).unwrap_or(0.0)
+        self.header
+            .rest
+            .get("createdAt")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0)
     }
     fn parent(&self) -> Option<String> {
-        self.header.rest.get("parentSession").and_then(|v| v.as_str()).map(str::to_string)
+        self.header
+            .rest
+            .get("parentSession")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
     }
     fn origin(&self) -> Option<String> {
-        self.header.rest.get("origin").and_then(|v| v.as_str()).map(str::to_string)
+        self.header
+            .rest
+            .get("origin")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
     }
 }
 
@@ -194,7 +213,11 @@ impl SessionMachine {
         self.store.scan().into_iter().find(|s| s.id == id)
     }
 
-    fn persist_append(&self, session: &StoredSession, extra: &[serde_json::Value]) -> Result<(), String> {
+    fn persist_append(
+        &self,
+        session: &StoredSession,
+        extra: &[serde_json::Value],
+    ) -> Result<(), String> {
         let mut rows = self.store.read_rows(&session.dir)?;
         // header row preserved at index 0; append events at end.
         rows.extend(extra.iter().cloned());
@@ -215,7 +238,10 @@ impl SessionMachine {
         if let Some(cwd) = s.cwd() {
             for ws in self.workspaces.find_by_path(&cwd) {
                 let listed = self.workspaces.read(|d| {
-                    d.records.get(&ws).map(|r| r.session_ids.contains(&s.id)).unwrap_or(false)
+                    d.records
+                        .get(&ws)
+                        .map(|r| r.session_ids.contains(&s.id))
+                        .unwrap_or(false)
                 });
                 if listed {
                     v["workspaceId"] = ws.into();
@@ -282,7 +308,10 @@ impl PluginMachine for SessionMachine {
         if name.0 != rpc::call_event("session") {
             return vec![];
         }
-        let method = payload.get("method").and_then(|v| v.as_str()).unwrap_or_default();
+        let method = payload
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         let args = payload.get("args").cloned().unwrap_or_default();
         // session/list's wire name is _request (dsh reserves it as an
         // unused placeholder); everything else uses request.
@@ -303,13 +332,19 @@ impl PluginMachine for SessionMachine {
             "prompt" => self.prompt(&req),
             "cancel" => self.cancel(&req),
             "updateQueue" => self.update_queue(&req),
-            "attachment" => rpc::err("session/attachment-invalid", "no attachments are stored yet"),
+            "attachment" => rpc::err(
+                "session/attachment-invalid",
+                "no attachments are stored yet",
+            ),
             "fork" => self.fork(&req),
             "modelCatalog" => self.model_catalog(),
             "selectModel" => self.select_model(&req),
             "openWorkspacePath" => rpc::ok(serde_json::json!({ "opened": false })),
             "canOpenWorkspacePath" => rpc::ok(serde_json::Value::Bool(false)),
-            other => rpc::err("gateway/bad-request", format!("unsupported session method: {other}")),
+            other => rpc::err(
+                "gateway/bad-request",
+                format!("unsupported session method: {other}"),
+            ),
         }
     }
 }
@@ -401,7 +436,10 @@ impl SessionMachine {
         }
         let dir = self.store.session_dir(cwd.as_deref(), &id);
         if let Err(e) = std::fs::create_dir_all(&dir) {
-            return rpc::err("gateway/internal", format!("cannot create session dir: {e}"));
+            return rpc::err(
+                "gateway/internal",
+                format!("cannot create session dir: {e}"),
+            );
         }
         if let Err(e) = self.store.write_generation(&dir, &[header]) {
             return rpc::err("gateway/internal", format!("cannot write session log: {e}"));
@@ -410,11 +448,11 @@ impl SessionMachine {
         if let Some(ws) = workspace_id {
             // Attach (prepend) the new session under the owning workspace.
             let _ = self.workspaces.mutate(|d| {
-                if let Some(rec) = d.records.get_mut(ws) {
-                    if !rec.session_ids.contains(&id) {
-                        rec.session_ids.insert(0, id.clone());
-                        rec.updated_at = now;
-                    }
+                if let Some(rec) = d.records.get_mut(ws)
+                    && !rec.session_ids.contains(&id)
+                {
+                    rec.session_ids.insert(0, id.clone());
+                    rec.updated_at = now;
                 }
             });
         }
@@ -438,7 +476,10 @@ impl SessionMachine {
     }
 
     fn list(&self) -> Vec<MachineOut> {
-        let mut items: Vec<_> = self.store.scan().into_iter()
+        let mut items: Vec<_> = self
+            .store
+            .scan()
+            .into_iter()
             .filter(|s| s.cwd().is_some())
             .collect();
         items.sort_by(|a, b| b.created_at().total_cmp(&a.created_at()));
@@ -461,7 +502,9 @@ impl SessionMachine {
         let q = query.to_lowercase();
         let mut items = Vec::new();
         for s in self.store.scan() {
-            let Ok(rows) = self.store.read_rows(&s.dir) else { continue };
+            let Ok(rows) = self.store.read_rows(&s.dir) else {
+                continue;
+            };
             for row in rows.into_iter().skip(1) {
                 let ty = row.get("type").and_then(|v| v.as_str()).unwrap_or_default();
                 if !matches!(ty, "user/message" | "assistant/message") {
@@ -474,7 +517,9 @@ impl SessionMachine {
                         serde_json::Value::String(t) => t.clone(),
                         serde_json::Value::Array(parts) => parts
                             .iter()
-                            .filter_map(|p| p.get("text").and_then(|v| v.as_str()).map(str::to_string))
+                            .filter_map(|p| {
+                                p.get("text").and_then(|v| v.as_str()).map(str::to_string)
+                            })
                             .collect::<Vec<_>>()
                             .join(" "),
                         _ => String::new(),
@@ -526,13 +571,20 @@ impl SessionMachine {
         // user/message + assistant/message only.
         let mut message_idx: Vec<usize> = Vec::new();
         for (i, r) in records.iter().enumerate() {
-            let ty = r["event"].get("type").and_then(|v| v.as_str()).unwrap_or_default();
+            let ty = r["event"]
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             if matches!(ty, "user/message" | "assistant/message") {
                 message_idx.push(i);
             }
         }
         let has_more = message_idx.len() > max;
-        let cut = if has_more { message_idx[message_idx.len() - max] } else { 0 };
+        let cut = if has_more {
+            message_idx[message_idx.len() - max]
+        } else {
+            0
+        };
         let records: Vec<_> = records.into_iter().skip(cut).collect();
         rpc::ok(serde_json::json!({ "records": records, "hasMore": has_more }))
     }
@@ -544,11 +596,9 @@ impl SessionMachine {
         };
         match self.follow_snapshot_value(&session_id) {
             Ok(snapshot) => rpc::ok(snapshot),
-            Err((code, details)) => rpc::err_details(
-                code,
-                format!("no such session: {session_id}"),
-                details,
-            ),
+            Err((code, details)) => {
+                rpc::err_details(code, format!("no such session: {session_id}"), details)
+            }
         }
     }
 
@@ -566,7 +616,8 @@ impl SessionMachine {
         let rows = self.store.read_rows(&s.dir).unwrap_or_default();
         // Cursor = last durable seq: header + N events → last seq N-1; -1 when
         // the log is empty (mirrors dsh's "-1 allowed = empty log").
-        let cursor = (rows.len().saturating_sub(1)).saturating_sub(1) as f64 - if rows.len() > 1 { 0.0 } else { 1.0 };
+        let cursor = (rows.len().saturating_sub(1)).saturating_sub(1) as f64
+            - if rows.len() > 1 { 0.0 } else { 1.0 };
         let header = serde_json::to_value(&s.header).unwrap_or_default();
         let mut records = Vec::new();
         for row in rows.into_iter().skip(1) {
@@ -594,11 +645,7 @@ impl SessionMachine {
     }
 
     /// One durable event broadcast to every live follow stream of `session_id`.
-    fn emit_follow_event(
-        &self,
-        session_id: &str,
-        event: &serde_json::Value,
-    ) -> Vec<MachineOut> {
+    fn emit_follow_event(&self, session_id: &str, event: &serde_json::Value) -> Vec<MachineOut> {
         let mut outs = Vec::new();
         for (stream_id, followed) in &self.follow_streams {
             if followed == session_id {
@@ -692,7 +739,7 @@ impl SessionMachine {
             "time": now_ms(),
             "data": { "title": normalized },
         });
-        if let Err(e) = self.persist_append(&s, &[event.clone()]) {
+        if let Err(e) = self.persist_append(&s, std::slice::from_ref(&event)) {
             return rpc::err("gateway/internal", e);
         }
         self.state.entry(id.to_string()).or_default().title = Some(normalized.clone());
@@ -705,12 +752,21 @@ impl SessionMachine {
         let Some(id) = get_str!(req, "sessionId") else {
             return rpc::err("gateway/bad-request", "missing sessionId");
         };
-        let content = req.get("content").and_then(|c| c.as_array()).cloned().unwrap_or_default();
+        let content = req
+            .get("content")
+            .and_then(|c| c.as_array())
+            .cloned()
+            .unwrap_or_default();
         let has_text = content.iter().any(|p| {
             p.get("type").and_then(|t| t.as_str()) == Some("text")
-                && p.get("text").and_then(|t| t.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false)
+                && p.get("text")
+                    .and_then(|t| t.as_str())
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false)
         });
-        let has_parts = content.iter().any(|p| p.get("type").and_then(|t| t.as_str()) != Some("text"));
+        let has_parts = content
+            .iter()
+            .any(|p| p.get("type").and_then(|t| t.as_str()) != Some("text"));
         if !has_text && !has_parts {
             return rpc::err_details(
                 "gateway/bad-request",
@@ -731,7 +787,10 @@ impl SessionMachine {
         let rows = self.store.read_rows(&s.dir).unwrap_or_default();
         let already = rows.iter().skip(1).any(|r| {
             r.get("type").and_then(|v| v.as_str()) == Some("user/message")
-                && r.get("source").and_then(|s| s.get("rpcId")).and_then(|v| v.as_str()) == Some(request_id)
+                && r.get("source")
+                    .and_then(|s| s.get("rpcId"))
+                    .and_then(|v| v.as_str())
+                    == Some(request_id)
         });
         if !already {
             let seq = rows.len().saturating_sub(1) as f64;
@@ -742,7 +801,7 @@ impl SessionMachine {
                 "data": { "content": content },
                 "source": { "kind": "user", "rpcId": request_id },
             });
-            if let Err(e) = self.persist_append(&s, &[event.clone()]) {
+            if let Err(e) = self.persist_append(&s, std::slice::from_ref(&event)) {
                 return rpc::err("gateway/internal", e);
             }
             let mut outs = rpc::ok(serde_json::json!({ "accepted": true }));
@@ -774,17 +833,26 @@ impl SessionMachine {
         let item_id = req.get("itemId").cloned().unwrap_or_default();
         let action = req.get("action").cloned().unwrap_or_default();
         let st = self.state.entry(id.to_string()).or_default();
-        let kind = action.get("kind").and_then(|v| v.as_str()).unwrap_or_default();
+        let kind = action
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         match kind {
             "remove" => {
                 st.queue.retain(|i| i.get("id") != Some(&item_id));
                 rpc::ok(serde_json::json!({ "accepted": true }))
             }
             "edit" => {
-                let content = action.get("content").cloned().unwrap_or(serde_json::Value::Null);
+                let content = action
+                    .get("content")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 let text_only = content
                     .as_array()
-                    .map(|c| c.iter().all(|p| p.get("type").and_then(|v| v.as_str()) == Some("text")))
+                    .map(|c| {
+                        c.iter()
+                            .all(|p| p.get("type").and_then(|v| v.as_str()) == Some("text"))
+                    })
                     .unwrap_or(false);
                 if !text_only {
                     return rpc::err_details(
@@ -814,7 +882,10 @@ impl SessionMachine {
                 format!("queue item cannot be steered now: {item_id}"),
                 serde_json::json!({ "itemId": item_id }),
             ),
-            other => rpc::err("gateway/bad-request", format!("unsupported queue action: {other}")),
+            other => rpc::err(
+                "gateway/bad-request",
+                format!("unsupported queue action: {other}"),
+            ),
         }
     }
 
@@ -849,7 +920,11 @@ impl SessionMachine {
         }
         let boundary = match at {
             Some(a) => ends.iter().copied().find(|&i| {
-                events[i].get("seq").and_then(|v| v.as_f64()).unwrap_or(-1.0) >= a
+                events[i]
+                    .get("seq")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(-1.0)
+                    >= a
             }),
             None => ends.last().copied(),
         };
@@ -882,7 +957,10 @@ impl SessionMachine {
         }
         let dir = self.store.session_dir(src.cwd().as_deref(), &child_id);
         if let Err(e) = std::fs::create_dir_all(&dir) {
-            return rpc::err("gateway/internal", format!("cannot create session dir: {e}"));
+            return rpc::err(
+                "gateway/internal",
+                format!("cannot create session dir: {e}"),
+            );
         }
         let mut child_rows = vec![header.clone()];
         child_rows.extend(events.iter().take(cut).cloned());
@@ -936,7 +1014,9 @@ impl SessionMachine {
 }
 
 fn address_session_id(address: Option<&serde_json::Value>) -> Result<String, String> {
-    let Some(a) = address else { return Err("missing address".into()) };
+    let Some(a) = address else {
+        return Err("missing address".into());
+    };
     match a.get("kind").and_then(|v| v.as_str()) {
         Some("session") => a
             .get("sessionId")
@@ -958,7 +1038,6 @@ fn now_ms() -> f64 {
         .map(|d| d.as_millis() as f64)
         .unwrap_or(0.0)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -986,31 +1065,58 @@ mod tests {
         );
         let wd = tempfile::tempdir().unwrap();
         let wc = {
-            let outs = PluginMachine::handle(&mut w, MachineIn::Event {
-                name: EventName::new(rpc::call_event("workspace")),
-                payload: serde_json::json!({
-                    "method": "create",
-                    "args": { "request": { "path": wd.path().to_string_lossy().to_string() } },
-                }),
-            });
-            let MachineOut::Realize(vocoder_cordis::RealizeRequest::Raw(v)) = &outs[0] else { panic!() };
-            v["result"]["value"]["workspace"]["workspaceId"].as_str().unwrap().to_string()
+            let outs = PluginMachine::handle(
+                &mut w,
+                MachineIn::Event {
+                    name: EventName::new(rpc::call_event("workspace")),
+                    payload: serde_json::json!({
+                        "method": "create",
+                        "args": { "request": { "path": wd.path().to_string_lossy().to_string() } },
+                    }),
+                },
+            );
+            let MachineOut::Realize(vocoder_cordis::RealizeRequest::Raw(v)) = &outs[0] else {
+                panic!()
+            };
+            v["result"]["value"]["workspace"]["workspaceId"]
+                .as_str()
+                .unwrap()
+                .to_string()
         };
-        let r = call(&mut m, "create", serde_json::json!({ "request": { "workspaceId": wc } }));
+        let r = call(
+            &mut m,
+            "create",
+            serde_json::json!({ "request": { "workspaceId": wc } }),
+        );
         assert!(r["ok"].as_bool().unwrap(), "create failed: {r}");
         let sid = r["value"]["sessionId"].as_str().unwrap().to_string();
         // Session dir lands under the workspace path's project slug.
-        let cwd = wd.path().canonicalize().unwrap().to_string_lossy().to_string();
-        assert!(std::fs::metadata(
-            dir.path().join("sessions").join(format!("--{}--", cwd.replace('/', "-")))
-        ).is_ok());
+        let cwd = wd
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            std::fs::metadata(
+                dir.path()
+                    .join("sessions")
+                    .join(format!("--{}--", cwd.replace('/', "-")))
+            )
+            .is_ok()
+        );
         // The workspace machine now reports it.
         let f = {
-            let outs = PluginMachine::handle(&mut w, MachineIn::Event {
-                name: EventName::new(rpc::call_event("workspace")),
-                payload: serde_json::json!({ "method": "follow", "args": {} }),
-            });
-            let MachineOut::Realize(vocoder_cordis::RealizeRequest::Raw(v)) = &outs[0] else { panic!() };
+            let outs = PluginMachine::handle(
+                &mut w,
+                MachineIn::Event {
+                    name: EventName::new(rpc::call_event("workspace")),
+                    payload: serde_json::json!({ "method": "follow", "args": {} }),
+                },
+            );
+            let MachineOut::Realize(vocoder_cordis::RealizeRequest::Raw(v)) = &outs[0] else {
+                panic!()
+            };
             v.clone()
         };
         let ids = &f["result"]["value"]["value"]["items"][0]["sessionIds"];
@@ -1031,17 +1137,35 @@ mod tests {
     #[test]
     fn create_list_rename_flow() {
         let (_dir, mut m, _registry) = machine();
-        let r = call(&mut m, "create", serde_json::json!({"request": {"cwd": "/tmp/x"}}));
+        let r = call(
+            &mut m,
+            "create",
+            serde_json::json!({"request": {"cwd": "/tmp/x"}}),
+        );
         assert!(r["ok"].as_bool().unwrap());
         let id = r["value"]["sessionId"].as_str().unwrap().to_string();
 
         let l = call(&mut m, "list", serde_json::json!({"request": {}}));
-        assert!(l["value"]["items"].as_array().unwrap().iter().any(|i| i["sessionId"] == id));
+        assert!(
+            l["value"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|i| i["sessionId"] == id)
+        );
 
-        let rn = call(&mut m, "rename", serde_json::json!({"request": {"sessionId": id, "title": "  hi  there "}}));
+        let rn = call(
+            &mut m,
+            "rename",
+            serde_json::json!({"request": {"sessionId": id, "title": "  hi  there "}}),
+        );
         assert_eq!(rn["value"]["title"], "hi there");
 
-        let bad = call(&mut m, "rename", serde_json::json!({"request": {"sessionId": id, "title": "   "}}));
+        let bad = call(
+            &mut m,
+            "rename",
+            serde_json::json!({"request": {"sessionId": id, "title": "   "}}),
+        );
         assert_eq!(bad["error"]["code"], "session/title-invalid");
     }
 
@@ -1053,56 +1177,104 @@ mod tests {
         std::fs::create_dir_all(&real).unwrap();
         std::os::unix::fs::symlink(&real, base.path().join("link")).unwrap();
         let link = base.path().join("link").to_string_lossy().to_string();
-        let r1 = call(&mut m, "create", serde_json::json!({"request": {"sessionId": "s-rp", "cwd": link}}));
+        let r1 = call(
+            &mut m,
+            "create",
+            serde_json::json!({"request": {"sessionId": "s-rp", "cwd": link}}),
+        );
         assert!(r1["ok"].as_bool().unwrap(), "{r1}");
         // Adopt through the symlink's target: canonical paths match, no conflict.
-        let r2 = call(&mut m, "create", serde_json::json!({"request": {"sessionId": "s-rp", "cwd": real.to_string_lossy().to_string()}}));
-        assert!(r2["ok"].as_bool().unwrap(), "realpath-equal cwd must adopt: {r2}");
+        let r2 = call(
+            &mut m,
+            "create",
+            serde_json::json!({"request": {"sessionId": "s-rp", "cwd": real.to_string_lossy().to_string()}}),
+        );
+        assert!(
+            r2["ok"].as_bool().unwrap(),
+            "realpath-equal cwd must adopt: {r2}"
+        );
         // A genuinely different directory still conflicts.
         let other = tempfile::tempdir().unwrap();
-        let r3 = call(&mut m, "create", serde_json::json!({"request": {"sessionId": "s-rp", "cwd": other.path().to_string_lossy().to_string()}}));
+        let r3 = call(
+            &mut m,
+            "create",
+            serde_json::json!({"request": {"sessionId": "s-rp", "cwd": other.path().to_string_lossy().to_string()}}),
+        );
         assert_eq!(r3["error"]["code"], "session/conflict", "{r3}");
     }
 
     #[test]
     fn prompt_then_page_and_search() {
         let (_dir, mut m, _registry) = machine();
-        let r = call(&mut m, "create", serde_json::json!({"request": {"cwd": "/tmp/y"}}));
+        let r = call(
+            &mut m,
+            "create",
+            serde_json::json!({"request": {"cwd": "/tmp/y"}}),
+        );
         let id = r["value"]["sessionId"].as_str().unwrap().to_string();
-        let p = call(&mut m, "prompt", serde_json::json!({"request": {
-            "sessionId": id,
-            "requestId": "req-1",
-            "mode": "queue",
-            "content": [{"type": "text", "text": "hello vocoder"}],
-        }}));
+        let p = call(
+            &mut m,
+            "prompt",
+            serde_json::json!({"request": {
+                "sessionId": id,
+                "requestId": "req-1",
+                "mode": "queue",
+                "content": [{"type": "text", "text": "hello vocoder"}],
+            }}),
+        );
         assert!(p["value"]["accepted"].as_bool().unwrap());
         // Idempotent re-prompt.
-        let p2 = call(&mut m, "prompt", serde_json::json!({"request": {
-            "sessionId": id, "requestId": "req-1", "mode": "queue",
-            "content": [{"type": "text", "text": "hello vocoder"}],
-        }}));
+        let p2 = call(
+            &mut m,
+            "prompt",
+            serde_json::json!({"request": {
+                "sessionId": id, "requestId": "req-1", "mode": "queue",
+                "content": [{"type": "text", "text": "hello vocoder"}],
+            }}),
+        );
         assert!(p2["value"]["accepted"].as_bool().unwrap());
 
-        let page = call(&mut m, "page", serde_json::json!({"request": {
-            "address": {"kind": "session", "sessionId": id},
-            "throughSeq": 99,
-        }}));
+        let page = call(
+            &mut m,
+            "page",
+            serde_json::json!({"request": {
+                "address": {"kind": "session", "sessionId": id},
+                "throughSeq": 99,
+            }}),
+        );
         assert_eq!(page["value"]["records"].as_array().unwrap().len(), 1);
 
-        let s = call(&mut m, "search", serde_json::json!({"request": {"query": "vocoder"}}));
-        assert!(s["value"]["items"].as_array().unwrap().iter().any(|i| i["sessionId"] == id));
+        let s = call(
+            &mut m,
+            "search",
+            serde_json::json!({"request": {"query": "vocoder"}}),
+        );
+        assert!(
+            s["value"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|i| i["sessionId"] == id)
+        );
     }
 
     #[test]
     fn unknown_session_is_not_found() {
         let (_dir, mut m, _registry) = machine();
-        let r = call(&mut m, "rename", serde_json::json!({"request": {"sessionId": "nope", "title": "t"}}));
+        let r = call(
+            &mut m,
+            "rename",
+            serde_json::json!({"request": {"sessionId": "nope", "title": "t"}}),
+        );
         assert_eq!(r["error"]["code"], "session/not-found");
     }
 
     #[test]
     fn segment_encoding_matches_dsh_rules() {
-        assert_eq!(SessionStore::encode_segment("session-abc_DEF.1"), "session-abc_DEF.1");
+        assert_eq!(
+            SessionStore::encode_segment("session-abc_DEF.1"),
+            "session-abc_DEF.1"
+        );
         assert_eq!(SessionStore::encode_segment("."), "~2e");
         assert_eq!(SessionStore::encode_segment(".."), "~2e~2e");
         assert_eq!(SessionStore::encode_segment("a/b"), "a~002fb");

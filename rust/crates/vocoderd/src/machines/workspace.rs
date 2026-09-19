@@ -20,7 +20,11 @@ pub struct WorkspaceMachine {
 
 impl WorkspaceMachine {
     pub fn new(registry: Arc<WorkspaceRegistryStore>, session_root: std::path::PathBuf) -> Self {
-        Self { registry, sessions: SessionStore::new(session_root), follow_streams: Vec::new() }
+        Self {
+            registry,
+            sessions: SessionStore::new(session_root),
+            follow_streams: Vec::new(),
+        }
     }
 
     /// Broadcast a WorkspaceFollowIncrement to every live follow stream.
@@ -40,7 +44,10 @@ impl WorkspaceMachine {
         increments: impl FnOnce(&WorkspaceRegistryData) -> Vec<serde_json::Value>,
     ) -> Vec<MachineOut> {
         match self.registry.mutate(mutate) {
-            Ok(MutateOutcome { mut outs, broadcast: true }) => {
+            Ok(MutateOutcome {
+                mut outs,
+                broadcast: true,
+            }) => {
                 for inc in increments(&self.registry.read(|d| {
                     // Clone out the tiny amount we need: whole-data clone is
                     // fine at this scale (registry stays in the low KBs).
@@ -51,7 +58,10 @@ impl WorkspaceMachine {
                 outs
             }
             Ok(MutateOutcome { outs, .. }) => outs,
-            Err(e) => rpc::err("gateway/internal", format!("persisting workspace registry: {e}")),
+            Err(e) => rpc::err(
+                "gateway/internal",
+                format!("persisting workspace registry: {e}"),
+            ),
         }
     }
 }
@@ -65,11 +75,17 @@ struct MutateOutcome {
 
 impl MutateOutcome {
     fn ok_broadcast(outs: Vec<MachineOut>) -> Self {
-        Self { outs, broadcast: true }
+        Self {
+            outs,
+            broadcast: true,
+        }
     }
     /// Error path: return the error outputs without broadcasting.
     fn err(outs: Vec<MachineOut>) -> Self {
-        Self { outs, broadcast: false }
+        Self {
+            outs,
+            broadcast: false,
+        }
     }
 }
 
@@ -101,7 +117,9 @@ impl PluginMachine for WorkspaceMachine {
     type Out = MachineOut;
 
     fn handle(&mut self, ev: MachineIn) -> Vec<MachineOut> {
-        let MachineIn::Event { name, payload } = &ev else { return vec![] };
+        let MachineIn::Event { name, payload } = &ev else {
+            return vec![];
+        };
         if name.0 == rpc::stream_open_event("workspace") {
             let stream_id = payload
                 .get("streamId")
@@ -118,10 +136,18 @@ impl PluginMachine for WorkspaceMachine {
             self.follow_streams.retain(|s| s != stream_id);
             return vec![];
         }
-        if name.0 != rpc::call_event("workspace") { return vec![] }
-        let method = payload.get("method").and_then(|v| v.as_str()).unwrap_or_default();
+        if name.0 != rpc::call_event("workspace") {
+            return vec![];
+        }
+        let method = payload
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         let args = payload.get("args").cloned().unwrap_or_default();
-        let req = args.get("request").cloned().unwrap_or(serde_json::json!({}));
+        let req = args
+            .get("request")
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
 
         match method {
             "create" => self.create(&req),
@@ -131,7 +157,10 @@ impl PluginMachine for WorkspaceMachine {
             "insertSessionBefore" => self.insert_session_before(&req),
             "archiveSession" => self.archive_session(&req),
             "follow" => self.follow_snapshot(),
-            other => rpc::err("gateway/bad-request", format!("unsupported workspace method: {other}")),
+            other => rpc::err(
+                "gateway/bad-request",
+                format!("unsupported workspace method: {other}"),
+            ),
         }
     }
 }
@@ -180,7 +209,10 @@ impl WorkspaceMachine {
             for (id, r) in &d.records {
                 if r.path == path {
                     let view = view_of(id, r);
-                    return (rpc::ok(serde_json::json!({ "created": false, "workspace": view })), false);
+                    return (
+                        rpc::ok(serde_json::json!({ "created": false, "workspace": view })),
+                        false,
+                    );
                 }
             }
             let id = rpc::new_id();
@@ -189,39 +221,58 @@ impl WorkspaceMachine {
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| path.clone());
             let now = crate::machines::session_now_ms();
-            d.records.insert(id.clone(), WorkspaceRecord {
-                path: path.clone(), title,
-                session_ids: Vec::new(), created_at: now, updated_at: now,
-            });
+            d.records.insert(
+                id.clone(),
+                WorkspaceRecord {
+                    path: path.clone(),
+                    title,
+                    session_ids: Vec::new(),
+                    created_at: now,
+                    updated_at: now,
+                },
+            );
             d.workspace_ids.push(id.clone());
             d.initialized = true;
             let view = view_of(&id, d.records.get(&id).unwrap());
-            (rpc::ok(serde_json::json!({ "created": true, "workspace": view })), true)
+            (
+                rpc::ok(serde_json::json!({ "created": true, "workspace": view })),
+                true,
+            )
         });
         match result {
             Ok((mut outs, created)) => {
-                if created {
-                    if let Some(view) = outs.first().and_then(created_view) {
-                        outs.append(&mut self.broadcast(
-                            serde_json::json!({ "type": "upsert", "workspace": view }),
-                        ));
-                    }
+                if created && let Some(view) = outs.first().and_then(created_view) {
+                    outs.append(
+                        &mut self
+                            .broadcast(serde_json::json!({ "type": "upsert", "workspace": view })),
+                    );
                 }
                 outs
             }
-            Err(e) => rpc::err("gateway/internal", format!("persisting workspace registry: {e}")),
+            Err(e) => rpc::err(
+                "gateway/internal",
+                format!("persisting workspace registry: {e}"),
+            ),
         }
     }
 
     fn rename(&mut self, req: &serde_json::Value) -> Vec<MachineOut> {
-        let Some(id) = req.get("workspaceId").and_then(|v| v.as_str()).map(str::to_string) else {
+        let Some(id) = req
+            .get("workspaceId")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+        else {
             return rpc::err("gateway/bad-request", "missing workspaceId");
         };
-        let title = req.get("title").and_then(|v| v.as_str()).unwrap_or_default();
+        let title = req
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         let trimmed = title.trim().to_string();
         if trimmed.is_empty() {
             return rpc::err_details(
-                "gateway/bad-request", "blank workspace title",
+                "gateway/bad-request",
+                "blank workspace title",
                 serde_json::json!({ "issues": ["title must not be blank"] }),
             );
         }
@@ -230,7 +281,8 @@ impl WorkspaceMachine {
             move |d| {
                 if !d.records.contains_key(&id2) {
                     return MutateOutcome::err(rpc::err_details(
-                        "workspace/not-found", format!("no such workspace: {id2}"),
+                        "workspace/not-found",
+                        format!("no such workspace: {id2}"),
                         serde_json::json!({ "workspaceId": id2 }),
                     ));
                 }
@@ -256,14 +308,20 @@ impl WorkspaceMachine {
                 }
             },
             move |d| match d.records.get(&id) {
-                Some(r) => vec![serde_json::json!({ "type": "upsert", "workspace": view_of(&id, r) })],
+                Some(r) => {
+                    vec![serde_json::json!({ "type": "upsert", "workspace": view_of(&id, r) })]
+                }
                 None => vec![],
             },
         )
     }
 
     fn delete(&mut self, req: &serde_json::Value) -> Vec<MachineOut> {
-        let Some(id) = req.get("workspaceId").and_then(|v| v.as_str()).map(str::to_string) else {
+        let Some(id) = req
+            .get("workspaceId")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+        else {
             return rpc::err("gateway/bad-request", "missing workspaceId");
         };
         let id2 = id.clone();
@@ -271,7 +329,8 @@ impl WorkspaceMachine {
             move |d| {
                 if d.records.remove(&id).is_none() {
                     return MutateOutcome::err(rpc::err_details(
-                        "workspace/not-found", format!("no such workspace: {id}"),
+                        "workspace/not-found",
+                        format!("no such workspace: {id}"),
                         serde_json::json!({ "workspaceId": id }),
                     ));
                 }
@@ -279,8 +338,11 @@ impl WorkspaceMachine {
                 MutateOutcome::ok_broadcast(rpc::ok(serde_json::json!({ "deleted": true })))
             },
             move |d| {
-                let order: Vec<serde_json::Value> =
-                    d.workspace_ids.iter().map(|s| serde_json::Value::from(s.as_str())).collect();
+                let order: Vec<serde_json::Value> = d
+                    .workspace_ids
+                    .iter()
+                    .map(|s| serde_json::Value::from(s.as_str()))
+                    .collect();
                 vec![
                     serde_json::json!({ "type": "remove", "workspaceId": id2 }),
                     serde_json::json!({ "type": "order", "workspaceIds": order }),
@@ -290,16 +352,24 @@ impl WorkspaceMachine {
     }
 
     fn insert_before(&mut self, req: &serde_json::Value) -> Vec<MachineOut> {
-        let Some(id) = req.get("workspaceId").and_then(|v| v.as_str()).map(str::to_string) else {
+        let Some(id) = req
+            .get("workspaceId")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+        else {
             return rpc::err("gateway/bad-request", "missing workspaceId");
         };
-        let before = req.get("beforeWorkspaceId").and_then(|v| v.as_str()).map(str::to_string);
+        let before = req
+            .get("beforeWorkspaceId")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
         self.mutate_and_broadcast(
             move |d| {
                 let ids = &mut d.workspace_ids;
                 if !ids.contains(&id) {
                     return MutateOutcome::err(rpc::err_details(
-                        "workspace/not-found", format!("no such workspace: {id}"),
+                        "workspace/not-found",
+                        format!("no such workspace: {id}"),
                         serde_json::json!({ "workspaceId": id }),
                     ));
                 }
@@ -307,7 +377,8 @@ impl WorkspaceMachine {
                     && !ids.contains(b)
                 {
                     return MutateOutcome::err(rpc::err_details(
-                        "workspace/not-found", format!("no such workspace: {b}"),
+                        "workspace/not-found",
+                        format!("no such workspace: {b}"),
                         serde_json::json!({ "workspaceId": b }),
                     ));
                 }
@@ -317,32 +388,49 @@ impl WorkspaceMachine {
                     .and_then(|b| ids.iter().position(|w| w == b))
                     .unwrap_or(ids.len());
                 ids.insert(pos, id);
-                let order: Vec<serde_json::Value> =
-                    ids.iter().map(|s| serde_json::Value::from(s.as_str())).collect();
+                let order: Vec<serde_json::Value> = ids
+                    .iter()
+                    .map(|s| serde_json::Value::from(s.as_str()))
+                    .collect();
                 MutateOutcome::ok_broadcast(rpc::ok(serde_json::json!({ "workspaceIds": order })))
             },
             |d| {
-                let order: Vec<serde_json::Value> =
-                    d.workspace_ids.iter().map(|s| serde_json::Value::from(s.as_str())).collect();
+                let order: Vec<serde_json::Value> = d
+                    .workspace_ids
+                    .iter()
+                    .map(|s| serde_json::Value::from(s.as_str()))
+                    .collect();
                 vec![serde_json::json!({ "type": "order", "workspaceIds": order })]
             },
         )
     }
 
     fn insert_session_before(&mut self, req: &serde_json::Value) -> Vec<MachineOut> {
-        let Some(ws) = req.get("workspaceId").and_then(|v| v.as_str()).map(str::to_string) else {
+        let Some(ws) = req
+            .get("workspaceId")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+        else {
             return rpc::err("gateway/bad-request", "missing workspaceId");
         };
-        let Some(session) = req.get("sessionId").and_then(|v| v.as_str()).map(str::to_string) else {
+        let Some(session) = req
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+        else {
             return rpc::err("gateway/bad-request", "missing sessionId");
         };
-        let before = req.get("beforeSessionId").and_then(|v| v.as_str()).map(str::to_string);
+        let before = req
+            .get("beforeSessionId")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
         let ws2 = ws.clone();
         self.mutate_and_broadcast(
             move |d| {
                 let Some(record) = d.records.get_mut(&ws) else {
                     return MutateOutcome::err(rpc::err_details(
-                        "workspace/not-found", format!("no such workspace: {ws}"),
+                        "workspace/not-found",
+                        format!("no such workspace: {ws}"),
                         serde_json::json!({ "workspaceId": ws }),
                     ));
                 };
@@ -361,20 +449,27 @@ impl WorkspaceMachine {
                 MutateOutcome::ok_broadcast(rpc::ok(serde_json::json!({ "workspace": view })))
             },
             move |d| match d.records.get(&ws2) {
-                Some(r) => vec![serde_json::json!({ "type": "upsert", "workspace": view_of(&ws2, r) })],
+                Some(r) => {
+                    vec![serde_json::json!({ "type": "upsert", "workspace": view_of(&ws2, r) })]
+                }
                 None => vec![],
             },
         )
     }
 
     fn archive_session(&mut self, req: &serde_json::Value) -> Vec<MachineOut> {
-        let Some(session) = req.get("sessionId").and_then(|v| v.as_str()).map(str::to_string) else {
+        let Some(session) = req
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+        else {
             return rpc::err("gateway/bad-request", "missing sessionId");
         };
         let known = self.sessions.scan().into_iter().any(|s| s.id == session);
         if !known {
             return rpc::err_details(
-                "session/not-found", format!("no such session: {session}"),
+                "session/not-found",
+                format!("no such session: {session}"),
                 serde_json::json!({ "sessionId": session }),
             );
         }
@@ -388,9 +483,9 @@ impl WorkspaceMachine {
                     .iter()
                     .map(|s| serde_json::Value::from(s.as_str()))
                     .collect();
-                MutateOutcome::ok_broadcast(
-                    rpc::ok(serde_json::json!({ "archivedSessionIds": archived })),
-                )
+                MutateOutcome::ok_broadcast(rpc::ok(
+                    serde_json::json!({ "archivedSessionIds": archived }),
+                ))
             },
             |d| {
                 let archived: Vec<serde_json::Value> = d

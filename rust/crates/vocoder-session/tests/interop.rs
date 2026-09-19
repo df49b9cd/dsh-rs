@@ -108,7 +108,7 @@ fn migration_chain_composes() {
     assert_eq!(out[0]["version"], 3);
     // Missing steps fail loudly.
     assert!(matches!(
-        compose(&vec![], 2, 3, vec![]),
+        compose(&[], 2, 3, vec![]),
         Err(SessionError::NoMigration { .. })
     ));
 }

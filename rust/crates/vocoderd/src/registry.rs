@@ -63,7 +63,10 @@ impl WorkspaceRegistryStore {
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
-        let store = std::sync::Arc::new(Self { file, inner: Mutex::new(inner) });
+        let store = std::sync::Arc::new(Self {
+            file,
+            inner: Mutex::new(inner),
+        });
         stores.insert(key, std::sync::Arc::downgrade(&store));
         store
     }

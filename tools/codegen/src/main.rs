@@ -70,6 +70,28 @@ fn repo_root() -> Result<PathBuf> {
     }
 }
 
+/// Write a generated Rust source file, then format it with rustfmt.
+///
+/// Generated output is committed and CI diffs it (`just codegen` must be a
+/// no-op on a clean tree), so it has to be byte-stable under the repo's own
+/// formatting. Rather than teaching the emitter rustfmt's line-breaking rules,
+/// emit roughly and let rustfmt be the single source of formatting truth — the
+/// same way `cargo fmt` owns hand-written files.
+fn write_rust_src(path: &std::path::Path, contents: &str) -> Result<()> {
+    fs::write(path, contents)?;
+    let status = std::process::Command::new(
+        std::env::var("RUSTFMT").unwrap_or_else(|_| "rustfmt".into()),
+    )
+    .args(["--edition", "2024", "--emit", "files"])
+    .arg(path)
+    .status()
+    .context("run rustfmt (is the rustfmt component installed?)")?;
+    if !status.success() {
+        anyhow::bail!("rustfmt failed on {}", path.display());
+    }
+    Ok(())
+}
+
 fn generate() -> Result<()> {
     let root = repo_root()?;
     let spec: RemoteSpec = serde_json::from_str(
@@ -90,7 +112,7 @@ fn generate() -> Result<()> {
         codes_rs.push_str(&format!("    pub const {ident}: &str = {code:?};\n"));
     }
     codes_rs.push_str("}\n");
-    fs::write(out_dir.join("error_codes.rs"), codes_rs)?;
+    write_rust_src(&out_dir.join("error_codes.rs"), &codes_rs)?;
 
     // --- DTOs from JSON schemas -------------------------------------------
     let mut types_rs = String::from(
@@ -113,7 +135,7 @@ fn generate() -> Result<()> {
             }
         }
     }
-    fs::write(out_dir.join("types.rs"), types_rs)?;
+    write_rust_src(&out_dir.join("types.rs"), &types_rs)?;
 
     // --- traits per namespace ---------------------------------------------
     let mut traits_rs = String::from(
@@ -154,17 +176,23 @@ fn generate() -> Result<()> {
                 .map(type_name_from_symbol)
                 .unwrap_or_else(|| "serde_json::Value".into());
             traits_rs.push_str(&format!(
-                "    async fn {method}(&self, {}) -> Result<{result_ty}, RemoteError>;\n",
-                params.join(", ")
+                "    async fn {method}({params}) -> Result<{result_ty}, RemoteError>;\n",
+                // `&self` is required even with no endpoint parameters: these
+                // are trait-object methods on the service.
+                params = if params.is_empty() {
+                    "&self".to_string()
+                } else {
+                    format!("&self, {}", params.join(", "))
+                }
             ));
         }
         traits_rs.push_str("}\n\n");
     }
-    fs::write(out_dir.join("traits.rs"), traits_rs)?;
+    write_rust_src(&out_dir.join("traits.rs"), &traits_rs)?;
 
     // --- mod.rs ------------------------------------------------------------
     let mod_rs = "// GENERATED — do not edit.\npub mod error_codes;\npub mod traits;\npub mod types;\n";
-    fs::write(out_dir.join("mod.rs"), mod_rs)?;
+    write_rust_src(&out_dir.join("mod.rs"), mod_rs)?;
 
     // Summary
     println!(

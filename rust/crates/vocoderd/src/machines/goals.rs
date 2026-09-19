@@ -35,16 +35,24 @@ impl PluginMachine for GoalsMachine {
             .and_then(|v| v.as_str())
             .unwrap_or_default();
         let args = payload.get("args").cloned().unwrap_or_default();
-        let agent = rpc::arg_str(&args, "agentId").unwrap_or_default().to_string();
+        let agent = rpc::arg_str(&args, "agentId")
+            .unwrap_or_default()
+            .to_string();
 
         match method {
             "create" => {
-                let objective = rpc::arg_str(&args, "objective").unwrap_or_default().to_string();
+                let objective = rpc::arg_str(&args, "objective")
+                    .unwrap_or_default()
+                    .to_string();
                 let accepted = !objective.is_empty();
                 if accepted {
                     self.goals.insert(
                         agent.clone(),
-                        GoalRecord { objective, state: "active".into(), revision: 0 },
+                        GoalRecord {
+                            objective,
+                            state: "active".into(),
+                            revision: 0,
+                        },
                     );
                 }
                 rpc::ok(serde_json::json!({ "accepted": accepted }))
@@ -88,7 +96,10 @@ impl PluginMachine for GoalsMachine {
                     None => rpc::err("goal/not-found", "no current goal"),
                 }
             }
-            other => rpc::err("gateway/bad-request", format!("unsupported goals method: {other}")),
+            other => rpc::err(
+                "gateway/bad-request",
+                format!("unsupported goals method: {other}"),
+            ),
         }
     }
 }
@@ -125,7 +136,15 @@ mod tests {
     #[test]
     fn goals_lifecycle() {
         let mut g = GoalsMachine::default();
-        assert!(call(&mut g, "a-1", "create", serde_json::json!({"objective": "ship"})).contains("\"ok\":true"));
+        assert!(
+            call(
+                &mut g,
+                "a-1",
+                "create",
+                serde_json::json!({"objective": "ship"})
+            )
+            .contains("\"ok\":true")
+        );
         assert!(call(&mut g, "a-1", "get", serde_json::json!({})).contains("ship"));
         assert!(call(&mut g, "a-1", "pause", serde_json::json!({})).contains("paused"));
         assert!(call(&mut g, "a-1", "resume", serde_json::json!({})).contains("active"));
@@ -143,6 +162,14 @@ mod tests {
     #[test]
     fn empty_objective_is_rejected() {
         let mut g = GoalsMachine::default();
-        assert!(call(&mut g, "a-1", "create", serde_json::json!({"objective": ""})).contains("\"accepted\":false"));
+        assert!(
+            call(
+                &mut g,
+                "a-1",
+                "create",
+                serde_json::json!({"objective": ""})
+            )
+            .contains("\"accepted\":false")
+        );
     }
 }
