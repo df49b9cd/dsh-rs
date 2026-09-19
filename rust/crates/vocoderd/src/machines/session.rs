@@ -235,7 +235,12 @@ impl StoredSession {
             .and_then(|v| v.as_str())
             .map(str::to_string)
     }
-    fn created_at(&self) -> f64 {
+    /// The session's creation time, from its header.
+    ///
+    /// Public because it is already a wire value in two places — `session/list`
+    /// reports it as `updatedAt` and the session-reference candidates carry it
+    /// as `createdAt`.
+    pub fn created_at(&self) -> f64 {
         self.header
             .rest
             .get("createdAt")
@@ -848,6 +853,24 @@ impl SessionMachine {
         let through = get_f64(req, "throughSeq").unwrap_or(-1.0);
         let before = get_f64(req, "beforeSeq");
         let max = get_f64(req, "maxMessages").unwrap_or(50.0) as usize;
+        // A `throughSeq` past the log's end is *refused*, not clamped: a caller
+        // that asks for more than exists has lost track of the cursor, and
+        // answering with a short page would look like a truncated read. The
+        // control host answers `gateway/bad-request` ("past cursor N") here.
+        //
+        // Seq 0 is the session header row, which `skip(1)` drops, so the last
+        // addressable seq is `rows.len() - 1`.
+        let cursor = rows.len().saturating_sub(1) as f64;
+        if through > cursor {
+            return Ok(rpc::err_details(
+                "gateway/bad-request",
+                format!(
+                    "session page through seq {} is past cursor {}",
+                    through as i64, cursor as i64
+                ),
+                serde_json::json!({}),
+            ));
+        }
         let mut records = Vec::new();
         for row in rows.into_iter().skip(1) {
             let seq = row.get("seq").and_then(|v| v.as_f64()).unwrap_or(f64::NAN);
@@ -1587,7 +1610,21 @@ mod tests {
         );
         assert!(p2["value"]["accepted"].as_bool().unwrap());
 
+        // `throughSeq` addresses a real seq: past the log's end is refused, so
+        // this asks through the turn it just logged rather than through a
+        // guessed upper bound.
         let page = call(
+            &mut m,
+            "page",
+            serde_json::json!({"request": {
+                "address": {"kind": "session", "sessionId": id},
+                "throughSeq": 1,
+            }}),
+        );
+        assert_eq!(page["value"]["records"].as_array().unwrap().len(), 1);
+
+        // Asking past the end is refused, not clamped.
+        let past = call(
             &mut m,
             "page",
             serde_json::json!({"request": {
@@ -1595,7 +1632,7 @@ mod tests {
                 "throughSeq": 99,
             }}),
         );
-        assert_eq!(page["value"]["records"].as_array().unwrap().len(), 1);
+        assert_eq!(past["error"]["code"], "gateway/bad-request");
 
         let s = call(
             &mut m,

@@ -346,12 +346,23 @@ impl SettingsMachine {
             .get(ns)
             .cloned()
             .unwrap_or_else(|| serde_json::json!({}));
+        let before_section = section.clone();
         if let Err(message) = write(&mut section) {
             return rpc::err_details(
                 "settings/rejected",
                 message.clone(),
                 serde_json::json!({ "ns": ns, "message": message }),
             );
+        }
+        // A write whose result equals what was already there is a **no-op**: it
+        // succeeds and keeps the revision. The revision is a compare-and-set
+        // token for *observers*, so bumping it on a patch that changed nothing
+        // would invalidate every held token for no state change — a client
+        // re-reading the same value would start failing its own conditional
+        // writes. The control host behaves this way (verified: two identical
+        // patches leave the revision unchanged).
+        if section == before_section {
+            return rpc::ok(self.view_of(ns));
         }
         self.document.sections.insert(ns.to_string(), section);
         self.document.revisions.insert(ns.to_string(), current + 1);
