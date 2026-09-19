@@ -240,16 +240,36 @@ fn coverage_report() -> Result<()> {
     )
     .context("goals machine source")?;
 
+    // Every wire method name this source matches on. Handles the
+    // `"a" | "b" | "c" => …` alternation form: reading only the first literal
+    // would report `pause`/`resume` as unimplemented while their arm is right
+    // there, which is how this went unnoticed.
     let methods_of = |src: &str| -> std::collections::BTreeSet<String> {
         let mut out = std::collections::BTreeSet::new();
         for line in src.lines() {
             let t = line.trim();
-            if let Some(rest) = t.strip_prefix('"')
-                && let Some(end) = rest.find('"')
-            {
-                let name = &rest[..end];
-                if rest[end..].contains("=>") {
-                    out.insert(name.to_string());
+            if !t.starts_with('"') {
+                continue;
+            }
+            let mut rest = t;
+            // Consume one or more quoted literals joined by `|`.
+            loop {
+                let Some(after_open) = rest.strip_prefix('"') else {
+                    break;
+                };
+                let Some(end) = after_open.find('"') else { break };
+                if rest[end + 1..].contains("=>") {
+                    out.insert(after_open[..end].to_string());
+                }
+                let tail = &after_open[end + 1..];
+                match tail.trim_start().strip_prefix('|') {
+                    Some(next) => rest = next.trim_start(),
+                    None => {
+                        if tail.contains("=>") {
+                            out.insert(after_open[..end].to_string());
+                        }
+                        break;
+                    }
                 }
             }
         }
