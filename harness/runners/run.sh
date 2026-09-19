@@ -33,13 +33,16 @@ dsh)
         TOKEN_URL=""
         for _ in $(seq 1 90); do
             if grep -q "http://127.0.0.1:$PORT/?token=" "$LOG" 2>/dev/null; then
-                TOKEN_URL=$(grep -o "http://127.0.0.1:$PORT/?token=[^ ]*" "$LOG" | head -1)
-                break
+                # Wait one beat for the log line to finish flushing, then
+                # extract with a strict token charset.
+                sleep 1
+                TOKEN_URL=$(grep -oE "http://127.0.0.1:$PORT/\?token=[A-Za-z0-9_-]+" "$LOG" | head -1)
+                [ -n "$TOKEN_URL" ] && break
             fi
             sleep 1
         done
         [ -n "$TOKEN_URL" ] || { echo "dsh did not print a token URL on $PORT" >&2; exit 1; }
-        H=$(curl -sI "$TOKEN_URL" | awk -F': *' 'BEGIN{IGNORECASE=1} /^set-cookie:/ { sub(/;.*/, "", $2); print $2; exit }')
+        H=$(curl -sI -H "Accept: text/html" "$TOKEN_URL" | awk -F': *' 'BEGIN{IGNORECASE=1} /^set-cookie:/ { sub(/;.*/, "", $2); print $2; exit }')
         [ -n "$H" ] || { echo "token exchange produced no set-cookie" >&2; exit 1; }
         echo "$H" > "$DSH_HOME/conformance.cookie"
         echo "dsh ready on $PORT (auth cookie at $DSH_HOME/conformance.cookie)"
@@ -59,9 +62,9 @@ vocoderd)
     case "$CMD" in
     start)
         [ -x "$BIN" ] || { echo "vocoderd not built; run \`just build\`" >&2; exit 2; }
-        exec "$BIN" serve \\
-            --home "${CONFORMANCE_HOME:-$ROOT/.scratch/vocoderd-home}" \\
-            --spec "$ROOT/spec" \\
+        exec "$BIN" serve \
+            --home "${CONFORMANCE_HOME:-$ROOT/.scratch/vocoderd-home}" \
+            --spec "$ROOT/spec" \
             --port "$PORT"
         ;;
     stop)

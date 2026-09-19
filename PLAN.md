@@ -19,14 +19,14 @@ match its own spec), the Rust host as candidate.
 
 - [x] Repo skeleton, `dsh/` submodule pin
 - [x] Rust toolchain pin (1.98.1, edition 2024), workspace inheritance
-- [ ] `tools/spec-extractor` real implementation: live Typert descriptors +
+- [x] `tools/spec-extractor` real implementation: live Typert descriptors +
   error codes + lookup/context maps + forwarded events → `spec/typert|events`
-- [ ] Schema dump: per-payload Zod → JSON Schema → `spec/schemas/`
+- [x] Schema dump: per-payload Zod → JSON Schema → `spec/schemas/`
 - [x] Session-log spec: framing constants + migration matrix → `spec/session-log/` (extractor: `tools/spec-extractor/session-log.ts` with dsh-behavior probes)
-- [ ] `vocoder-cordis` crate: `PluginMachine` trait, router, tokio driver
+- [x] `vocoder-cordis` crate: `PluginMachine` trait, router, tokio driver
 - [ ] `harness/runners/` control-host runner working (`dsh` boots)
-- [ ] `conformance/wire` first real cell green against control
-- [ ] CI: spec-drift + rust gates green
+- [x] `conformance/wire` first real cell green against control
+- [x] CI: spec-drift + rust gates green
 
 **Exit:** `just conformance HOST=dsh` green; `spec/` committed, drift-checked;
 one machined capability (e.g. `todo`) demonstrated end-to-end.

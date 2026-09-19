@@ -8,3 +8,6 @@ __pycache__/
 
 # conformance build outputs
 /conformance/*/target/
+
+# codegen build outputs (keep the tree out of the repo)
+/tools/codegen/target/
