@@ -67,7 +67,45 @@ run: see *Known gaps* below.
 - The generated `traits.rs` façade is still unused. With the validator in
   place the untyped-extraction class is covered, so this is now a choice rather
   than a gap — machines stay sync and pure.
-- [ ] cancellation: `AbortSignal` ↔ `CancellationToken` as machine inputs
+- [x] cancellation: `AbortSignal` ↔ `CancellationToken` as machine inputs —
+  landed as the FSM's latched cause (`agent_loop::CancelCause`, `TurnEnd::Aborted`)
+  reaching the wire. The mechanism the item named is not the observable part;
+  the three observable facts are, and each is asserted:
+  - **The turn closes `aborted` with `reason: {kind: 'user'}`**, not a bespoke
+    event. A cancel is recorded by *closing the turn*
+    (`core/session/src/types.ts`'s `TurnEndReasonMap`), and
+    `agent/cancel-requested` — which vocoderd wrote and which appears nowhere in
+    `KNOWN_SESSION_EVENT_TYPES` — was invented: a reader that did not know the
+    type would refuse the whole log.
+  - **The delivered prefix is `assistant/message` with `interrupted: true`**,
+    with undispatched tool calls dropped, or `assistant/attempt` when nothing
+    visible streamed. An ordinary message claims the model finished.
+  - **`session/cancel` refuses two addresses**: `session/not-found` —
+    `session "<id>" not found (not attached)`, details `{sessionId}` — for a
+    session with no live agent, and `session/agent-busy` with
+    `{reason: 'use subagent delivery for this child session'}` for a subagent
+    child, checked in that order (`api/session-controller/src/commands.ts:497`).
+    The session machine owns that decision and `main.rs` forwards the cancel to
+    the agent machine **only on acceptance**; gating it there matters because
+    the two machines hold separate state.
+  - `keepInbox: true` is upstream's flag and vocoderd matches it by
+    construction: a cancel aborts the turn and the inbox fold is untouched, so
+    no canceled splice is logged.
+  - A cancel for a *different* session no longer aborts whatever is running —
+    the wire path had no session check at all.
+  - **`usage` is omitted, not zeroed.** `assemble_message` always wrote
+    `{inputTokens: 0, outputTokens: 0}`, but upstream spreads the key only when
+    the adapter reported one and four recorded `assistant/message` rows carry no
+    `usage` at all. A zero claims an accounting that never arrived. This is a
+    pre-existing defect the cancel work happened to expose, and it was found the
+    same way as the others: by tabulating the recorded rows instead of trusting
+    the code.
+  - Two wire cells (accepted, and not-attached) are green on **both** hosts.
+  - **The recorded cancellation is `dsh/snapshots/acp/cancel/`** — outside the
+    `snapshots/session/` root the replay harness reads, which is why none of the
+    above was caught by replay. A test now asserts the recorded row shape
+    (`the_recorded_cancel_fixes_the_interrupted_row_shape`); widening the replay
+    discovery to the other snapshot roots is still open.
 - [x] `conformance/wire` endpoint coverage on both hosts — 45 cells, and both
   hosts are green on every one of them, run as
   `./run-conformance.sh {dsh,vocoderd} wire`. Extending coverage to `llm` and
@@ -322,7 +360,8 @@ than it is:
 - **`M1`'s cancellation item is folded into M4** rather than dropped: a turn
   FSM with no cancel input cannot express upstream's streaming-cancellation
   contract, so it is a prerequisite for the first agent-loop step, not
-  parallel cleanup.
+  parallel cleanup. **Now landed** — see M1's entry for what it turned out to
+  be, which was mostly *not* the `AbortSignal` threading the item named.
 - **`agentTeams` has no wire cell.** Upstream's agent-team Remote lives in an
   experimental profile layer the default web profile does not compose, so the
   control 404s the whole namespace and a cell would compare against a host that

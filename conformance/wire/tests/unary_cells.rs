@@ -373,6 +373,30 @@ async fn session_create_list_rename_page_cell() {
     .await;
     assert_eq!(past["result"]["ok"], false, "{past}");
     assert_eq!(error_code(&past), "gateway/bad-request", "{past}");
+
+    // `cancel` addresses the *live* agent, not the durable session, and both
+    // hosts must accept it for a session they just created: the value is the
+    // spec's `{accepted: true}`. A turn is not in flight here, which is the
+    // idle case both hosts answer the same way.
+    let c = rpc("session/cancel", json!({"request": {"sessionId": sid}})).await;
+    assert_eq!(c["result"]["ok"], true, "{c}");
+    assert_eq!(value(&c)["accepted"], true, "{c}");
+}
+
+/// A cancel for a session the host does not have is not-attached, not a no-op.
+///
+/// This is the difference the live-agent lookup buys: `session/rename` on an
+/// unknown session is also `session/not-found`, but `cancel` is the only
+/// endpoint whose wording says *not attached* — and both hosts must agree on
+/// the code, since a client branches on it.
+#[tokio::test]
+async fn session_cancel_unknown_is_not_found_cell() {
+    let r = rpc(
+        "session/cancel",
+        json!({"request": {"sessionId": "ghost-session"}}),
+    )
+    .await;
+    assert_eq!(error_code(&r), "session/not-found", "{r}");
 }
 
 #[tokio::test]

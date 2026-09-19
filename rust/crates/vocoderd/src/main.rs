@@ -795,11 +795,29 @@ async fn api_rpc(
         });
     }
 
-    // `session/cancel` likewise. The agent machine latches the cancel and lets
-    // the in-flight model call settle the turn, because forcing the frame
-    // closers now would leave the reply with no open step to settle into.
+    // `session/cancel` likewise, and **only when the handler accepted it**.
+    //
+    // The session machine owns the decision — whether the Session exists and is
+    // not a subagent child — and the agent machine owns the cancellation. The
+    // two are separate machines with separate state, so the acceptance above is
+    // what gates the forward: sending a cancel the handler refused would abort a
+    // turn for a session the caller was just told it may not touch, and the
+    // subagent case would race the parent's own delivery.
+    //
+    // The agent machine latches the cancel and lets the in-flight model call
+    // settle the turn, because forcing the frame closers now would leave the
+    // reply with no open step to settle into.
     if namespace == "session"
         && method == "cancel"
+        && outs.iter().any(|o| {
+            matches!(
+                o,
+                RouteOut::Reply {
+                    reply: vocoder_cordis::RpcReply::Ok { .. },
+                    ..
+                }
+            )
+        })
         && let Some(request) = args.get("request")
         && let Some(session_id) = request.get("sessionId").and_then(|v| v.as_str())
     {

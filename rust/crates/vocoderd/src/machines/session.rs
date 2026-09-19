@@ -1308,16 +1308,51 @@ impl SessionMachine {
         Ok(outs)
     }
 
+    /// Cancel the live turn of one attached Session, keeping its pending inbox.
+    ///
+    /// Upstream's `cancel` (`api/session-controller/src/commands.ts:497`) is the
+    /// only method in the namespace that reads the **live agent registry**
+    /// rather than resuming a cold Session: it asks `ctx.agents.get(sessionId)`,
+    /// and a miss throws `session/not-found` with "not attached" — which is a
+    /// different fact from "no such Session", and the two are worth keeping
+    /// apart. Every other session method goes through `resolveAgent`, which
+    /// resumes a cold session; a cancel has nothing to resume *for*, so it
+    /// refuses instead of waking one.
+    ///
+    /// A subagent child is refused first, before liveness is even asked: its
+    /// turn is driven by its parent's delivery, so a direct cancel would race
+    /// the parent's own routing. Upstream checks
+    /// `hasApiSessionSubagentOwner`, whose first clause is the durable
+    /// `origin === 'subagent'` header fact
+    /// (`api/session-controller/src/agent.ts:97`) — the same field vocoderd's
+    /// `StoredSession::origin` reads, so this half is exact.
+    ///
+    /// The liveness half is answered by the *agent* machine, which is the only
+    /// thing that knows whether a turn is in flight: this machine never sees
+    /// the agent's ops. The forwarding in `main.rs` is what delivers the cancel;
+    /// this handler decides whether one may be sent at all.
     fn cancel(&mut self, req: &serde_json::Value) -> Result<Vec<MachineOut>, Vec<MachineOut>> {
         let Some(id) = get_str!(req, "sessionId") else {
             return Ok(rpc::err("gateway/bad-request", "missing sessionId"));
         };
-        // No live agents yet: cancel is a no-op acceptance for existing ones.
-        if self.find(id)?.is_none() {
+        let Some(session) = self.find(id)? else {
+            // Not a Session this host knows. Upstream's message for a lookup
+            // miss is the "not attached" one — it has no separate wording for
+            // "no such session", because `agents.get` is its only test.
             return Ok(rpc::err_details(
                 "session/not-found",
-                format!("no such session: {id}"),
+                format!("session \"{id}\" not found (not attached)"),
                 serde_json::json!({ "sessionId": id }),
+            ));
+        };
+        // A subagent child's turn is delivered by its parent, so a direct
+        // cancel must not reach it. Refused before the liveness question,
+        // matching upstream's order.
+        if session.origin().as_deref() == Some("subagent") {
+            return Ok(rpc::err_details(
+                "session/agent-busy",
+                format!("session \"{id}\" is owned by subagent routing"),
+                serde_json::json!({ "reason": "use subagent delivery for this child session" }),
             ));
         }
         Ok(rpc::ok(serde_json::json!({ "accepted": true })))
@@ -1812,6 +1847,128 @@ mod tests {
             serde_json::json!({"request": {"sessionId": "nope", "title": "t"}}),
         );
         assert_eq!(r["error"]["code"], "session/not-found");
+    }
+
+    /// A cancel for a Session this host does not know is "not attached".
+    ///
+    /// Upstream's `cancel` tests only `ctx.agents.get(sessionId)`, so its
+    /// wording for a miss is the not-attached one — and it carries `sessionId`
+    /// in `details`, which is what a client keys its recovery on.
+    #[test]
+    fn a_cancel_for_an_unknown_session_is_not_attached() {
+        let (_dir, mut m, _registry) = machine();
+        let r = call(
+            &mut m,
+            "cancel",
+            serde_json::json!({"request": {"sessionId": "does-not-exist"}}),
+        );
+        assert_eq!(r["error"]["code"], "session/not-found");
+        assert_eq!(
+            r["error"]["message"],
+            "session \"does-not-exist\" not found (not attached)"
+        );
+        assert_eq!(r["error"]["details"]["sessionId"], "does-not-exist");
+    }
+
+    /// A cancel for a subagent child is refused, naming the reason.
+    ///
+    /// The child's turn is delivered by its parent, so a direct cancel would
+    /// race the parent's routing. Upstream refuses with `session/agent-busy`
+    /// and the literal reason string
+    /// (`api/session-controller/src/agent.ts:97`), which a client uses to
+    /// decide to re-route rather than retry.
+    #[test]
+    fn a_cancel_for_a_subagent_child_is_agent_busy() {
+        let (dir, mut m, _registry) = machine();
+        // Both sessions are written to disk *before* any call runs: the store
+        // caches the directory tree on first scan, so a session created after
+        // that scan is invisible to this machine until its cache is dropped.
+        let parent = "session-cancel-parent";
+        let child = "session-cancel-child";
+        let write = |id: &str, extra: serde_json::Value| {
+            let sdir = dir
+                .path()
+                .join("sessions")
+                .join(SessionStore::project_dir(None))
+                .join(SessionStore::encode_segment(id));
+            std::fs::create_dir_all(&sdir).unwrap();
+            let mut header = serde_json::json!({
+                "type": "session", "version": 3, "id": id, "createdAt": 0,
+            });
+            for (k, v) in extra.as_object().unwrap() {
+                header[k] = v.clone();
+            }
+            let rows = vec![
+                header,
+                serde_json::json!({
+                    "type": "turn/start", "seq": 1, "time": 0, "data": { "turn": 1 },
+                }),
+                serde_json::json!({
+                    "type": "turn/end", "seq": 2, "time": 0,
+                    "data": { "turn": 1, "reason": { "kind": "completed" } },
+                }),
+            ];
+            let bytes = vocoder_session::encode_generation(&rows, false).unwrap();
+            std::fs::write(
+                sdir.join(vocoder_session::generation_filename(0, false)),
+                bytes,
+            )
+            .unwrap();
+        };
+        write(parent, serde_json::json!({}));
+        // A child is one whose header carries both facts: `parentSession` and
+        // `origin: "subagent"`. Written directly, since nothing in this machine
+        // creates children — the subagents machine does.
+        write(
+            child,
+            serde_json::json!({ "parentSession": parent, "origin": "subagent", "delegationDepth": 1 }),
+        );
+
+        let r = call(
+            &mut m,
+            "cancel",
+            serde_json::json!({"request": {"sessionId": child}}),
+        );
+        assert_eq!(r["error"]["code"], "session/agent-busy");
+        assert_eq!(
+            r["error"]["message"],
+            format!("session \"{child}\" is owned by subagent routing")
+        );
+        assert_eq!(
+            r["error"]["details"]["reason"],
+            "use subagent delivery for this child session"
+        );
+        // The parent — an ordinary Session — is not refused.
+        let p = call(
+            &mut m,
+            "cancel",
+            serde_json::json!({"request": {"sessionId": parent}}),
+        );
+        assert_eq!(p["value"]["accepted"], true, "{p}");
+    }
+
+    /// A cancel for an ordinary Session is accepted.
+    ///
+    /// The happy path, and the one the forwarding in `main.rs` is gated on: an
+    /// acceptance here is what lets the agent machine receive the cancel. An
+    /// ordinary Session (no `origin`) is not a subagent child, so it passes.
+    #[test]
+    fn a_cancel_for_an_ordinary_session_is_accepted() {
+        let (_dir, mut m, _registry) = machine();
+        let id = {
+            let r = call(
+                &mut m,
+                "create",
+                serde_json::json!({"request": {"cwd": "/tmp/cancel-ordinary"}}),
+            );
+            r["value"]["sessionId"].as_str().unwrap().to_string()
+        };
+        let r = call(
+            &mut m,
+            "cancel",
+            serde_json::json!({"request": {"sessionId": id}}),
+        );
+        assert_eq!(r["value"]["accepted"], true, "{r}");
     }
 
     #[test]

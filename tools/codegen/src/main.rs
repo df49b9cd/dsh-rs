@@ -498,14 +498,15 @@ fn coverage_report() -> Result<()> {
     //
     // - **Pending the agent core.** These need a live turn (or an agent
     //   registry) to mean anything, so they answer a typed refusal or a no-op
-    //   acceptance until M4 lands.
+    //   acceptance until M4 lands. `session/cancel` was in this list and is not
+    //   any more: it reaches the live turn now (the agent machine latches the
+    //   cancel; the session machine refuses an unattached or subagent address).
     // - **Pending OS integration.** Nothing about these depends on an agent
     //   loop; they need a native picker that a loopback host does not have.
     //   `session/modelCatalog` is neither — it is fully implemented, reading
     //   the llm machine's registry, and was stale in this list.
     let m4_stubs = [
         "session/attachment",
-        "session/cancel",
         "session/selectModel",
         "session/updateQueue",
     ];

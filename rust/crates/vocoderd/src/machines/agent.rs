@@ -51,7 +51,7 @@ use serde_json::{Value, json};
 use vocoder_cordis::{EffectResult, MachineIn, MachineOut, PluginMachine, RealizeRequest};
 
 use super::agent_inbox::{Inbox, InboxTarget};
-use super::agent_loop::{AgentLoop, Draft, LoopOutput, StepOutcome};
+use super::agent_loop::{AgentLoop, CancelCause, Draft, LoopOutput, StepOutcome};
 use super::llm_replay::{BlockType, FinishReason, StreamChunk, step_outcome};
 use super::markdown::DisplayAccumulator;
 use super::provider::{
@@ -1135,11 +1135,34 @@ impl AgentMachine {
             .map(|r| r.config.kind)
             .unwrap_or(ProviderKind::OpenAiChat);
         let chunks = decode(kind, &body);
-        let (message, usage) = assemble_message(&chunks, &provider, &state.rows);
+        let (mut message, usage) = assemble_message(&chunks, &provider, &state.rows);
         let reason = chunks.iter().rev().find_map(|c| match c {
             StreamChunk::Finish { reason } => Some(reason.clone()),
             _ => None,
         });
+        // A cancel latched while this call was in flight outranks the reply: the
+        // turn ends `aborted`, and what the model produced becomes the
+        // *interrupted prefix* rather than a reply — upstream settles it as
+        // `assistant/message` with `interrupted: true` and drops undispatched
+        // tool calls, or as `assistant/attempt` when no visible content streamed
+        // (`core/session/src/types.ts`, `assistant/message`'s `interrupted`).
+        //
+        // The distinction is load-bearing for a reader: an ordinary
+        // `assistant/message` claims the model finished, and a turn that was cut
+        // off would replay as a completed answer.
+        let interrupted = state.fsm.cancel_pending();
+        if interrupted {
+            // Undispatched tool calls are absent from the prefix; their results
+            // never happened, so recording the calls would propose work the
+            // model asked for and the loop never ran.
+            if let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) {
+                parts.retain(|p| p.get("type").and_then(Value::as_str) != Some("tool-call"));
+            }
+        }
+        let has_visible_content = message
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|parts| !parts.is_empty());
         let has_calls = chunks.iter().any(|c| {
             matches!(
                 c,
@@ -1149,28 +1172,53 @@ impl AgentMachine {
                 }
             )
         });
+        // A step that called tools runs them **before the step closes**, which is
+        // the order the corpus records: `assistant/message`, the calls, their
+        // results, then `step/end`. `step_reply` is what emits `step/end`, so the
+        // executor is entered first and the FSM is advanced once it finishes.
+        // Driving the tools after `continue_turn` instead would file them under
+        // the next step, which is a different durable claim about what happened.
+        //
+        // An interrupted turn runs none of them: the calls were dropped from the
+        // prefix above because they were never dispatched. Captured before the
+        // message is moved into the row below, since the executor reads the
+        // calls out of it.
+        if has_calls && reason.is_some() && !interrupted {
+            state.pending_calls = Some(super::tool_exec::calls_in(&message));
+        }
         // A stream with no finish chunk is recorded as an *attempt*, not a
         // message: claiming a reply the model never finished would make a broken
-        // call replay as a good one.
-        let row_type = if reason.is_some() {
+        // call replay as a good one. An interrupted turn with nothing visible
+        // streamed is the same kind of record for the same reason.
+        let row_type = if interrupted {
+            if has_visible_content {
+                "assistant/message"
+            } else {
+                "assistant/attempt"
+            }
+        } else if reason.is_some() {
             "assistant/message"
         } else {
             "assistant/attempt"
         };
         let (turn, step) = state.fsm.position();
-        let settled = Self::row(
-            &mut state.rows,
-            &Draft {
-                row_type,
-                data: json!({
-                    "turn": turn,
-                    "step": step,
-                    "message": message,
-                    "usage": usage,
-                    "stream": chunk_records(&chunks),
-                }),
-            },
-        );
+        let mut data = json!({
+            "turn": turn,
+            "step": step,
+            "stream": chunk_records(&chunks),
+        });
+        if row_type == "assistant/message" {
+            data["message"] = message;
+            // Absent rather than zero when the adapter reported nothing; see
+            // `assemble_message`.
+            if let Some(usage) = usage {
+                data["usage"] = usage;
+            }
+            if interrupted {
+                data["interrupted"] = json!(true);
+            }
+        }
+        let settled = Self::row(&mut state.rows, &Draft { row_type, data });
         // The attempt's closing frame, naming the row that supersedes it.
         //
         // Without this a client's partial stays live forever: the protocol's
@@ -1189,15 +1237,6 @@ impl AgentMachine {
                 message: "provider stream ended without a finish chunk".into(),
             },
         };
-        // A step that called tools runs them **before the step closes**, which is
-        // the order the corpus records: `assistant/message`, the calls, their
-        // results, then `step/end`. `step_reply` is what emits `step/end`, so the
-        // executor is entered first and the FSM is advanced once it finishes.
-        // Driving the tools after `continue_turn` instead would file them under
-        // the next step, which is a different durable claim about what happened.
-        if has_calls && reason.is_some() {
-            state.pending_calls = Some(super::tool_exec::calls_in(&message));
-        }
         let mut end_frames = vec![stream_event(
             &state.session,
             json!({
@@ -1205,7 +1244,7 @@ impl AgentMachine {
                 "attemptId": self.attempt_id_of(&state),
                 "revision": self.revision_of(&state) + 1,
                 "index": self.chunk_index_of(&state),
-                "outcome": if reason.is_some() {
+                "outcome": if row_type == "assistant/message" {
                     json!({ "kind": "committed", "eventType": row_type, "seq": seq })
                 } else {
                     json!({ "kind": "abandoned" })
@@ -1220,7 +1259,9 @@ impl AgentMachine {
             end_frames.extend(resumed);
             return end_frames;
         }
-        let outs = state.fsm.step_reply(outcome, has_calls, false);
+        let outs = state
+            .fsm
+            .step_reply(outcome, has_calls && !interrupted, false);
         let call = self.apply(&mut state, outs);
         end_frames.extend(self.continue_turn(state, call));
         end_frames
@@ -1525,9 +1566,24 @@ impl AgentMachine {
     /// The FSM decides *what* the cancel owes, and its answer is subtle in a way
     /// this must respect: when a step is open the cancel only *latches*, and the
     /// closers are emitted when the model's reply settles — which is the only
-    /// ordering that keeps `step/start`/`step/end` balanced. So a cancel here
-    /// reports acceptance and lets the in-flight call finish; forcing the frame
-    /// closers now would leave the reply with no step to settle into.
+    /// ordering that keeps `step/start`/`step/end` balanced. So a cancel
+    /// mid-call reports acceptance and lets the in-flight call settle the turn;
+    /// forcing the frame closers now would leave the reply with no step to
+    /// settle into.
+    ///
+    /// A cancel that arrives while the loop is *between* steps owes its closers
+    /// immediately, and the FSM returns them from `cancel` — those rows are
+    /// appended here and the turn is published, because a cancel between steps
+    /// is a whole turn's worth of durable change and no later effect will carry
+    /// it.
+    ///
+    /// There is deliberately **no** row recording the request itself. Upstream
+    /// records a cancellation by *closing the turn* with
+    /// `turn/end {kind: 'aborted', reason: {kind: 'user'}}`
+    /// (`core/session/src/types.ts`'s `TurnEndReasonMap`, emitted by
+    /// `core/agent-loop/src/agent.ts` from `signal.reason`), and it has no
+    /// event for the request; `agent/cancel-requested` is not in
+    /// `KNOWN_SESSION_EVENT_TYPES`, so a reader would refuse the log.
     ///
     /// A cancel for a session with no turn running is accepted and does
     /// nothing, which is upstream's own behaviour for an idle agent.
@@ -1540,44 +1596,53 @@ impl AgentMachine {
         if session.is_empty() {
             return rpc::err("gateway/bad-request", "missing sessionId");
         }
-        let turn = match &self.op {
+        // A cancel is addressed to one session; a turn for a *different* session
+        // is not the one being cancelled, and latching it would abort an
+        // unrelated conversation.
+        let holds_turn = match &self.op {
             Some(Op::Call { state, .. }) | Some(Op::Settle { state, .. }) => {
-                Some(state.fsm.position().0)
+                state.session == session
             }
-            _ => None,
+            _ => false,
         };
-        let Some(op) = self.op.as_mut() else {
-            // No operation in flight: nothing to latch, and nothing to write.
-            return rpc::ok(json!({ "accepted": true }));
-        };
-        // The rows live in whichever op variant is holding the turn; a cancel
-        // mid-call settles when that call's answer arrives, so latching is
-        // enough and no frame closers are forced here.
-        let rows = match op {
-            Op::Tools { state } => Some(&mut state.rows),
-            Op::Opening { .. } => None,
-            Op::Call { state, .. } | Op::Settle { state, .. } => Some(&mut state.rows),
-            Op::Publishing => None,
-        };
-        let Some(rows) = rows else {
-            return rpc::ok(json!({ "accepted": true }));
-        };
-        if rows
-            .iter()
-            .rev()
-            .any(|r| r.get("type").and_then(Value::as_str) == Some("turn/end"))
-        {
+        if !holds_turn {
+            // Either nothing is in flight, or the turn in flight belongs to
+            // another session. Neither has a turn to abort here.
             return rpc::ok(json!({ "accepted": true }));
         }
-        // The cancel is recorded as a row so a resume can see it, and the
-        // in-flight call is left to settle the turn.
-        let seq = rows.len().saturating_sub(1) as f64;
-        rows.push(json!({
-            "type": "agent/cancel-requested",
-            "seq": seq,
-            "time": super::session_now_ms(),
-            "data": { "turn": turn, "cause": { "kind": "user" } },
-        }));
+        // Latch first, then let the FSM say what the cancel owes. The order
+        // matters: `cancel` reads the latch it sets, so a step that is open
+        // returns nothing and the closer arrives with the reply.
+        let outs = {
+            let fsm = match self.op.as_mut() {
+                Some(Op::Call { state, .. }) | Some(Op::Settle { state, .. }) => {
+                    Some(&mut state.fsm)
+                }
+                _ => None,
+            };
+            match fsm {
+                Some(fsm) => fsm.cancel(CancelCause::User),
+                None => Vec::new(),
+            }
+        };
+        // The FSM closed the turn itself — it was between steps. Append what it
+        // returned and publish: no effect is outstanding to carry these rows, so
+        // this call is the only chance to write them.
+        if !outs.is_empty() {
+            let state = match self.op.take() {
+                Some(Op::Call { state, .. }) | Some(Op::Settle { state, .. }) => state,
+                other => {
+                    self.op = other;
+                    return rpc::ok(json!({ "accepted": true }));
+                }
+            };
+            let mut state = state;
+            let call = self.apply(&mut state, outs);
+            debug_assert!(call.is_none(), "a cancel owes no model call");
+            return self.finish(&state);
+        }
+        // A step is open: the latch is set and the reply settles it. Nothing is
+        // written now, and the answer is the same acceptance upstream returns.
         rpc::ok(json!({ "accepted": true }))
     }
 
@@ -2023,14 +2088,27 @@ fn chunk_value(chunk: &StreamChunk) -> Value {
 ///
 /// Blocks are emitted in index order, so reasoning precedes the text it
 /// preceded on the wire.
-fn assemble_message(chunks: &[StreamChunk], provider: &str, rows: &[Value]) -> (Value, Value) {
+///
+/// `usage` is `None` when the adapter reported none, and the caller omits the
+/// key entirely. Upstream spreads it conditionally on both settle paths
+/// (`core/agent-loop/src/agent.ts`: `...live.usage === undefined ? {} : { usage:
+/// live.usage }`), and the corpus agrees — four recorded `assistant/message`
+/// rows carry no `usage` at all, the cancelled one among them
+/// (`snapshots/acp/cancel/session.v3.jsonl`). Writing zeros instead would claim
+/// the adapter reported a zero-token call, which is a different fact from
+/// "no accounting arrived".
+fn assemble_message(
+    chunks: &[StreamChunk],
+    provider: &str,
+    rows: &[Value],
+) -> (Value, Option<Value>) {
     // Block index → its kind and accumulated text, kept in a BTreeMap so the
     // output is ordered by the wire's own block numbering.
     let mut blocks: BTreeMap<u64, (BlockType, String)> = BTreeMap::new();
     // Tool calls accumulate separately: their fragments concatenate into a JSON
     // string, and their id and name arrive once.
     let mut tool_ids: BTreeMap<u64, (String, String)> = BTreeMap::new();
-    let mut usage = json!({ "inputTokens": 0, "outputTokens": 0 });
+    let mut usage: Option<Value> = None;
     for chunk in chunks {
         match chunk {
             StreamChunk::BlockStart { index, block_type } => {
@@ -2065,7 +2143,7 @@ fn assemble_message(chunks: &[StreamChunk], provider: &str, rows: &[Value]) -> (
                     .1
                     .push_str(arguments_delta);
             }
-            StreamChunk::Usage { usage: u } => usage = u.clone(),
+            StreamChunk::Usage { usage: u } => usage = Some(u.clone()),
             // Deliberately not read; see the doc comment above.
             StreamChunk::BlockEnd { .. } | StreamChunk::Finish { .. } => {}
         }
@@ -2372,8 +2450,23 @@ mod tests {
         "data: [DONE]\n\n",
     );
 
-    /// A canned reply that calls `read` on a file, then answers.
+    /// A reply that streams text and finishes, with **no usage trailer**.
     ///
+    /// The shape the recorded cancellation has
+    /// (`snapshots/acp/cancel/session.v3.jsonl`): the adapter reported no
+    /// accounting, so the settling row must carry no `usage` key at all. A body
+    /// with a usage trailer — [`LIVE_BODY`] — cannot exercise that, which is
+    /// exactly how the zero-usage defect survived.
+    const NO_USAGE_BODY: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],",
+        "\"created\":1,\"id\":\"chatcmpl-2\",\"model\":\"m\",\"object\":\"chat.completion.chunk\"}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"stop\",",
+        "\"index\":0}],\"created\":1,\"id\":\"chatcmpl-2\",\"model\":\"m\",",
+        "\"object\":\"chat.completion.chunk\"}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    /// A canned reply that calls `read` on a file, then answers.    ///
     /// Two bodies because the turn has two model calls: the first proposes the
     /// tool call, the second answers once the tool result is in the log. The
     /// provider route is keyed by *call order*, which is what `canned_provider_seq`
@@ -3185,14 +3278,15 @@ mod tests {
         assert_eq!(written_rows(&sessions, session_id).len(), before);
     }
 
-    /// A cancel is accepted, recorded, and never leaves an unbalanced frame.
+    /// A cancel arriving after the turn closed is accepted and appends nothing.
     ///
-    /// The FSM latches a cancel while a step is open and settles it with the
-    /// reply, because forcing the closers at cancel time would leave the model's
-    /// answer with no step to settle into. So the cancel is a *request* on the
-    /// log, and the turn still closes exactly once.
+    /// The late-arrival case: a client's stop reaches the host after the model's
+    /// last token did. Upstream answers an idle agent the same way, and the log
+    /// must not gain a row for it. The *mid-call* case — the one a stop button
+    /// actually produces — is
+    /// [`a_cancel_mid_call_aborts_the_turn_and_marks_the_prefix_interrupted`].
     #[test]
-    fn a_cancel_is_recorded_and_leaves_the_frames_balanced() {
+    fn a_late_cancel_is_accepted_and_leaves_the_frames_balanced() {
         let session_id = "session-7";
         let (_home, sessions) = session_home(session_id);
         let mut machine = AgentMachine::new(sessions.clone(), vec![canned_provider(LIVE_BODY)]);
@@ -3211,6 +3305,7 @@ mod tests {
                 }),
             },
         );
+        let before = written_rows(&sessions, session_id);
         // The turn has finished by now, so a late cancel is accepted and adds
         // nothing: there is no turn to abort.
         let outs = drive(
@@ -3226,6 +3321,7 @@ mod tests {
         assert!(matches!(reply_of(&outs), RpcReply::Ok { .. }), "{outs:?}");
 
         let rows = written_rows(&sessions, session_id);
+        assert_eq!(rows.len(), before.len(), "a late cancel writes nothing");
         let types: Vec<&str> = rows
             .iter()
             .map(|r| r.get("type").and_then(Value::as_str).unwrap_or_default())
@@ -3240,7 +3336,211 @@ mod tests {
         }
     }
 
-    /// A cancel for an idle session is accepted and writes nothing.
+    /// Start a turn and stop with its model call *outstanding*.
+    ///
+    /// Answers every effect the turn needs on the way there — the session log's
+    /// walk and read — and deliberately does **not** perform the `FetchStream`,
+    /// returning its id instead. That is the suspension point a cancel has to be
+    /// delivered at to exercise the mid-call path: the call is issued and has no
+    /// answer yet, which is precisely when a user presses stop.
+    fn start_turn_to_the_fetch(
+        machine: &mut AgentMachine,
+        session_id: &str,
+    ) -> vocoder_cordis::EffectId {
+        let mut outs = machine.handle(MachineIn::Event {
+            name: vocoder_cordis::EventName::new(rpc::call_event("agent")),
+            payload: json!({
+                "method": "run",
+                "args": {
+                    "sessionId": session_id,
+                    "requestId": "req-cancel",
+                    "content": [{ "type": "text", "text": "ping" }],
+                },
+            }),
+        });
+        for _ in 0..16 {
+            let Some((id, request)) = outs.iter().find_map(|o| match o {
+                MachineOut::Realize { id, request } => Some((*id, request.clone())),
+                _ => None,
+            }) else {
+                panic!("the turn never asked for a model call: {outs:?}");
+            };
+            if matches!(request, RealizeRequest::FetchStream { .. }) {
+                return id;
+            }
+            let result =
+                crate::driver::realize_with(request, &mut |_| {}).unwrap_or(EffectResult::Done);
+            outs = machine.handle(MachineIn::EffectResult { id, result });
+        }
+        panic!("the turn asked for more effects than a first call should need");
+    }
+
+    /// Answer every effect in `outs` for real, until none is left.
+    ///
+    /// The manual tests above hand the machine one input at a time, so they own
+    /// the effect loop that `drive` would otherwise run. A turn that finishes
+    /// still owes its *publish* — the log write is an effect, not something
+    /// `finish` does inline — so discarding the outputs would leave the turn
+    /// decided in memory and absent from disk.
+    fn realize_all(machine: &mut AgentMachine, mut outs: Vec<MachineOut>) -> Vec<MachineOut> {
+        let mut terminal = Vec::new();
+        for _ in 0..16 {
+            let mut next: Vec<(vocoder_cordis::EffectId, RealizeRequest)> = Vec::new();
+            for out in outs {
+                match out {
+                    MachineOut::Realize { id, request } => next.push((id, request)),
+                    other => terminal.push(other),
+                }
+            }
+            let Some((id, request)) = next.into_iter().next() else {
+                break;
+            };
+            let result =
+                crate::driver::realize_with(request, &mut |_| {}).unwrap_or(EffectResult::Done);
+            outs = machine.handle(MachineIn::EffectResult { id, result });
+        }
+        terminal
+    }
+
+    /// A cancel that lands while the model call is in flight aborts the turn.
+    ///
+    /// This is the case the wire path exists for, and the one a stub cannot
+    /// serve: `session/cancel` arrives *between* the fetch's issue and its
+    /// answer, which is exactly when a user hits stop. The turn must close
+    /// `aborted` with the user's cause, and the model's text must be recorded as
+    /// an interrupted prefix rather than as a reply it finished.
+    #[test]
+    fn a_cancel_mid_call_aborts_the_turn_and_marks_the_prefix_interrupted() {
+        let session_id = "session-cancel-mid";
+        let (_home, sessions) = session_home(session_id);
+        let mut machine = AgentMachine::new(sessions.clone(), vec![canned_provider(NO_USAGE_BODY)]);
+        let _ = machine.handle(MachineIn::ServicesReady { keys: vec![] });
+
+        let effect_id = start_turn_to_the_fetch(&mut machine, session_id);
+
+        // The cancel arrives now, while the fetch is outstanding.
+        let cancel = machine.handle(MachineIn::Event {
+            name: vocoder_cordis::EventName::new(rpc::call_event("agent")),
+            payload: json!({
+                "method": "cancel",
+                "args": { "sessionId": session_id },
+            }),
+        });
+        assert!(
+            matches!(reply_of(&cancel), RpcReply::Ok { .. }),
+            "a cancel mid-call is accepted: {cancel:?}"
+        );
+
+        // The provider answers the call the cancel interrupted.
+        let outs = machine.handle(MachineIn::EffectResult {
+            id: effect_id,
+            result: EffectResult::HttpResponse {
+                status: 200,
+                body: NO_USAGE_BODY.to_string(),
+            },
+        });
+        let _ = realize_all(&mut machine, outs);
+
+        let rows = written_rows(&sessions, session_id);
+        let types: Vec<&str> = rows
+            .iter()
+            .map(|r| r.get("type").and_then(Value::as_str).unwrap_or_default())
+            .collect();
+        for frame in ["turn/start", "turn/end", "step/start", "step/end"] {
+            assert_eq!(
+                types.iter().filter(|t| **t == frame).count(),
+                1,
+                "{frame} exactly once in {types:?}"
+            );
+        }
+        // The turn closed aborted, with the user named as the cause.
+        let end = rows
+            .iter()
+            .find(|r| r.get("type").and_then(Value::as_str) == Some("turn/end"))
+            .expect("a turn/end");
+        assert_eq!(
+            end.pointer("/data/reason/kind").and_then(Value::as_str),
+            Some("aborted"),
+            "a cancelled turn ends aborted: {end}"
+        );
+        assert_eq!(
+            end.pointer("/data/reason/reason/kind")
+                .and_then(Value::as_str),
+            Some("user"),
+            "the cause is the user: {end}"
+        );
+        // The model's text survives as an interrupted prefix, so the answer the
+        // model had produced is not lost — and is not claimed as finished.
+        let msg = rows
+            .iter()
+            .find(|r| r.get("type").and_then(Value::as_str) == Some("assistant/message"))
+            .expect("the delivered prefix is recorded");
+        assert_eq!(
+            msg.pointer("/data/interrupted").and_then(Value::as_bool),
+            Some(true),
+            "an interrupted prefix carries the marker: {msg}"
+        );
+        // `usage` is absent, not zero: the adapter reported none. Upstream
+        // spreads the key conditionally, and the recording omits it — writing
+        // zeros would claim an accounting the adapter never gave.
+        assert!(
+            msg.pointer("/data/usage").is_none(),
+            "no usage key when the adapter reported none: {msg}"
+        );
+        // The request itself is *not* an event: upstream has no such vocabulary,
+        // and a reader that did not know `agent/cancel-requested` would refuse
+        // the whole log.
+        assert!(
+            !types.contains(&"agent/cancel-requested"),
+            "a cancel request is not a durable event type: {types:?}"
+        );
+    }
+
+    /// A cancel for a different session must not abort the turn in flight.
+    ///
+    /// Upstream's `agents.get(sessionId)` is a *lookup*: a cancel naming a
+    /// session with no live agent is answered `session/not-found` and reaches no
+    /// other session's turn. Aborting whatever happens to be running would let
+    /// one conversation's stop button kill another's.
+    #[test]
+    fn a_cancel_for_another_session_does_not_abort_this_turn() {
+        let session_id = "session-cancel-scope";
+        let (_home, sessions) = session_home(session_id);
+        let mut machine = AgentMachine::new(sessions.clone(), vec![canned_provider(LIVE_BODY)]);
+        let _ = machine.handle(MachineIn::ServicesReady { keys: vec![] });
+
+        let effect_id = start_turn_to_the_fetch(&mut machine, session_id);
+
+        // A cancel for a session that is not the one running.
+        let _ = machine.handle(MachineIn::Event {
+            name: vocoder_cordis::EventName::new(rpc::call_event("agent")),
+            payload: json!({
+                "method": "cancel",
+                "args": { "sessionId": "some-other-session" },
+            }),
+        });
+
+        let outs = machine.handle(MachineIn::EffectResult {
+            id: effect_id,
+            result: EffectResult::HttpResponse {
+                status: 200,
+                body: LIVE_BODY.to_string(),
+            },
+        });
+        let _ = realize_all(&mut machine, outs);
+        let rows = written_rows(&sessions, session_id);
+        let end = rows
+            .iter()
+            .find(|r| r.get("type").and_then(Value::as_str) == Some("turn/end"))
+            .expect("a turn/end");
+        assert_eq!(
+            end.pointer("/data/reason/kind").and_then(Value::as_str),
+            Some("completed"),
+            "another session's cancel leaves this turn alone: {end}"
+        );
+    }
+
+    /// A cancel for a session with no turn running is accepted and writes nothing.
     #[test]
     fn a_cancel_with_no_running_turn_is_a_no_op() {
         let session_id = "session-8";
@@ -3801,6 +4101,83 @@ mod tests {
         assert!(
             !joined.contains("**unclosed**"),
             "a tool argument must not be markdown-repaired: {joined:?}"
+        );
+    }
+
+    /// The one recorded cancellation, and the shape it fixes.
+    ///
+    /// `dsh/snapshots/acp/cancel/session.v3.jsonl` is the only committed log
+    /// that records a cancelled turn, and it is the authority for three things
+    /// this machine had wrong or unverified: the settling row is
+    /// `assistant/message` with `interrupted: true`; `usage` is **absent**
+    /// (the adapter never reported one, and upstream spreads the key
+    /// conditionally on both settle paths); and there is no event for the
+    /// cancel *request* — the turn's own `turn/end {kind: 'aborted'}` carries
+    /// it. A reader that did not know `agent/cancel-requested` would refuse the
+    /// whole log, which is why nothing writes one.
+    ///
+    /// Asserted against the recording rather than against a hand-written
+    /// expectation, so a change to the vocabulary fails here.
+    #[test]
+    fn the_recorded_cancel_fixes_the_interrupted_row_shape() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../dsh/snapshots/acp/cancel/session.v3.jsonl");
+        if !path.exists() {
+            eprintln!(
+                "skipping: {} absent (submodule not checked out)",
+                path.display()
+            );
+            return;
+        }
+        let rows = vocoder_session::read_generation(&path).expect("read recorded cancel");
+
+        let row = |ty: &str| {
+            rows.iter()
+                .find(|r| r.get("type").and_then(Value::as_str) == Some(ty))
+                .unwrap_or_else(|| panic!("no {ty} row in the recording"))
+                .get("data")
+                .cloned()
+                .unwrap_or(Value::Null)
+        };
+
+        // The settling row: an interrupted prefix, not a reply.
+        let msg = row("assistant/message");
+        assert_eq!(
+            msg.get("interrupted").and_then(Value::as_bool),
+            Some(true),
+            "recorded: {msg}"
+        );
+        assert!(
+            !msg.as_object().is_some_and(|o| o.contains_key("usage")),
+            "no usage key when the adapter reported none: {msg}"
+        );
+        assert!(
+            msg.pointer("/message/content").is_some(),
+            "the prefix carries the model's delivered content: {msg}"
+        );
+
+        // The abort is carried by the turn's own closer, with the user as the
+        // cause — there is no separate cancel event.
+        let end = row("turn/end");
+        assert_eq!(
+            end.pointer("/reason/kind").and_then(Value::as_str),
+            Some("aborted"),
+            "recorded: {end}"
+        );
+        assert_eq!(
+            end.pointer("/reason/reason/kind").and_then(Value::as_str),
+            Some("user"),
+            "recorded: {end}"
+        );
+
+        // No invented vocabulary anywhere in the recording.
+        let types: Vec<&str> = rows
+            .iter()
+            .map(|r| r.get("type").and_then(Value::as_str).unwrap_or_default())
+            .collect();
+        assert!(
+            !types.contains(&"agent/cancel-requested"),
+            "the recording has no cancel-request event: {types:?}"
         );
     }
 }
