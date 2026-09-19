@@ -240,7 +240,53 @@ problems than a credential.
     dialect tests in `provider.rs` (which check the rendered body per dialect)
     rather than on a live acceptance. Stated here because it is the one part of
     this step that reading and fixtures cannot confirm.
-- [ ] sandbox machines (Landlock/seccomp native) (step 4)
+- [ ] sandbox machines (Landlock/seccomp native) (step 4) — **the runner seam
+  has landed**; nothing *calls* it yet. `machines/sandbox_runner.rs` reproduces
+  upstream's `LocalSandboxProvider.confine` seam, which is already a machine's
+  signature: argv + policy in, wrapped argv + classification metadata out. So
+  the whole interesting half — chain selection, per-runner profiles, exit-gated
+  runner-failure classification, the denial dialect — is pure and tested without
+  spawning; the driver's half is a `Command::new`.
+  - **Two new effects carry what a machine cannot do.** `ProcessExec` takes an
+    argv that is *already wrapped*, so the driver never decides whether to
+    confine; `ProbeProgram` answers usability as data. The first is where the
+    fail-closed contract is enforced structurally rather than by discipline:
+    there is no arm that hands a confined mode its original argv.
+  - **The runner chain is real, and so is the fallback.** `bwrap` → Landlock on
+    Linux, Seatbelt, Windows ACL; a chain of one is selected unprobed, a longer
+    one is probed in preference order. `windows-acl` claims `partial`
+    enforcement, and the others `full`.
+  - **Verified against the kernel, not only against fixtures.** `bwrap` is
+    present on this host, so the tests spawn a confined process and assert the
+    *observable world* — under `read-only` the target file does not appear,
+    under `workspace-write` the workspace write lands and an outside write does
+    not. The test was confirmed non-vacuous by inverting its central assertion
+    and watching it fail with the kernel's real `Read-only file system`, which
+    is also the recorded denial signature. Tests self-skip (loudly) where no
+    runner is usable, since such a host leaves the claim untested rather than
+    false.
+  - **Three defects the wiring exposed, each contradicted by the corpus.** The
+    escalation ladder was *unreachable*: the gate understood escalation and the
+    executor implemented the ask, but the catalog advertised neither
+    `sandbox_permissions` nor `justification` and the denial did not mention
+    them, so a denied model had no sanctioned move — upstream spreads those
+    fields into exactly the two mutators under a confining backend, and this
+    host's backend confines. `data.error` was wrong twice over (on the message
+    part as well as the envelope, and shaped `{message}` where all five recorded
+    examples are `{name, code}`, never the part). And the containment fence and
+    the kernel profiles each derived writable roots separately, so they could
+    disagree — now one shared function, for the reason upstream gives.
+  - **What is reduced.** `seccomp` is not implemented and no `bash` tool exists,
+    so nothing yet *calls* this seam: the fence still guards `read`/`write`/`edit`,
+    which execute no code. `ProbeProgram` is an existence-and-execute-bit check
+    rather than upstream's functional probe (which runs the real profile around
+    `true`) — because probing by execution would mean the host spawns an
+    arbitrary path a machine named, which is the thing the probe exists to
+    decide. The Windows ACL rung is written but unexercised on Linux, and the
+    Landlock launcher is unreachable here for the same reason (bwrap wins the
+    chain), so both rest on upstream's recorded dialects rather than on this
+    host's kernel. The `partial` ABI-reporting path is likewise tested through
+    the fixture's shape rather than a real older-ABI kernel.
 
 ## M5 — Plugin interop
 
@@ -302,8 +348,21 @@ than it is:
   can lose an update. Sound today only because the executor is serial and the
   model is the sole writer.
 - **The confinement fence is containment, not a kernel boundary** (see M4 step
-  3). That is upstream's own framing for `fs-sandbox` too, and it is the reason
-  `bash` is not in the tool catalog: no untrusted *code* runs until step 4.
+  3). That is upstream's own framing for `fs-sandbox` too. The kernel boundary
+  now *exists* (step 4) but nothing calls it: the fence guards `read`/`write`/
+  `edit`, which execute no code, and `bash` is still absent from the catalog. So
+  the two are not yet joined — the runner seam is the answer to a question no
+  live call is asking.
+- **The sandbox runner seam has no consumer** (see M4 step 4). Its module carries
+  `#![allow(dead_code)]` for that reason, and the three real-kernel tests are the
+  only thing exercising it end to end. Wiring it needs a tool that executes code,
+  which is the same prerequisite `bash` has always had.
+- **`seccomp` is not implemented** (see M4 step 4), despite the plan item naming
+  it. Upstream's Linux chain does not use seccomp either — it is `bwrap` then
+  Landlock — so the vocabulary in this item was wrong, not merely incomplete.
+  Syscall filtering is a strictly narrower mechanism than the file-effect mode
+  vocabulary the rest of the sandbox speaks, and nothing in the corpus asks for
+  one.
 
 ## Spec parity gate (CI)
 
