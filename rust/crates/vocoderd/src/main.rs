@@ -72,6 +72,16 @@ struct AppState {
     streams: Mutex<std::collections::HashMap<String, StreamRoute>>,
     /// Stable host facts for the $events ready frame.
     home: String,
+    /// Serializes whole effect loops. A machine holds one suspended operation
+    /// at a time, so two pumps interleaving between an effect request and its
+    /// answer would cross their suspensions and deliver an answer to the wrong
+    /// operation.
+    ///
+    /// Deliberately not the router lock: `pump` calls `route_stream_outs`,
+    /// which takes the connections lock, and connection tasks take those in
+    /// the opposite order — holding the router lock inverts that order and
+    /// deadlocks.
+    dispatch: Mutex<()>,
 }
 
 struct StreamRoute {
@@ -97,6 +107,8 @@ impl AppState {
     fn pump(&self, to: &MachineId, ev: MachineIn) -> Vec<RouteOut> {
         let mut terminal = Vec::new();
         let mut pending = Some(ev);
+        // One whole effect loop at a time; see [`AppState::dispatch`].
+        let _serialized = self.dispatch.lock();
         for _ in 0..crate::driver::MAX_EFFECTS_PER_INPUT {
             let Some(input) = pending.take() else { break };
             let outs = self.router.lock().handle(RouteIn::Deliver {
@@ -261,6 +273,7 @@ async fn main() -> Result<()> {
         connections: Mutex::new(std::collections::HashMap::new()),
         streams: Mutex::new(std::collections::HashMap::new()),
         home: args.home.display().to_string(),
+        dispatch: Mutex::new(()),
     });
 
     let app: AxumRouter<Arc<AppState>> = AxumRouter::new()
@@ -370,9 +383,13 @@ async fn ws_conn(mut socket: WebSocket, state: Arc<AppState>) {
                                     .and_then(|a| a.get("request"))
                                     .cloned()
                                     .unwrap_or(payload.clone());
-                                let outs = state.router.lock().handle(RouteIn::Deliver {
-                                    to: owner,
-                                    ev: MachineIn::Event {
+                                // Through the pump, not a bare Deliver: opening a
+                                // stream may need filesystem effects (a follow
+                                // snapshot reads the session log), and the pump is
+                                // what realizes them.
+                                let outs = state.pump(
+                                    &owner,
+                                    MachineIn::Event {
                                         name: EventName::new(
                                             crate::rpc::stream_open_event(&namespace),
                                         ),
@@ -386,7 +403,7 @@ async fn ws_conn(mut socket: WebSocket, state: Arc<AppState>) {
                                             "hostHome": state.home,
                                         }),
                                     },
-                                });
+                                );
                                 state.route_stream_outs(outs);
                             }
                             None => {

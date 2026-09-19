@@ -199,7 +199,75 @@ pub fn row_to_json(value: &serde_json::Value) -> String {
     }
 }
 
+/// Encode one generation to bytes, without touching the filesystem.
+///
+/// This is the pure half of [`write_generation`]: framing and (optional) zstd
+/// compression are computation, not I/O, so a Sans-I/O machine can produce the
+/// exact bytes and let the driver perform the write.
+pub fn encode_generation(
+    rows: &[serde_json::Value],
+    compress: bool,
+) -> Result<Vec<u8>, SessionError> {
+    use std::io::Write;
+    if compress {
+        let mut enc = zstd::stream::write::Encoder::new(Vec::new(), 3)?;
+        for row in rows {
+            enc.write_all(row_to_json(row).as_bytes())?;
+            enc.write_all(b"\n")?;
+        }
+        Ok(enc.finish()?)
+    } else {
+        let mut out = Vec::new();
+        for row in rows {
+            out.write_all(row_to_json(row).as_bytes())?;
+            out.write_all(b"\n")?;
+        }
+        Ok(out)
+    }
+}
+
+/// Decode generation bytes into JSON rows (header first).
+///
+/// Pure counterpart to [`encode_generation`], zstd-aware. The machine has the
+/// driver read the file and calls this on the bytes.
+pub fn decode_generation(
+    bytes: &[u8],
+    compressed: bool,
+) -> Result<Vec<serde_json::Value>, SessionError> {
+    let raw: Vec<u8> = if compressed {
+        zstd::stream::decode_all(bytes).map_err(|e| SessionError::Zstd(e.to_string()))?
+    } else {
+        bytes.to_vec()
+    };
+    let text = String::from_utf8(raw).map_err(|e| SessionError::Zstd(e.to_string()))?;
+    let mut rows = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        rows.push(
+            serde_json::from_str(trimmed).map_err(|e| SessionError::BadJson {
+                line: i + 1,
+                source: e,
+            })?,
+        );
+    }
+    Ok(rows)
+}
+
+/// Parse just the header row from generation bytes.
+pub fn decode_header(bytes: &[u8], compressed: bool) -> Result<SessionHeader, SessionError> {
+    let rows = decode_generation(bytes, compressed)?;
+    let first = rows.first().ok_or(SessionError::Empty)?;
+    serde_json::from_value(first.clone()).map_err(|e| SessionError::BadJson { line: 1, source: e })
+}
+
 /// Write one generation atomically (tmp + rename) into `dir`.
+///
+/// Standalone convenience for callers that are *not* Sans-I/O machines
+/// (tests, interop harness). A machine should emit a `WriteText` effect
+/// instead, whose driver implementation is atomic for the same reason.
 pub fn write_generation(
     dir: &Path,
     rows: &[serde_json::Value],
@@ -217,21 +285,9 @@ pub fn write_generation(
     ));
     {
         use std::io::Write;
-        if compress {
-            let mut enc = zstd::stream::write::Encoder::new(std::fs::File::create(&tmp)?, 3)?;
-            for row in rows {
-                enc.write_all(row_to_json(row).as_bytes())?;
-                enc.write_all(b"\n")?;
-            }
-            enc.finish()?; // completes the frame and flushes
-        } else {
-            let mut out = std::fs::File::create(&tmp)?;
-            for row in rows {
-                out.write_all(row_to_json(row).as_bytes())?;
-                out.write_all(b"\n")?;
-            }
-            out.flush()?;
-        }
+        let mut out = std::fs::File::create(&tmp)?;
+        out.write_all(&encode_generation(rows, compress)?)?;
+        out.flush()?;
     }
     std::fs::rename(&tmp, &target)?;
     Ok(target)

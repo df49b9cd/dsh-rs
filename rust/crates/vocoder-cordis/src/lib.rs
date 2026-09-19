@@ -104,8 +104,13 @@ impl EffectError {
 pub enum EffectResult {
     /// `ReadText` succeeded.
     Text(String),
+    /// `ReadBytes` succeeded.
+    Bytes(Vec<u8>),
     /// `ListDir` succeeded: the immediate entry names, sorted.
     Entries(Vec<String>),
+    /// `ListTree` succeeded: every descendant file path, sorted. Paths are
+    /// absolute and lexicographic, so a parent always precedes its children.
+    Paths(Vec<String>),
     /// `Stat` succeeded. `canonical` is the resolved realpath.
     Stat { canonical: String, is_dir: bool },
     /// `WriteText` / `CreateDirAll` succeeded.
@@ -257,11 +262,20 @@ pub enum MachineOut {
 pub enum RealizeRequest {
     /// Structured log line.
     Log { level: String, message: String },
-    /// Read a file as UTF-8 text.
+    /// Read a file as UTF-8 text. Fails on non-UTF-8 content — use
+    /// [`ReadBytes`] for anything binary (session generations are zstd).
     ReadText { path: String },
+    /// Read a file as raw bytes.
+    ReadBytes { path: String },
     /// Write a file as UTF-8 text, creating parent directories. Atomic
     /// (temp + rename) — session generations rely on this.
     WriteText { path: String, contents: String },
+    /// Write raw bytes, creating parent directories. Atomic, like [`WriteText`].
+    ///
+    /// Session generations are zstd frames, so they are not valid UTF-8 and
+    /// cannot travel through `WriteText`; routing them through a string would
+    /// corrupt or silently truncate the log.
+    WriteBytes { path: String, contents: Vec<u8> },
     /// Create a directory and any missing parents.
     CreateDirAll { path: String },
     /// Resolve a path and report whether it is a directory. One turn, because
@@ -269,6 +283,15 @@ pub enum RealizeRequest {
     Stat { path: String },
     /// List the immediate entry names of a directory.
     ListDir { path: String },
+    /// Recursively list every file beneath `path`, as absolute paths.
+    ///
+    /// The session namespace needs this: discovering whether a directory holds
+    /// a `session.vN.jsonl[.zstd]` generation means walking
+    /// `<root>/<project>/<session>/`, and doing that as one effect keeps
+    /// `session/list` a single round trip instead of one per directory. A
+    /// per-directory effect would make list O(sessions) awaits, and the
+    /// effect-loop cap bounds how deep any one call may go.
+    ListTree { path: String },
     /// Write raw text to the client's WebSocket (the mux machine's transport).
     SendText { text: String },
     /// A logical stream became live; the driver routes its frames to `owner`.
@@ -279,9 +302,6 @@ pub enum RealizeRequest {
     },
     /// A logical stream was cancelled by the client.
     CancelStream { stream_id: String },
-    /// Uninterpreted escape hatch for host-specific effects. Being retired:
-    /// prefer a typed variant above, so the driver's match stays exhaustive.
-    Raw(Payload),
 }
 
 // ---------------------------------------------------------------------------

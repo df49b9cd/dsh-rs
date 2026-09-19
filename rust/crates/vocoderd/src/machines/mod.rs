@@ -5,6 +5,7 @@
 
 pub mod events;
 pub mod goals;
+pub mod readcache;
 pub mod session;
 pub mod settings;
 pub mod workspace;

@@ -5,10 +5,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use vocoder_cordis::{
-    EffectId, EffectResult, MachineIn, MachineOut, PluginMachine, RealizeRequest,
-};
+use vocoder_cordis::{EffectResult, MachineIn, MachineOut, PluginMachine};
 
+use crate::machines::readcache::{self, FsCache, Pending};
 use crate::machines::session::SessionStore;
 use crate::registry::{WorkspaceRecord, WorkspaceRegistryStore};
 use crate::rpc;
@@ -20,17 +19,12 @@ pub struct WorkspaceMachine {
     follow_streams: Vec<String>,
     /// Monotonic effect-id counter; see [`WorkspaceMachine::next_effect`].
     effects: u64,
-    /// An operation suspended on an effect. `create` awaits a `Stat` before it
-    /// can canonicalize the path it persists, which is the only effect-awaiting
-    /// path in this namespace today.
-    pending: Option<PendingCreate>,
-}
-
-/// A `workspace/create` waiting on its `Stat` effect.
-struct PendingCreate {
-    effect: EffectId,
-    /// The path exactly as the client sent it (for error details).
-    requested: String,
+    /// An operation suspended on an effect; see [`WorkspaceMachine::dispatch`].
+    pending: Option<Pending>,
+    /// Driver-supplied view of the sessions tree. This namespace only needs
+    /// `session/archiveSession`'s "does it exist" check, but it reads through
+    /// the same cache as the session machine so both suspend identically.
+    cache: FsCache,
 }
 
 impl WorkspaceMachine {
@@ -41,14 +35,44 @@ impl WorkspaceMachine {
             follow_streams: Vec::new(),
             effects: 0,
             pending: None,
+            cache: FsCache::default(),
         }
     }
 
-    /// Claim the next effect id for this machine.
-    fn next_effect(&mut self) -> EffectId {
-        let id = EffectId::nth(self.effects);
-        self.effects += 1;
-        id
+    /// The sessions tree, requesting it once if not cached.
+    fn tree(&mut self) -> Result<Vec<String>, Vec<MachineOut>> {
+        let root = self.sessions.root();
+        self.cache.tree(&root, &mut self.pending, &mut self.effects)
+    }
+
+    /// Whether `id` names a session the host knows about.
+    ///
+    /// Reads through the same tree cache the session machine uses, so a
+    /// workspace mutation that follows a session call needs no extra walk.
+    fn session_exists(&mut self, id: &str) -> Result<bool, Vec<MachineOut>> {
+        let tree = self.tree()?;
+        // The tree alone is enough to see a session directory, but the *id* is
+        // in the header, so the files must be read too.
+        for path in &tree {
+            let Some(name) = path.rsplit('/').next() else {
+                continue;
+            };
+            if vocoder_session::parse_generation_filename(name).is_none() {
+                continue;
+            }
+            if !self.cache.files.contains_key(path)
+                && !self.cache.requested.contains(path)
+                && !self.cache.failed.contains_key(path)
+            {
+                self.cache.requested.insert(path.clone());
+                return Err(self
+                    .cache
+                    .request_read(path, &mut self.pending, &mut self.effects));
+            }
+        }
+        Ok(SessionStore::stateless_scan(&tree, &self.cache.files)
+            .into_iter()
+            .any(|s| s.id == id))
     }
 
     /// Broadcast a WorkspaceFollowIncrement to every live follow stream.
@@ -143,8 +167,11 @@ impl PluginMachine for WorkspaceMachine {
             let Some(pending) = self.pending.take() else {
                 return vec![];
             };
-            debug_assert_eq!(pending.effect, id, "workspace: effect id mismatch");
-            return self.resume_create(&pending.requested, result);
+            debug_assert_eq!(pending.effect, Some(id), "workspace: effect id mismatch");
+            if self.cache.absorb(result) {
+                return rpc::err("gateway/internal", "workspace effect failed");
+            }
+            return self.dispatch(&pending.method, &pending.req);
         }
         let MachineIn::Event { name, payload } = &ev else {
             return vec![];
@@ -178,18 +205,46 @@ impl PluginMachine for WorkspaceMachine {
             .cloned()
             .unwrap_or(serde_json::json!({}));
 
+        self.dispatch(method, &req)
+    }
+}
+
+impl WorkspaceMachine {
+    /// Run one method, arming `pending` so an effect request suspends it.
+    /// Mirrors the session machine's dispatcher; see `machines/readcache.rs`.
+    fn dispatch(&mut self, method: &str, req: &serde_json::Value) -> Vec<MachineOut> {
+        self.pending = Some(Pending {
+            effect: None,
+            method: method.to_string(),
+            req: req.clone(),
+        });
+        let outs = match self.run(method, req) {
+            Ok(outs) => outs,
+            Err(effect_request) => effect_request,
+        };
+        if self.pending.as_ref().is_some_and(|p| p.effect.is_none()) {
+            self.pending = None;
+        }
+        outs
+    }
+
+    fn run(
+        &mut self,
+        method: &str,
+        req: &serde_json::Value,
+    ) -> Result<Vec<MachineOut>, Vec<MachineOut>> {
         match method {
-            "create" => self.create(&req),
-            "rename" => self.rename(&req),
-            "delete" => self.delete(&req),
-            "insertBefore" => self.insert_before(&req),
-            "insertSessionBefore" => self.insert_session_before(&req),
-            "archiveSession" => self.archive_session(&req),
-            "follow" => self.follow_snapshot(),
-            other => rpc::err(
+            "create" => self.create(req),
+            "rename" => Ok(self.rename(req)),
+            "delete" => Ok(self.delete(req)),
+            "insertBefore" => Ok(self.insert_before(req)),
+            "insertSessionBefore" => Ok(self.insert_session_before(req)),
+            "archiveSession" => self.archive_session(req),
+            "follow" => Ok(self.follow_snapshot()),
+            other => Ok(rpc::err(
                 "gateway/bad-request",
                 format!("unsupported workspace method: {other}"),
-            ),
+            )),
         }
     }
 }
@@ -211,63 +266,60 @@ impl WorkspaceMachine {
         vec![rpc::stream_item(stream_id, baseline)]
     }
 
-    /// `workspace/create`. Two phases, because resolving the path needs the
-    /// driver (canonicalize + is-dir): phase 1 requests the `Stat` effect, and
-    /// the answer resumes in [`Self::resume_create`].
-    fn create(&mut self, req: &serde_json::Value) -> Vec<MachineOut> {
-        let Some(path) = req.get("path").and_then(|v| v.as_str()) else {
-            return rpc::err("gateway/bad-request", "missing path");
+    /// `workspace/create`. Suspends on a `Stat` so the driver can canonicalize
+    /// and classify the path; the re-run finds the answer cached.
+    fn create(&mut self, req: &serde_json::Value) -> Result<Vec<MachineOut>, Vec<MachineOut>> {
+        let Some(requested) = req.get("path").and_then(|v| v.as_str()) else {
+            return Ok(rpc::err("gateway/bad-request", "missing path"));
         };
-        let id = self.next_effect();
-        self.pending = Some(PendingCreate {
-            effect: id,
-            requested: path.to_string(),
-        });
-        vec![rpc::effect(
-            id,
-            RealizeRequest::Stat {
-                path: path.to_string(),
-            },
-        )]
-    }
-
-    /// Complete a `workspace/create` once the driver has resolved the path.
-    fn resume_create(&mut self, requested: &str, result: EffectResult) -> Vec<MachineOut> {
-        let canonical = match result {
-            EffectResult::Stat {
+        let key = readcache::stat_key(requested);
+        let path = match self.cache.stats.get(&key) {
+            Some(EffectResult::Stat {
                 canonical, is_dir, ..
-            } => {
+            }) => {
                 if !is_dir {
-                    return rpc::err_details(
+                    return Ok(rpc::err_details(
                         "workspace/invalid-path",
                         format!("not a directory: {requested}"),
                         serde_json::json!({ "path": requested }),
-                    );
+                    ));
                 }
-                canonical
+                canonical.clone()
             }
-            EffectResult::Failed(e) => {
-                // A missing path is the client's error; anything else is ours.
-                if e == vocoder_cordis::EffectError::NotFound {
-                    return rpc::err_details(
+            // A path the driver already failed to resolve: distinguish the
+            // client's error (absent) from ours (unreadable).
+            Some(EffectResult::Failed(e)) => {
+                if e == &vocoder_cordis::EffectError::NotFound {
+                    return Ok(rpc::err_details(
                         "workspace/invalid-path",
                         format!("not a resolvable directory: {requested}"),
                         serde_json::json!({ "path": requested }),
-                    );
+                    ));
                 }
-                return rpc::err(
+                return Ok(rpc::err(
                     "gateway/internal",
                     format!("resolving workspace path: {}", e.message()),
-                );
+                ));
             }
-            _ => {
-                return rpc::err(
-                    "gateway/internal",
-                    "workspace/create got an unexpected effect result",
-                );
-            }
+            // Not cached yet. `canonicalize` either requests the Stat (and
+            // this call suspends) or reports a path it already knows is
+            // absent — which the arms above would have handled, so the only
+            // way back is the cached-absent case, reported as invalid-path.
+            _ => match self
+                .cache
+                .canonicalize(requested, &mut self.pending, &mut self.effects)
+            {
+                Ok(Some(canonical)) => canonical,
+                Ok(None) => {
+                    return Ok(rpc::err_details(
+                        "workspace/invalid-path",
+                        format!("not a resolvable directory: {requested}"),
+                        serde_json::json!({ "path": requested }),
+                    ));
+                }
+                Err(effect_request) => return Err(effect_request),
+            },
         };
-        let path = canonical;
 
         let result = self.registry.mutate(|d| {
             // Idempotent by canonical path.
@@ -312,12 +364,12 @@ impl WorkspaceMachine {
                             .broadcast(serde_json::json!({ "type": "upsert", "workspace": view })),
                     );
                 }
-                outs
+                Ok(outs)
             }
-            Err(e) => rpc::err(
+            Err(e) => Ok(rpc::err(
                 "gateway/internal",
                 format!("persisting workspace registry: {e}"),
-            ),
+            )),
         }
     }
 
@@ -522,23 +574,25 @@ impl WorkspaceMachine {
         )
     }
 
-    fn archive_session(&mut self, req: &serde_json::Value) -> Vec<MachineOut> {
+    fn archive_session(
+        &mut self,
+        req: &serde_json::Value,
+    ) -> Result<Vec<MachineOut>, Vec<MachineOut>> {
         let Some(session) = req
             .get("sessionId")
             .and_then(|v| v.as_str())
             .map(str::to_string)
         else {
-            return rpc::err("gateway/bad-request", "missing sessionId");
+            return Ok(rpc::err("gateway/bad-request", "missing sessionId"));
         };
-        let known = self.sessions.scan().into_iter().any(|s| s.id == session);
-        if !known {
-            return rpc::err_details(
+        if !self.session_exists(&session)? {
+            return Ok(rpc::err_details(
                 "session/not-found",
                 format!("no such session: {session}"),
                 serde_json::json!({ "sessionId": session }),
-            );
+            ));
         }
-        self.mutate_and_broadcast(
+        Ok(self.mutate_and_broadcast(
             move |d| {
                 if !d.archived_session_ids.contains(&session) {
                     d.archived_session_ids.push(session.clone());
@@ -560,7 +614,7 @@ impl WorkspaceMachine {
                     .collect();
                 vec![serde_json::json!({ "type": "archived", "archivedSessionIds": archived })]
             },
-        )
+        ))
     }
 
     fn follow_snapshot(&self) -> Vec<MachineOut> {

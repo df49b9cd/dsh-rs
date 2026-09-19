@@ -9,9 +9,10 @@
 //! unit tests drive a single machine through the real effect path without
 //! building an HTTP host, which is what makes the purity refactor testable.
 
-use vocoder_cordis::{
-    EffectError, EffectId, EffectResult, MachineIn, MachineOut, PluginMachine, RealizeRequest,
-};
+use vocoder_cordis::{EffectError, EffectResult, RealizeRequest};
+
+#[cfg(test)]
+use vocoder_cordis::{EffectId, MachineIn, MachineOut, PluginMachine};
 
 /// Maximum effect round-trips allowed while answering one input.
 ///
@@ -67,17 +68,22 @@ pub fn realize(request: RealizeRequest) -> Option<EffectResult> {
             tracing::debug!("driver: CancelStream {stream_id}");
             return None;
         }
-        RealizeRequest::Raw(v) => {
-            tracing::debug!("driver: unhandled Raw effect {v}");
-            return None;
-        }
-
         // Filesystem effects: answered back to the machine.
         RealizeRequest::ReadText { path } => match std::fs::read_to_string(&path) {
             Ok(text) => EffectResult::Text(text),
             Err(e) => EffectResult::Failed(io_err(&e)),
         },
+        RealizeRequest::ReadBytes { path } => match std::fs::read(&path) {
+            Ok(bytes) => EffectResult::Bytes(bytes),
+            Err(e) => EffectResult::Failed(io_err(&e)),
+        },
         RealizeRequest::WriteText { path, contents } => {
+            match write_atomically(std::path::Path::new(&path), contents.as_bytes()) {
+                Ok(()) => EffectResult::Done,
+                Err(e) => EffectResult::Failed(io_err(&e)),
+            }
+        }
+        RealizeRequest::WriteBytes { path, contents } => {
             match write_atomically(std::path::Path::new(&path), &contents) {
                 Ok(()) => EffectResult::Done,
                 Err(e) => EffectResult::Failed(io_err(&e)),
@@ -111,17 +117,49 @@ pub fn realize(request: RealizeRequest) -> Option<EffectResult> {
             }
             Err(e) => EffectResult::Failed(io_err(&e)),
         },
+        RealizeRequest::ListTree { path } => match list_tree(std::path::Path::new(&path)) {
+            Ok(paths) => EffectResult::Paths(paths),
+            Err(e) => EffectResult::Failed(io_err(&e)),
+        },
     })
 }
 
-/// Write text via temp-file + rename, so a reader never observes a partial
+/// Every file beneath `root`, as absolute paths, sorted.
+///
+/// Sorted output is load-bearing: the session machine derives "latest
+/// generation" from the lexicographically last generation filename, so a
+/// nondeterministic walk would make `session/list` order-dependent.
+fn list_tree(root: &std::path::Path) -> std::io::Result<Vec<String>> {
+    // A missing root is an empty tree, not an error: the host's sessions
+    // directory does not exist until the first session is created.
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                stack.push(path);
+            } else {
+                out.push(path.to_string_lossy().to_string());
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Write bytes via temp-file + rename, so a reader never observes a partial
 /// file and a crash never leaves a truncated one. Parent directories are
 /// created as needed.
 ///
 /// Session generations depend on this: they are immutable once published, and
 /// `vocoder-session`'s committed-artifact check treats any existing destination
 /// as frozen.
-pub fn write_atomically(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+pub fn write_atomically(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -132,7 +170,7 @@ pub fn write_atomically(path: &std::path::Path, contents: &str) -> std::io::Resu
     ));
     {
         let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(contents.as_bytes())?;
+        f.write_all(contents)?;
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)
@@ -142,9 +180,13 @@ pub fn write_atomically(path: &std::path::Path, contents: &str) -> std::io::Resu
 ///
 /// Returns the machine's terminal outputs — crucially, outputs it produced
 /// *after* the last effect answer, so a caller whose operation suspends on I/O
-/// still sees its final reply. Used by machine unit tests; the live host does
-/// the same thing through `AppState::pump`, which additionally routes stream
-/// frames and dispatches events to other machines.
+/// still sees its final reply.
+///
+/// Test-only: the live host needs [`AppState::pump`], which additionally
+/// routes stream frames and dispatches events to other machines. Keeping this
+/// separate is what lets a machine be tested through the real effect path
+/// without standing up an HTTP host.
+#[cfg(test)]
 pub fn drive(
     machine: &mut dyn PluginMachine<In = MachineIn, Out = MachineOut>,
     input: MachineIn,
