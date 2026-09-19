@@ -66,7 +66,7 @@ impl SessionStore {
     }
 
     /// dsh: cwd separators → '-', prefixed/suffixed with '--'.
-    fn project_dir(cwd: Option<&str>) -> String {
+    pub fn project_dir(cwd: Option<&str>) -> String {
         match cwd {
             None | Some("") => "_no-cwd".to_string(),
             Some(c) => format!("--{}--", c.replace(['/', '\\', ':'], "-")),
@@ -75,7 +75,7 @@ impl SessionStore {
 
     /// dsh encodeSegment: [A-Za-z0-9._-] literal; else ~XXXX (UTF-16 unit).
     /// '.' / '..' get escaped to avoid path traversal.
-    fn encode_segment(id: &str) -> String {
+    pub fn encode_segment(id: &str) -> String {
         match id {
             "." => return "~2e".into(),
             ".." => return "~2e~2e".into(),

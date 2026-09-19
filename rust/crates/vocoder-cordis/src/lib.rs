@@ -143,6 +143,14 @@ pub enum EffectResult {
     Range { data: Vec<u8>, eof: bool },
     /// `WriteText` / `CreateDirAll` succeeded.
     Done,
+    /// A [`RealizeRequest::FetchJson`] succeeded: the HTTP status and the
+    /// response body as text.
+    ///
+    /// The status is carried rather than folded into the error because a
+    /// provider's error body is *useful* — the dialects put the real reason in
+    /// it — and a machine that only saw "failed" could not tell a rate limit
+    /// from a bad request.
+    HttpResponse { status: u16, body: String },
     /// The effect failed.
     Failed(EffectError),
 }
@@ -368,6 +376,28 @@ pub enum RealizeRequest {
     },
     /// A logical stream was cancelled by the client.
     CancelStream { stream_id: String },
+    /// POST a JSON body to an LLM provider and read the response body back.
+    ///
+    /// The one effect that leaves the machine boundary for the network, and it
+    /// is deliberately the *whole* call rather than a socket: a machine asks for
+    /// "this request, that endpoint", and the driver owns transport, timeouts,
+    /// and credentials. That keeps `handle` sync and lets a recorded call be
+    /// replayed by answering the same effect from a script instead of a socket.
+    ///
+    /// `headers` are already-resolved name/value pairs, so an API key never
+    /// enters the machine: the driver reads it from the environment at call
+    /// time and it exists only for the duration of the request.
+    ///
+    /// The response body is returned whole, as text. A streaming call therefore
+    /// buffers its SSE rather than being read frame-by-frame — enough for a
+    /// correct decode (the SSE decoder is incremental and does not care where
+    /// the read boundaries fell), at the cost of not surfacing the first token
+    /// before the last arrives.
+    FetchJson {
+        url: String,
+        headers: Vec<(String, String)>,
+        body: String,
+    },
 }
 
 // ---------------------------------------------------------------------------

@@ -3,6 +3,9 @@
 //! Each namespace is one Sans-I/O plugin machine; the driver feeds it
 //! "vocoder/<ns>/call" events and realizes its rpc.result outputs.
 
+pub mod agent;
+pub mod agent_inbox;
+pub mod agent_loop;
 pub mod agent_presets;
 pub mod agent_teams;
 pub mod commands;
@@ -12,8 +15,10 @@ pub mod events;
 pub mod file_references;
 pub mod goals;
 pub mod llm;
+pub mod llm_replay;
 pub mod message_feedback;
 pub mod plugin_inventory;
+pub mod provider;
 pub mod readcache;
 pub mod session;
 pub mod session_feedback;

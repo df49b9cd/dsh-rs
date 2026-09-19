@@ -166,7 +166,64 @@ pub fn realize(request: RealizeRequest) -> Option<EffectResult> {
             Ok(paths) => EffectResult::Paths(paths),
             Err(e) => EffectResult::Failed(io_err(&e)),
         },
+        // The one effect that leaves this process. A non-2xx status is *not* a
+        // failure here: provider error bodies carry the real reason, and the
+        // machine that knows the dialect is the one that should read it.
+        RealizeRequest::FetchJson { url, headers, body } => match fetch_json(&url, &headers, &body)
+        {
+            Ok((status, text)) => EffectResult::HttpResponse { status, body: text },
+            Err(e) => EffectResult::Failed(EffectError::Other(e)),
+        },
     })
+}
+
+/// Per-request timeout for a provider call.
+///
+/// A model call is slow by nature — reasoning models can stream for minutes —
+/// so this bounds a *stalled* connection rather than a long one. ureq's
+/// timeout applies per read/write operation, not to the whole transfer, which
+/// is exactly the wanted semantics.
+const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// POST a JSON body and return `(status, body_text)`.
+///
+/// Errors are reserved for transport failures and for bodies that are not text.
+/// An HTTP error *status* is returned as data, because the provider dialects
+/// put a structured reason in the body and only the machine knows how to read
+/// it; collapsing it here would turn "rate limited, retry in 30s" into an
+/// opaque failure.
+///
+/// `http_status_as_error(false)` is load-bearing rather than stylistic: with
+/// ureq's default, a non-2xx is an `Error::StatusCode` that **discards the
+/// body** (probed against a local 400, not assumed), which is precisely the
+/// detail a provider's error message lives in.
+fn fetch_json(
+    url: &str,
+    headers: &[(String, String)],
+    body: &str,
+) -> Result<(u16, String), String> {
+    // `Agent` is ureq's connection pool; building one per call is deliberate at
+    // this stage (calls are rare and a shared agent would need a lifetime to
+    // manage), and cheap enough that it is not the bottleneck.
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(FETCH_TIMEOUT))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut request = agent
+        .post(url)
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream");
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    let response = request.send(body).map_err(|e| format!("{e}"))?;
+    let status = response.status().as_u16();
+    response
+        .into_body()
+        .read_to_string()
+        .map(|text| (status, text))
+        .map_err(|e| format!("read response body: {e}"))
 }
 
 /// Every file beneath `root`, as absolute paths, sorted.

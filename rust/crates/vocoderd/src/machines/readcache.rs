@@ -392,6 +392,10 @@ impl FsCache {
                 false
             }
             EffectResult::Entries(_) => false,
+            // The cache is a filesystem cache and never issues a fetch, so an
+            // HTTP answer cannot belong to it. Attributing this to a pending
+            // read would poison that path with a bogus result.
+            EffectResult::HttpResponse { .. } => true,
         }
     }
 }

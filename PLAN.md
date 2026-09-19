@@ -144,9 +144,33 @@ problems than a credential.
 
 ## M4 — Agent core
 
-- Agent-loop machine: turn/step FSM, streaming, cancellation
-- LLM machine behind `spec/llm` (added to extractor in M1)
-- Tool seam + approval machine; sandbox machines (Landlock/seccomp native)
+- [x] **turn/step FSM** — `machines/agent_loop.rs`, pure and I/O-free, with
+  cancellation. 21 tests, including a replay over all 85 committed snapshot
+  directories that checks frame balance, dense step numbering, and the
+  `turn/end` reason vocabulary.
+- [x] **streaming and the LLM call path (step 2)** — the seam is
+  `machines/llm_replay.rs` (the chunk vocabulary + a replay provider derived
+  from a log's own recorded calls), `machines/agent_inbox.rs` (the durable fold
+  over `agent/inbox/spliced`), and `machines/provider.rs` (**the translation
+  core** for the three configured provider dialects). `machines/agent.rs` wires
+  them together and is what a `session/prompt` drives; a prompt over HTTP
+  against a live gateway produces
+  `user/message → agent/inbox/spliced → turn/start → step/start →
+  assistant/message → step/end → turn/end {completed}` with real token counts.
+  - **`llm-dialect` is a dependency and the canonical model**, not a
+    reimplementation. The crate is a *gateway's* translation core: it parses a
+    client wire body in and renders to a client dialect out. vocoderd is a
+    *client of providers*, so it needs the three inverse quadrants — canonical →
+    request body, and provider wire/SSE → canonical — which `provider.rs`
+    supplies. Where the crate has an adjacent direction its own framers are used
+    as a **round-trip oracle** in the tests.
+  - The live run found a defect no recorded fixture could: reasoning arrives
+    from an Anthropic backend fronted by a chat-completions surface as a nested
+    `thinking: {block_index, kind, text}` object, not the `reasoning_content`
+    string every fixture had assumed, so the decoder was silently dropping every
+    reasoning token.
+- [ ] tool seam + approval machine (step 3)
+- [ ] sandbox machines (Landlock/seccomp native) (step 4)
 
 ## M5 — Plugin interop
 

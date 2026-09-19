@@ -5,14 +5,20 @@ below was verified against the tree on 2026-09-19, not read off a claim — the
 suite was run, the hosts were started, and the control was probed where a
 parity question existed.
 
-> **Status: P0 and P1 are DONE** (uncommitted, 2026-09-19). Implementing them
-> found **five candidate defects**, not the two this document predicted — each
-> was surfaced by extending wire coverage and running the control, and each is
-> fixed with a cell. Measured result: **45 wire cells green on both hosts**
-> (`./run-conformance.sh {dsh,vocoderd} wire`), 168 Rust tests passing, codegen
-> and coverage-report both idempotent. P2–P4 below are unchanged.
+> **Status: P0, P1, and P2 step 2 are DONE** (uncommitted, 2026-09-19).
+> Implementing P0/P1 found **five candidate defects**, not the two this document
+> predicted — each was surfaced by extending wire coverage and running the
+> control, and each is fixed with a cell. Measured result: **45 wire cells green
+> on both hosts** (`./run-conformance.sh {dsh,vocoderd} wire`), 267 Rust tests
+> passing, codegen and coverage-report both idempotent.
 >
-> Two findings worth carrying forward:
+> P2 step 2 (the LLM seam) landed after that and is verified **against a live
+> provider endpoint**, not only against recorded data: a `session/prompt` over
+> HTTP produces a complete, balanced turn with real token counts. That run found
+> a defect no fixture had (see "What the LLM seam's live run taught" below).
+> P2 steps 3–4 and P3–P4 remain.
+>
+> Findings worth carrying forward:
 > - **P1.3's original framing was wrong.** "Adopt the generated service traits"
 >   could not have delivered working validation: the generated types drop
 >   `additionalProperties: false`, turn `const` into plain `String`, and the
@@ -23,6 +29,10 @@ parity question existed.
 >   optional parameters look required. That is a spec-fidelity bug, not a
 >   machine bug, and it would have made the boundary refuse calls the control
 >   accepts.
+> - **Running against a real provider beats reading code and spec**, the same way
+>   running the control host did earlier: it found a reasoning-decoding defect
+>   that every recorded fixture agreed was fine, because every fixture shared the
+>   same wrong assumption.
 
 Sources: unchecked `PLAN.md` bullets, the "Known gaps" section, `docs/`
 status tables, and deferral comments in machine source. Items are ordered by
@@ -166,19 +176,95 @@ scoping was sound and should be preserved as the core lands, not papered over.
 
 Suggested order, each step ending somewhere useful:
 
-1. **Turn/step FSM, no I/O.** `user/message` → `agent/step` → `assistant/message`
-   as pure transitions over the session log, replayed as unit tests. Requires
-   1.4's cancel input.
-2. **LLM seam.** The `llm` machine already answers the catalog; what is missing
-   is the *call* path. Upstream's `llm-deepseek` is ~10k lines; the seam should
-   be sized to the replay provider first (`installLlmReplay`), so the loop is
-   testable without a network or a key — which is also how upstream's own CI
-   runs its web lane.
+1. **Turn/step FSM, no I/O — DONE** (2026-09-19).
+   `rust/crates/vocoderd/src/machines/agent_loop.rs`: `turn/start`,
+   `step/start`, `step/end`, `turn/end` as pure transitions emitting row
+   *drafts* (seq and time are assigned by whoever publishes the generation, so
+   a replay stays byte-comparable). Cancellation (1.4) is folded in: the cause
+   vocabulary is the spec's `TurnEndCancelCause`, a cancel latches while a step
+   is open and settles with it so `step/start`/`step/end` stay balanced, and a
+   cancel outranks a successful reply.
+   21 tests, including a replay over **every committed snapshot** (85 dirs, 84
+   closed turns) that asserts balanced frames, dense step numbering from 1, and
+   a known `turn/end` reason — and that `resume_from` never claims a turn the
+   log already closed. Corpus-derived thresholds are floors set below the
+   measured counts.
+   Two shapes upstream keeps distinct and this reproduces because they were
+   easy to conflate: a **rejected pre-step opens no step at all** (so
+   `begin_turn` and `enter_step` are separate calls, with the hook between
+   them), and an **empty turn owns its boundary but spends no model call**.
+   Write it up as: `docs/architecture.md` still lists `agent-loop` as a target
+   machine; that is now true for the FSM half.
+2. **LLM seam — DONE** (2026-09-19). The `llm` machine already answered the
+   catalog; the *call* path now exists across four modules:
+   - `machines/llm_replay.rs` — the streaming chunk vocabulary and a replay
+     provider derived from a log's own `assistant/message`/`assistant/attempt`
+     rows (the mode upstream's own CI runs its web lane in).
+   - `machines/agent_inbox.rs` — the durable fold over `agent/inbox/spliced`.
+   - `machines/provider.rs` — **the translation core** between configured
+     providers (openai chat/completions, openai responses, anthropic messages),
+     built on `llm-dialect`'s canonical model.
+   - `machines/agent.rs` — the wiring: what a `session/prompt` drives. Answers
+     `{accepted: true}` immediately and runs the turn detached, which is
+     upstream's own contract and also necessary, since the model call takes
+     seconds.
+   Verified end to end against a live gateway: a prompt over HTTP produces
+   `user/message → agent/inbox/spliced → turn/start → step/start →
+   assistant/message → step/end → turn/end {completed}`, with real token counts
+   and a stream record the replay provider can re-derive.
 3. **Tool seam + approval machine.** Unblocks the `$events/result` round-trip
    deferred at `events.rs:28` and the `approval/*` waterfall, currently
    subscribed by no machine.
 4. **Sandbox machines** (Landlock/seccomp native). Largely independent of 1–3;
    can proceed in parallel if there is a second worker.
+
+### Left undone in the LLM seam
+
+- **One turn at a time per host.** `AgentMachine` holds a single in-flight
+  operation, so a second `agent run` during a live turn is refused rather than
+  queued. Correct for the single-client host that exists today; wrong for two
+  clients prompting two sessions concurrently. The fix is per-session ops
+  (`BTreeMap<String, Op>`) — every op already carries its own session id and
+  rows, so only the *slot* is shared. Deliberately not a queue: delaying a prompt
+  behind a slow model call reads to a client as a hang.
+- **Tool calls are recorded but not executed.** A `tool-calls` finish already
+  opens another step, so the loop is shaped for tools, but nothing runs them —
+  that is step 3's seam, and a turn that calls a tool currently opens a step
+  whose request has no tool results to send.
+- **Reasoning is recorded but not re-sent.** A provider's reasoning is decoded
+  and packed into the log, but `canonical_request` reads only text and tool
+  items back out, so an Anthropic round trip loses unsigned thinking. Signed
+  thinking survives (it is re-emitted verbatim from the block), which is the case
+  that would 400.
+
+### What the LLM seam's live run taught
+
+Worth recording because it is the same lesson this document keeps relearning,
+now in a new place: **reading the code and the spec found nothing; running
+against a real provider found a defect immediately.**
+
+An Anthropic backend fronted by a chat-completions surface streams reasoning as
+a nested `thinking: {block_index, kind, text}` object — which is, not
+coincidentally, the exact shape `llm-dialect`'s own `AnthropicFramer` emits.
+Every recorded fixture in the corpus had been written from the assumption that
+reasoning arrives as a `reasoning_content` string (the vLLM/DeepSeek spelling),
+so the decoder dropped every reasoning token from such a provider. The visible
+text was unaffected, which is why nothing caught it: the defect was invisible in
+the transcript and wrong only in the log.
+
+Two more things the same run settled:
+
+- **`llm-dialect` supplies the client-facing direction, not the provider one.**
+  Its `*/req.rs` parse a client wire body into canonical and its `*/out.rs` and
+  `*/stream.rs` render canonical back out to a client. vocoderd needs the three
+  inverses, which `machines/provider.rs` supplies; where the crate has an
+  adjacent direction its framers serve as a round-trip oracle in the tests. One
+  case is a pure win: for a chat/completions provider, `deflate`'s output *is*
+  the wire body, so that dialect's request builder is a call into the crate.
+- **ureq's default error path discards the response body**, and a provider's
+  error detail lives in that body. `http_status_as_error(false)` is load-bearing
+  rather than stylistic; the wrong setting turns "rate limited, retry in 30s"
+  into an opaque failure.
 
 ### Machine-level stubs that M4 closes
 

@@ -351,6 +351,19 @@ async fn main() -> Result<()> {
             sessions_root.clone(),
         )),
     });
+    // The agent core's driver half. It is driven by `vocoder/agent/call`, which
+    // no wire descriptor carries: the client-facing entry point for a turn is
+    // `session/prompt`. This machine is what consumes the inbox row that call
+    // writes and turns it into `turn/*` rows, so it is mounted here and wired to
+    // the session namespace through the shared log rather than through the
+    // namespace registry.
+    initial_router.handle(RouteIn::Mount {
+        id: MachineId::new("agent"),
+        machine: Box::new(crate::machines::agent::AgentMachine::new(
+            sessions_root.clone(),
+            crate::machines::agent::routes_from_env(),
+        )),
+    });
     let mut registry = vocoder_typert::dispatch::NamespaceRegistry::new();
     registry_owner_register(&mut registry, "goals", "goals");
     registry_owner_register(&mut registry, "session", "session");
@@ -685,7 +698,114 @@ async fn api_rpc(
         },
     );
 
+    // `session/prompt` admits input and answers `{accepted: true}`; the turn it
+    // admits then runs on its own. That split is upstream's own contract — the
+    // prompt call is a durable acceptance, and the turn streams to whoever is
+    // following the session — and it is also a necessity here: a turn makes
+    // network calls that take seconds to minutes, and holding the HTTP response
+    // open that long would make the client's prompt look hung.
+    //
+    // Spawned rather than awaited, so the acknowledgement is returned now.
+    //
+    // The request's fields are read from `args.request`, not from `args`: every
+    // session endpoint takes its payload under the wire name `request` (the
+    // spec records this, and `session/list` spells it `_request`), which is why
+    // reading `args.sessionId` finds nothing and the turn is silently skipped.
+    if namespace == "session"
+        && method == "prompt"
+        && outs.iter().any(|o| {
+            matches!(
+                o,
+                RouteOut::Reply {
+                    reply: vocoder_cordis::RpcReply::Ok { .. },
+                    ..
+                }
+            )
+        })
+        && let Some(request) = args.get("request")
+        && let (Some(session_id), Some(request_id)) = (
+            request.get("sessionId").and_then(|v| v.as_str()),
+            request.get("requestId").and_then(|v| v.as_str()),
+        )
+    {
+        let state = state.clone();
+        let session_id = session_id.to_string();
+        let request_id = request_id.to_string();
+        let content = request
+            .get("content")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        tokio::task::spawn_blocking(move || {
+            crate::run_agent_turn(&state, &session_id, &request_id, content);
+        });
+    }
+
+    // `session/cancel` likewise. The agent machine latches the cancel and lets
+    // the in-flight model call settle the turn, because forcing the frame
+    // closers now would leave the reply with no open step to settle into.
+    if namespace == "session"
+        && method == "cancel"
+        && let Some(request) = args.get("request")
+        && let Some(session_id) = request.get("sessionId").and_then(|v| v.as_str())
+    {
+        let state = state.clone();
+        let session_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let _ = state.pump(
+                &MachineId::new("agent"),
+                MachineIn::Event {
+                    name: EventName::new(crate::rpc::call_event("agent")),
+                    payload: serde_json::json!({
+                        "method": "cancel",
+                        "args": { "sessionId": session_id },
+                    }),
+                },
+            );
+        });
+    }
+
     respond(outs, req.rpc_id)
+}
+
+/// Drive one agent turn to completion, detached from the prompt's response.
+///
+/// A blocking task rather than an async one: the effect loop is synchronous by
+/// design (see `driver`), and a provider call is a blocking `ureq` request, so
+/// running it on a runtime worker would stall the reactor for the length of the
+/// call instead of parking a dedicated thread.
+pub(crate) fn run_agent_turn(
+    state: &AppState,
+    session_id: &str,
+    request_id: &str,
+    content: serde_json::Value,
+) {
+    let payload = serde_json::json!({
+        "method": "run",
+        "args": {
+            "sessionId": session_id,
+            "requestId": request_id,
+            "content": content,
+        },
+    });
+    let outs = state.pump(
+        &MachineId::new("agent"),
+        MachineIn::Event {
+            name: EventName::new(crate::rpc::call_event("agent")),
+            payload,
+        },
+    );
+    // A detached turn has no caller to answer, so a failure is logged rather
+    // than dropped. The session log still records it: the turn is closed as an
+    // error row before this point.
+    for out in outs {
+        if let RouteOut::Reply {
+            reply: vocoder_cordis::RpcReply::Err { code, message, .. },
+            ..
+        } = out
+        {
+            tracing::error!("agent turn {request_id} failed: {code}: {message}");
+        }
+    }
 }
 
 /// A typed gateway failure, as the HTTP response.

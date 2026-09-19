@@ -9,6 +9,13 @@ description = "vocoderd — pure-Rust dsh backend: web host, Typert gateway, ses
 [dependencies]
 vocoder-cordis = { path = "../vocoder-cordis" }
 vocoder-typert = { path = "../vocoder-typert" }
+# The provider translation core (openai chat/completions, openai responses,
+# anthropic messages). Its default feature set is pure sans-I/O — the `axum`
+# feature (an SSE `Response` pump, i.e. a server) is deliberately off, because
+# vocoderd is a *client* of providers and never a gateway in front of one.
+# See `machines/provider.rs` for which directions it supplies and which this
+# crate supplies itself.
+llm-dialect = "0.1.3"
 parking_lot = "0.12"
 vocoder-spec-api = { path = "../vocoder-spec-api" }
 vocoder-session = { path = "../vocoder-session" }
@@ -22,6 +29,13 @@ tokio.workspace = true
 tower-http = { workspace = true, features = ["fs", "trace"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# The provider call is the one effect that leaves this process. `driver::realize`
+# is sync by doctrine — machines are sync, and the driver documents sync effects
+# as deliberate ("were these to become slow (network, subprocess), this would
+# move behind `spawn_blocking` without changing a single machine"). ureq is the
+# sync client that fits that shape: no runtime, so it composes with the existing
+# blocking effect loop instead of forcing a second async path through it.
+ureq = "3"
 zstd.workspace = true
 
 [dev-dependencies]
