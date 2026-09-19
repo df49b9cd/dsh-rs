@@ -62,12 +62,27 @@ enum RealizeRequest {
 }
 ```
 
-`vocoderd`'s driver (`src/driver.rs`) is the only code that performs I/O. The
-match over `RealizeRequest` is exhaustive with no catch-all, which is what makes
-*"every output needs a driver implementation"* a compile error rather than a
-convention. (An earlier `Raw(Payload)` escape hatch inverted this — machines
-minted `{"kind": "rpc.result"}` and the driver re-discovered the shape by string
-matching. It is gone.)
+`vocoderd`'s driver (`src/driver.rs`) is the only code that performs I/O *on a
+machine's behalf*. The match over `RealizeRequest` is exhaustive with no
+catch-all, which is what makes *"every output needs a driver implementation"* a
+compile error rather than a convention. (An earlier `Raw(Payload)` escape hatch
+inverted this — machines minted `{"kind": "rpc.result"}` and the driver
+re-discovered the shape by string matching. It is gone.)
+
+Two documented exceptions sit *beside* the machines rather than inside them,
+and are named here so the rule above stays checkable rather than aspirational:
+
+- **`src/registry.rs`** — the cross-machine workspace registry (`workspaces.json`),
+  which two namespaces must agree on and which the router cannot arbitrate
+  (dispatch results are scheduled, not synchronous). It does its own reads and
+  writes because it *is* the shared store, not a machine: nothing about it is
+  replayable or unit-testable in isolation, and both machines that hold it
+  treat it as an injected service. Making it effect-driven would require a
+  machine to own it, which is the coordination problem it exists to solve.
+- **`src/main.rs`'s boot reads** — the settings document, the credentials
+  document and `.env` layers, the home directory, and the web dist. These
+  happen once at startup and are *handed to* machines as constructor arguments,
+  so a machine never reads the process environment or a file at mount.
 
 **Suspension.** A machine that awaits an effect returns the request and is
 re-entered with the answer under the same `EffectId`, which the *machine*
