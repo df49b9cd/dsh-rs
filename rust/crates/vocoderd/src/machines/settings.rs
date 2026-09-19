@@ -27,16 +27,62 @@ struct CatalogEntry {
     secrets: &'static [&'static str],
 }
 
-/// The built-in namespaces vocoderd knows. The wire vocabulary is dsh's;
-/// entries here exist so `describe` returns them even before a write and
-/// so `secrets` redaction has a declared home. LLM provider credentials are
-/// the only secret-bearing surface today (M4 wires the live catalog).
+/// The namespaces this host registers, mirroring the control host's set.
+///
+/// Two things depend on this being right, and both were wrong before:
+///
+/// - **A write to an unregistered namespace is refused** (`settings/rejected`),
+///   not silently created. The control host requires registration; accepting an
+///   arbitrary name would let a client invent a namespace that no plugin reads,
+///   and would report success for a document nothing consumes.
+/// - **`describe` reports exactly this set**, so a settings page renders the
+///   rows the host actually has.
+///
+/// The names are the ones the control host reports, captured from it rather
+/// than guessed: a plugin's namespace is constructed at composition time, so it
+/// is not statically enumerable from `dsh/`. `web-search-deepseek` carries the
+/// only declared secret path today.
 fn catalog() -> &'static [CatalogEntry] {
     &[
         CatalogEntry {
-            ns: "llm",
-            schema: "llm",
-            secrets: &["providers"],
+            ns: "agent-default-model",
+            schema: "agent-default-model",
+            secrets: &[],
+        },
+        CatalogEntry {
+            ns: "agent-loop",
+            schema: "agent-loop",
+            secrets: &[],
+        },
+        CatalogEntry {
+            ns: "agent-presets",
+            schema: "agent-presets",
+            secrets: &[],
+        },
+        CatalogEntry {
+            ns: "llm-deepseek",
+            schema: "llm-deepseek",
+            secrets: &[],
+        },
+        CatalogEntry {
+            ns: "llm-pi-ai",
+            schema: "llm-pi-ai",
+            secrets: &[],
+        },
+        CatalogEntry {
+            ns: "locale",
+            schema: "locale",
+            secrets: &[],
+        },
+        CatalogEntry {
+            ns: "permission",
+            schema: "permission",
+            secrets: &[],
+        },
+        CatalogEntry {
+            ns: "shell",
+            schema: "shell",
+            secrets: &[],
         },
         CatalogEntry {
             ns: "subagent-model-selection",
@@ -44,16 +90,36 @@ fn catalog() -> &'static [CatalogEntry] {
             secrets: &[],
         },
         CatalogEntry {
-            ns: "agent-default-model",
-            schema: "agent-default-model",
+            ns: "ui-chat",
+            schema: "ui-chat",
             secrets: &[],
         },
         CatalogEntry {
-            ns: "ui",
-            schema: "ui",
+            ns: "ui-conversation",
+            schema: "ui-conversation",
             secrets: &[],
         },
+        CatalogEntry {
+            ns: "ui-onboarding",
+            schema: "ui-onboarding",
+            secrets: &[],
+        },
+        CatalogEntry {
+            ns: "ui-theme",
+            schema: "ui-theme",
+            secrets: &[],
+        },
+        CatalogEntry {
+            ns: "web-search-deepseek",
+            schema: "web-search-deepseek",
+            secrets: &["apiKey"],
+        },
     ]
+}
+
+/// Whether `ns` is a registered namespace.
+fn is_registered(ns: &str) -> bool {
+    catalog().iter().any(|e| e.ns == ns)
 }
 
 /// Does `path` (dot-separated segments) match a declared secret selector
@@ -254,6 +320,16 @@ impl SettingsMachine {
                 serde_json::json!({ "issues": ["ns must be a non-empty string"] }),
             );
         }
+        // A namespace no plugin registered is refused rather than created: the
+        // control host answers `settings/rejected` here, and accepting the
+        // write would report success for a document nothing reads.
+        if !is_registered(ns) {
+            return rpc::err_details(
+                "settings/rejected",
+                format!("settings namespace \"{ns}\" is not registered"),
+                serde_json::json!({ "ns": ns }),
+            );
+        }
         let current = self.document.revisions.get(ns).copied().unwrap_or(0);
         if let Some(want) = expected
             && want != current
@@ -435,7 +511,7 @@ mod tests {
             &mut m,
             "update",
             serde_json::json!({
-                "ns": "ui", "patch": {"theme": {"mode": "dark"}}
+                "ns": "ui-theme", "patch": {"theme": {"mode": "dark"}}
             }),
         );
         assert_eq!(v["value"]["revision"], 1);
@@ -448,22 +524,25 @@ mod tests {
             .iter()
             .filter_map(|n| n["ns"].as_str())
             .collect();
-        // catalog namespaces are visible pre-write; "ui" appears after write
+        // Every registered namespace is visible pre-write, not only the ones
+        // a write happened to touch.
         for known in [
-            "llm",
-            "ui",
             "agent-default-model",
             "subagent-model-selection",
+            "ui-theme",
+            "llm-deepseek",
+            "web-search-deepseek",
         ] {
             assert!(ns_names.contains(&known), "missing catalog ns {known}");
         }
+        assert_eq!(ns_names.len(), catalog().len(), "{ns_names:?}");
 
         // Stale expected revision conflicts.
         let c = call(
             &mut m,
             "update",
             serde_json::json!({
-                "ns": "ui", "patch": {"theme": {"mode": "light"}}, "expectedRevision": 9
+                "ns": "ui-theme", "patch": {"theme": {"mode": "light"}}, "expectedRevision": 9
             }),
         );
         assert_eq!(c["error"]["code"], "settings/conflict");
@@ -474,7 +553,7 @@ mod tests {
             &mut m,
             "update",
             serde_json::json!({
-                "ns": "ui", "patch": {"theme": {"mode": "light"}}, "expectedRevision": 1
+                "ns": "ui-theme", "patch": {"theme": {"mode": "light"}}, "expectedRevision": 1
             }),
         );
         assert_eq!(v2["value"]["revision"], 2);
@@ -483,7 +562,7 @@ mod tests {
         let r = call(
             &mut m,
             "replace",
-            serde_json::json!({ "ns": "ui", "section": {} }),
+            serde_json::json!({ "ns": "ui-theme", "section": {} }),
         );
         assert_eq!(r["value"]["value"], serde_json::json!({}));
 
@@ -492,7 +571,7 @@ mod tests {
             &mut m,
             "mutate",
             serde_json::json!({
-                "ns": "ui",
+                "ns": "ui-theme",
                 "ops": [
                     {"op": "set", "path": ["a", "b"], "value": 3},
                     {"op": "unset", "path": ["a", "b"]},
@@ -510,28 +589,48 @@ mod tests {
             &mut m,
             "update",
             serde_json::json!({
-                "ns": "llm",
-                "patch": {"providers": {"anthropic": {"apiKey": "sk-secret", "models": []}}},
+                "ns": "web-search-deepseek",
+                "patch": {"apiKey": "sk-secret"},
             }),
         );
         assert!(v["ok"].as_bool().unwrap(), "{v}");
         // Value ships with the key redacted…
-        assert_eq!(
-            v["value"]["value"]["providers"]["anthropic"]["apiKey"],
-            serde_json::Value::Null
-        );
-        // …and the secrets slot reports set-ness by path (dotted selector).
+        assert_eq!(v["value"]["value"]["apiKey"], serde_json::Value::Null);
+        // …and the secrets slot reports set-ness by path.
         let secrets = v["value"]["secrets"].as_array().unwrap();
         assert!(
             secrets
                 .iter()
-                .any(|s| s["path"][0] == "providers" && s["set"] == true)
+                .any(|s| s["path"][0] == "apiKey" && s["set"] == true),
+            "{v}"
         );
 
         // User projection also redacted.
-        assert_eq!(
-            v["value"]["user"]["providers"]["anthropic"]["apiKey"],
-            serde_json::Value::Null
+        assert_eq!(v["value"]["user"]["apiKey"], serde_json::Value::Null);
+    }
+
+    /// A write to a namespace no plugin registered is refused rather than
+    /// created: the control host answers `settings/rejected`, and accepting it
+    /// would report success for a document nothing reads.
+    #[test]
+    fn unregistered_namespace_is_rejected() {
+        let home = tempfile::tempdir().unwrap();
+        let mut m = SettingsMachine::new(home.path(), None);
+        let v = call(
+            &mut m,
+            "update",
+            serde_json::json!({ "ns": "not-a-real-ns", "patch": {"a": 1} }),
         );
+        assert_eq!(v["error"]["code"], "settings/rejected", "{v}");
+        assert_eq!(v["error"]["details"]["ns"], "not-a-real-ns");
+        // And nothing was recorded: a later describe does not list it.
+        let d = call(&mut m, "describe", serde_json::json!({}));
+        let names: Vec<&str> = d["value"]["namespaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|n| n["ns"].as_str())
+            .collect();
+        assert!(!names.contains(&"not-a-real-ns"), "{names:?}");
     }
 }

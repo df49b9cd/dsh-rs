@@ -68,13 +68,29 @@ fn load_endpoints() -> Vec<Endpoint> {
         .collect()
 }
 
+/// Signed dsh cookie ("k=v") minted by harness/runners/run.sh when running
+/// the control host; ignored by vocoderd.
+///
+/// Every request must carry it: the control host gates the whole `/api`
+/// surface behind browser auth, so a cell that omits it gets an HTML redirect
+/// rather than a `server-response` envelope. (This suite grew from vocoderd,
+/// which is loopback-trusted, so the omission was invisible until the control
+/// host was actually run.)
+fn auth_cookie() -> Option<String> {
+    let path = std::env::var("CONFORMANCE_COOKIE_FILE").ok()?;
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
 async fn post_raw(path: &str, body: &serde_json::Value) -> (u16, serde_json::Value) {
-    let res = reqwest::Client::new()
+    let mut req = reqwest::Client::new()
         .post(format!("{}/api/{}", base_url(), path))
-        .json(body)
-        .send()
-        .await
-        .unwrap();
+        .json(body);
+    if let Some(c) = auth_cookie() {
+        req = req.header("cookie", c);
+    }
+    let res = req.send().await.unwrap();
     let status = res.status().as_u16();
     let v: serde_json::Value = res
         .json()
@@ -106,16 +122,47 @@ async fn malformed_envelope_yields_bad_request() {
     assert_eq!(v["result"]["error"]["code"], "gateway/bad-request", "{v}");
 }
 
+/// An unknown method is refused cleanly — and the two hosts refuse it in
+/// *different shapes*, which this cell records rather than papers over.
+///
+/// - **control (dsh)** answers HTTP 404 with a `text/plain` body: its router
+///   has no `/api/<ns>/<method>` route for an unregistered method.
+/// - **candidate (vocoderd)** answers HTTP 200 with a typed envelope
+///   (`gateway/bad-request`, or `gateway/internal` for an unknown namespace):
+///   it registers one catch-all `/api/{*endpoint}` route, so every path
+///   reaches the gateway and is judged there.
+///
+/// The candidate's shape is strictly more informative — a client can branch on
+/// a code instead of on a status line — but it is a real divergence, so the
+/// cell asserts the invariant both satisfy: never a 5xx, never an HTML error
+/// page, and never a silent success.
 #[tokio::test]
-async fn unknown_method_errors_typed() {
-    let v = call("session/noSuchMethod", json!({})).await;
-    assert_eq!(v["type"], "server-response", "{v}");
-    assert_eq!(v["result"]["ok"], false, "{v}");
-    let code = v["result"]["error"]["code"].as_str().unwrap_or_default();
-    assert!(
-        code.starts_with("gateway/") || code.starts_with("session/"),
-        "unexpected code {code}: {v}"
-    );
+async fn unknown_method_is_refused_cleanly() {
+    let (status, v) = post_raw(
+        "session/noSuchMethod",
+        &json!({
+            "type": "client-request",
+            "rpcId": format!("cell-{}", uuid()),
+            "method": "session/noSuchMethod",
+            "payload": { "args": {} },
+        }),
+    )
+    .await;
+
+    assert!(status < 500, "must not be a server fault (got {status}): {v}");
+    if v["type"] == "server-response" {
+        // The candidate: a typed failure with a code.
+        assert_eq!(v["result"]["ok"], false, "{v}");
+        let code = v["result"]["error"]["code"].as_str().unwrap_or_default();
+        assert!(
+            code.starts_with("gateway/") || code.starts_with("session/"),
+            "unexpected code {code}: {v}"
+        );
+    } else {
+        // The control: a plain 404 whose body is not the JSON envelope.
+        assert_eq!(status, 404, "control answers a bare 404: {v}");
+        assert_eq!(v["__nonJson"], true, "{v}");
+    }
 }
 
 /// The generated per-endpoint matrix: for every unary endpoint in a live
@@ -163,12 +210,17 @@ async fn every_unary_endpoint_answers_typed_envelope() {
 /// Error-detail shape: known conflict cases carry structured details.
 #[tokio::test]
 async fn error_detail_shape_session_not_found() {
-    // prompt an unknown session → session/not-found + details.sessionId
+    // Prompt an unknown session → session/not-found + details.sessionId.
+    // The payload must satisfy the spec's prompt schema (required: requestId,
+    // sessionId, mode, content; `mode` is `"queue" | "steer"`): a payload the
+    // gateway rejects is `gateway/input-invalid` before the session is
+    // consulted, which is a different cell than this one.
     let v = call(
         "session/prompt",
         json!({ "request": {
             "sessionId": format!("missing-{}", uuid()),
             "requestId": "r1",
+            "mode": "queue",
             "content": [{ "type": "text", "text": "hi" }],
         } }),
     )
@@ -183,9 +235,11 @@ async fn error_detail_shape_session_not_found() {
 
 #[tokio::test]
 async fn settings_conflict_details() {
-    // Seed a namespace so revision 1 exists, then write with a stale
-    // expectedRevision → settings/conflict with {ns, expected, actual}.
-    let ns = format!("cell-{}", uuid());
+    // Seed a registered namespace, then write with a stale expectedRevision →
+    // settings/conflict with {ns, expected, actual}. The namespace must be one
+    // the host registers: the control refuses an invented one with
+    // `settings/rejected` before any revision is consulted.
+    let ns = "locale";
     let v1 = call(
         "settings/update",
         json!({ "ns": ns, "patch": { "k": 1 } }),

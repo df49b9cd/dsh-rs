@@ -66,28 +66,51 @@ async fn goals_complete_without_goal_errors_cell() {
 
 // ---------------------------------------------------------------- settings
 
+// Every settings cell names a namespace the host actually *registers*: the
+// control host refuses an unregistered one with `settings/rejected`, so an
+// invented name would only ever exercise the refusal path. Each cell uses its
+// own namespace because revisions are per-namespace, and the runner starts
+// from a fresh home so the first write in a run is revision 1.
+
 #[tokio::test]
 async fn settings_roundtrip_and_conflict_cell() {
-    let ns = format!("cell-rt-{}", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+    let ns = "ui-theme";
     let d0 = rpc("settings/describe", json!({})).await;
     assert_eq!(d0["result"]["ok"], true);
-    assert!(value(&d0)["namespaces"].is_array());
+    let described: Vec<&str> = value(&d0)["namespaces"]
+        .as_array()
+        .expect("namespaces array")
+        .iter()
+        .filter_map(|n| n["ns"].as_str())
+        .collect();
+    assert!(described.contains(&ns), "catalog must list {ns}: {described:?}");
 
     let u = rpc("settings/update", json!({"ns": ns, "patch": {"a": 1}})).await;
-    assert_eq!(value(&u)["revision"], 1);
+    assert_eq!(value(&u)["revision"], 1, "{u}");
     let conflict = rpc("settings/update", json!({"ns": ns, "patch": {"a": 2}, "expectedRevision": 99})).await;
     assert_eq!(error_code(&conflict), "settings/conflict");
     assert_eq!(conflict["result"]["error"]["details"]["actual"], 1);
     let ok = rpc("settings/update", json!({"ns": ns, "patch": {"a": 2}, "expectedRevision": 1})).await;
-    assert_eq!(value(&ok)["revision"], 2);
+    assert_eq!(value(&ok)["revision"], 2, "{ok}");
+}
+
+/// An unregistered namespace is refused, not created — the control host's
+/// behavior, and the reason the cells above cannot invent names.
+#[tokio::test]
+async fn settings_unregistered_namespace_is_rejected_cell() {
+    let r = rpc(
+        "settings/update",
+        json!({"ns": "definitely-not-a-namespace", "patch": {"a": 1}}),
+    )
+    .await;
+    assert_eq!(error_code(&r), "settings/rejected", "{r}");
 }
 
 #[tokio::test]
 async fn settings_mutate_ops_cell() {
-    let ns = format!("cell-mut-{}", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
-    let _ = rpc("settings/update", json!({"ns": ns, "patch": {"x": {"y": 0}}})).await;
+    let ns = "ui-chat";
+    let seed = rpc("settings/update", json!({"ns": ns, "patch": {"x": {"y": 0}}})).await;
+    assert_eq!(seed["result"]["ok"], true, "{seed}");
     let m = rpc("settings/mutate", json!({
         "ns": ns,
         "ops": [
@@ -95,7 +118,7 @@ async fn settings_mutate_ops_cell() {
             {"op": "unset", "path": ["x", "y"]},
         ],
     })).await;
-    assert_eq!(value(&m)["value"]["x"], json!({}));
+    assert_eq!(value(&m)["value"]["x"], json!({}), "{m}");
 }
 
 // ---------------------------------------------------------------- workspace
