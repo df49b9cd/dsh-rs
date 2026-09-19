@@ -201,14 +201,45 @@ problems than a credential.
     skipped a seq. Verified by `conformance/wire/tests/live_stream.rs` against a
     live gateway — 151 frames, deltas summing to the model's exact output, all
     six rows announced gap-free.
-- [ ] tool seam + approval machine (step 3) — **the approval half has landed**:
+- [ ] tool seam + approval machine (step 3) — **both halves have landed.**
   `machines/approval.rs` answers the `approval/request` waterfall (mounted and
-  reachable through the real router, verified) and writes the
-  `approval/asked`/`approval/decided` audit pair, failing **closed** with
-  `unavailable` since this host composes no interactive answerer. What remains
-  is the *emitter*: upstream raises these from the tool executor, so until that
-  exists nothing dispatches the event and `session/prompt` answers a tool call
-  by opening a step with no results to send.
+  reachable through the real router, verified) and **mints the audit id**,
+  failing **closed** with `unavailable`; `machines/tool_exec.rs` is the emitter,
+  and it writes the pair from the verdict because it owns the turn's row order.
+  A tool-calling `session/prompt` now runs its calls and continues: the whole
+  sequence `assistant/message → tool/call → tool/result → step/end →
+  step/start → assistant/message → step/end` is asserted with a real file's
+  content in the upstream envelope.
+  - **A plain mutation does not ask.** The corpus is the authority:
+    `fs-write`, `fs-edit` and `session-sandbox-root` each call a mutator under an
+    `ask` policy and record **zero** `approval/asked` rows. Upstream reaches the
+    seam from `tools/pre-execute`, whose only base-profile registrants are the two
+    escalation paths, and those fire only on `sandbox_permissions`. So the ask is
+    raised by a *request to widen*, not by mutating — a gate that asked on every
+    write would fill the log with questions no tool asked.
+  - **`read`/`write`/`edit` only, and the set is closed on purpose.** Upstream
+    composes ~30 tools; offering a name this host cannot execute teaches the
+    model that the tool exists and is broken. The 28 absent ones (`bash`,
+    `subagent`, `run_code`, …) are the honest boundary.
+  - **The rendered text is a contract, not a formatting choice.** The envelope,
+    `1: line` numbering, EOF footer, truncation suffix, `Created`/`Updated`, and
+    the two edit sentences are `tool-fs`'s verbatim, because the recorded corpus
+    compares them byte for byte.
+  - **What is reduced, and it is not nothing.** The scheduler is replaced by
+    strict serial order (every tool here is `isConcurrencySafe`, and 215 of 221
+    corpus steps make one call); `edit` has **no version guard**, so two
+    concurrent editors could lose an update; and the fence is containment over a
+    model-controlled path, not a kernel boundary — which is exactly why no
+    `bash` is offered. Step 4's Landlock/seccomp machines are what would change
+    the last one.
+  - **Unit and integration cells pass; the live probe is written and
+    unrun.** `conformance/wire/tests/live_tools.rs` drives a real model into a
+    real file read and asserts the follow-up request was accepted — but it needs
+    a provider key, which was not available for this run, so the claim "a real
+    provider accepts this `tools` array and this tool-result item" rests on the
+    dialect tests in `provider.rs` (which check the rendered body per dialect)
+    rather than on a live acceptance. Stated here because it is the one part of
+    this step that reading and fixtures cannot confirm.
 - [ ] sandbox machines (Landlock/seccomp native) (step 4)
 
 ## M5 — Plugin interop
@@ -259,6 +290,20 @@ than it is:
 - **Composition traces are hand-authored**, not recorded from JS (see M5).
 - **`session-replay` has no suite directory**; its tests live in
   `rust/crates/vocoder-session/tests/interop.rs`.
+
+- **The tool seam's live probe is committed but unrun** (see M4 step 3). It needs
+  a provider key, which was unavailable for this run; the dialect rendering is
+  covered by `provider.rs`'s per-dialect tests, but "a real provider accepts this
+  `tools` array and this `tool-result` item" is not something fixtures can
+  confirm. `live_stream.rs` has the same property and for the same reason.
+- **`edit` has no version guard** (see M4 step 3). Upstream's
+  `fs-observation-policy` requires a prior read and pins a version CAS basis;
+  this host keeps no per-session observation state, so a read-modify-write race
+  can lose an update. Sound today only because the executor is serial and the
+  model is the sole writer.
+- **The confinement fence is containment, not a kernel boundary** (see M4 step
+  3). That is upstream's own framing for `fs-sandbox` too, and it is the reason
+  `bash` is not in the tool catalog: no untrusted *code* runs until step 4.
 
 ## Spec parity gate (CI)
 
