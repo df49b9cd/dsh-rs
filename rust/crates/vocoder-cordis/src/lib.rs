@@ -256,6 +256,21 @@ pub enum MachineIn {
     StreamClose { stream_id: String },
     /// The driver finished an effect this machine requested under `id`.
     EffectResult { id: EffectId, result: EffectResult },
+    /// A piece of a streaming effect's response arrived, before the effect
+    /// itself completes.
+    ///
+    /// Correlation is by `id` for the same reason [`Self::EffectResult`] uses
+    /// it: a machine may have more than one effect outstanding over its life,
+    /// and a chunk delivered to the wrong wait would be silently wrong. A chunk
+    /// is not an answer — the awaited [`Self::EffectResult`] still arrives — so
+    /// a machine that ignores chunks loses display latency and nothing else.
+    ///
+    /// `bytes` is raw: response bodies are byte streams and a multi-byte
+    /// character can straddle two chunks, so decoding each chunk on its own
+    /// would corrupt the text a UTF-8-boundary-splitting read produced. The
+    /// consumer accumulates and decodes where it knows the boundaries (the SSE
+    /// decoder works on bytes for exactly this reason).
+    EffectChunk { id: EffectId, bytes: Vec<u8> },
 }
 
 /// Outputs a machine emits to the router.
@@ -394,6 +409,35 @@ pub enum RealizeRequest {
     /// the read boundaries fell), at the cost of not surfacing the first token
     /// before the last arrives.
     FetchJson {
+        url: String,
+        headers: Vec<(String, String)>,
+        body: String,
+    },
+    /// POST a JSON body to an LLM provider and read the response **as it
+    /// arrives**, delivering each chunk of response bytes back to the machine
+    /// as a [`MachineIn::EffectChunk`] before the effect itself completes.
+    ///
+    /// This is [`Self::FetchJson`] with the buffering taken out, and the reason
+    /// it is a separate effect rather than a flag is what the difference buys:
+    /// a client must see the model's first token when the model emits it, not
+    /// when the last one lands. A buffered call cannot do that — by the time the
+    /// machine has any bytes, the whole answer already exists — so the two want
+    /// different signatures, not different arguments.
+    ///
+    /// The chunks are *transport* chunks, not SSE frames: their boundaries
+    /// follow the socket and carry no protocol meaning. The machine's decoder is
+    /// incremental and does not care where the reads fell, which is what lets a
+    /// chunk split a frame in half. A machine that treats a chunk as a frame is
+    /// broken, and [`Self::FetchJson`]'s doc already says the same thing from
+    /// the other side.
+    ///
+    /// The effect still completes with an [`EffectResult::HttpResponse`] whose
+    /// body is whatever was read, so a machine may either consume the chunks
+    /// incrementally and ignore the final body, or ignore the chunks entirely
+    /// and treat this as a buffered call. Both are legal; the live agent does
+    /// both (it forwards chunks for display and keeps the body for the durable
+    /// stream record).
+    FetchStream {
         url: String,
         headers: Vec<(String, String)>,
         body: String,

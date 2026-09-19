@@ -11,6 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use serde_json::{Value, json};
 use vocoder_cordis::{MachineIn, MachineOut, PluginMachine};
 
 use crate::machines::readcache::{FsCache, Pending};
@@ -301,6 +302,23 @@ pub struct SessionMachine {
     workspaces: std::sync::Arc<crate::registry::WorkspaceRegistryStore>,
     /// Live `session/follow` streams: streamId → the followed session id.
     follow_streams: BTreeMap<String, String>,
+    /// Follow streams that asked for assistant-stream frames, by stream id.
+    ///
+    /// Separate from [`Self::follow_streams`] because the opt-in is per stream,
+    /// not per session: `session/follow` takes `assistantStream?: true`, and a
+    /// follower that did not ask must not receive the frames. Tracking it as a
+    /// set rather than a flag on the session is what keeps a second follower's
+    /// choice from changing the first one's stream.
+    assistant_followers: BTreeMap<String, String>,
+    /// Per-session assistant-stream state, as a reconnect baseline.
+    ///
+    /// This is the process-local presentation state the control keeps in
+    /// `SessionAssistantStreamAccumulator`: a follower that joins mid-turn gets
+    /// the attempt's identity and its text so far, then live frames. Without it
+    /// a reconnect would show an empty partial until the next chunk, and the
+    /// client's continuity check — which expects a `start` before any `chunk` —
+    /// would drop everything it received.
+    streams: BTreeMap<String, super::assistant_stream::AssistantStream>,
     /// Live `session/control` streams (stream ids only; baseline already sent).
     control_streams: Vec<String>,
     /// Driver-supplied view of the sessions tree (see [`FsCache`]).
@@ -321,6 +339,8 @@ impl SessionMachine {
             state: BTreeMap::new(),
             workspaces,
             follow_streams: BTreeMap::new(),
+            assistant_followers: BTreeMap::new(),
+            streams: BTreeMap::new(),
             control_streams: Vec::new(),
             cache: FsCache::default(),
             pending: None,
@@ -490,6 +510,26 @@ impl PluginMachine for SessionMachine {
         }
 
         let MachineIn::Event { name, payload } = &ev else {
+            // Activation. Subscribing to the agent's presentation frames is the
+            // one thing this machine needs to be told about beyond its own
+            // namespace: they are emitted by the agent namespace and delivered
+            // here by event name, so without this subscription a turn would
+            // stream to nobody.
+            if matches!(ev, MachineIn::ServicesReady { .. }) {
+                return vec![
+                    MachineOut::Subscribe {
+                        name: vocoder_cordis::EventName::new("agent/assistant-stream"),
+                    },
+                    // Durable rows the agent appends itself. The agent owns the
+                    // log for a turn it drives, so the follow stream's durable
+                    // half has to hear about those rows from the machine that
+                    // wrote them; without this subscription a follower sees the
+                    // live partial and then no settled event at all.
+                    MachineOut::Subscribe {
+                        name: vocoder_cordis::EventName::new("session/event"),
+                    },
+                ];
+            }
             return vec![];
         };
         if name.0 == rpc::stream_open_event("session") {
@@ -520,8 +560,42 @@ impl PluginMachine for SessionMachine {
                 .unwrap_or_default()
                 .to_string();
             self.follow_streams.remove(&stream_id);
+            self.assistant_followers.remove(&stream_id);
             self.control_streams.retain(|s| s != &stream_id);
             return vec![];
+        }
+        // The agent's live presentation frames. Folded into this session's
+        // accumulator and forwarded to every follower that opted in — this is
+        // the whole of `session/follow`'s assistant-stream half, and it lives
+        // here rather than in the agent because only the session machine knows
+        // which streams are open and which asked for frames.
+        if name.0 == "agent/assistant-stream" {
+            let session_id = payload
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let Some(frame) = payload.get("frame") else {
+                return vec![];
+            };
+            return self.accept_assistant_frame(&session_id, frame);
+        }
+        // A durable row another machine appended to a session's log.
+        //
+        // Only the agent emits this — `session`'s own writers broadcast directly
+        // (they already hold the frame) — and it is what keeps a follower's
+        // event stream gap-free when a turn is driven by the agent rather than
+        // by `session/prompt`.
+        if name.0 == "session/event" {
+            let session_id = payload
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let Some(event) = payload.get("event") else {
+                return vec![];
+            };
+            return self.emit_follow_event(&session_id, event);
         }
         if name.0 != rpc::call_event("session") {
             return vec![];
@@ -994,6 +1068,34 @@ impl SessionMachine {
         }))
     }
 
+    /// Fold one live presentation frame and forward it to opted-in followers.
+    ///
+    /// Both halves run even when nobody is following: the accumulator is the
+    /// reconnect baseline, and a client that connects *after* the turn started
+    /// needs the text so far — dropping the fold when no follower is attached
+    /// would leave exactly that client with an empty partial.
+    ///
+    /// A frame the accumulator rejects is not forwarded. The accumulator
+    /// rejects out-of-order or unattributable chunks, and passing one on would
+    /// hand a follower a frame the baseline it also received cannot account for
+    /// — the client would see a partial that disagrees with its own snapshot.
+    fn accept_assistant_frame(&mut self, session_id: &str, frame: &Value) -> Vec<MachineOut> {
+        let slot = self.streams.entry(session_id.to_string()).or_default();
+        if !slot.accept(frame) {
+            return vec![];
+        }
+        let mut outs = Vec::new();
+        for (stream_id, followed) in &self.assistant_followers {
+            if followed == session_id {
+                outs.push(rpc::stream_item(
+                    stream_id,
+                    json!({ "type": "assistant-stream", "frame": frame }),
+                ));
+            }
+        }
+        outs
+    }
+
     /// One durable event broadcast to every live follow stream of `session_id`.
     fn emit_follow_event(&self, session_id: &str, event: &serde_json::Value) -> Vec<MachineOut> {
         let mut outs = Vec::new();
@@ -1032,7 +1134,22 @@ impl SessionMachine {
             }
         };
         match self.follow_snapshot_value(&session_id) {
-            Ok(snapshot) => {
+            Ok(mut snapshot) => {
+                // The opt-in is per stream and carried on the request; a
+                // follower that did not ask for live frames gets a snapshot
+                // with no `assistantStream` key at all, which is what the spec's
+                // closed shape requires — an empty baseline would claim the
+                // client asked and the answer was "nothing".
+                if body.get("assistantStream").and_then(Value::as_bool) == Some(true) {
+                    let baseline = self
+                        .streams
+                        .get(&session_id)
+                        .map(|s| s.baseline())
+                        .unwrap_or_else(|| json!({ "revision": 0 }));
+                    snapshot["assistantStream"] = baseline;
+                    self.assistant_followers
+                        .insert(stream_id.clone(), session_id.clone());
+                }
                 self.follow_streams.insert(stream_id.clone(), session_id);
                 Ok(vec![rpc::stream_item(&stream_id, snapshot)])
             }
@@ -1718,5 +1835,183 @@ mod tests {
         let mut vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let steps = crate::composition::replay_trace(&mut m, &text, &mut vars);
         assert!(steps >= 5, "trace too thin: {steps} steps");
+    }
+
+    /// An opted-in follower receives live frames, and a follower that did not
+    /// opt in receives none.
+    ///
+    /// Both halves are asserted in one test because the failure they guard
+    /// against is symmetric: sending frames to everyone makes a client that
+    /// never asked for them receive frames it has no baseline for, and sending
+    /// to nobody makes `assistantStream: true` a no-op. A test of either alone
+    /// passes with the other broken.
+    #[test]
+    fn only_opted_in_followers_receive_assistant_frames() {
+        let (dir, mut m, _registry) = machine();
+        let sid = create_session(&mut m, dir.path());
+
+        // Two followers on the same session: one opted in, one did not.
+        let (opted, plain) = (
+            open_follow(&mut m, &sid, true),
+            open_follow(&mut m, &sid, false),
+        );
+        assert!(opted.is_some() && plain.is_some(), "both streams opened");
+
+        let frame = serde_json::json!({
+            "type": "start", "attemptId": "a1", "revision": 1,
+            "startedAfterSeq": 3, "turn": 1, "step": 1,
+        });
+        let outs = PluginMachine::handle(
+            &mut m,
+            MachineIn::Event {
+                name: EventName::new("agent/assistant-stream"),
+                payload: serde_json::json!({ "sessionId": sid, "frame": frame }),
+            },
+        );
+        let targets: Vec<&str> = outs
+            .iter()
+            .filter_map(|o| match o {
+                MachineOut::Stream(vocoder_cordis::StreamFrame::Item { stream_id, .. }) => {
+                    Some(stream_id.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            targets,
+            vec![opted.as_deref().unwrap()],
+            "exactly the opted-in stream receives the frame"
+        );
+    }
+
+    /// A follower that joins mid-turn gets the attempt's text so far in its
+    /// opening snapshot, not an empty partial.
+    ///
+    /// This is what makes the baseline worth having: without it a client that
+    /// reconnected during a long answer would render nothing until the next
+    /// delta, and if the answer had already finished streaming it would render
+    /// nothing at all.
+    #[test]
+    fn a_follower_joining_mid_turn_receives_the_baseline() {
+        let (dir, mut m, _registry) = machine();
+        let sid = create_session(&mut m, dir.path());
+
+        // A turn is already streaming.
+        for frame in [
+            serde_json::json!({
+                "type": "start", "attemptId": "a1", "revision": 1,
+                "startedAfterSeq": 3, "turn": 1, "step": 1,
+            }),
+            serde_json::json!({
+                "type": "chunk", "attemptId": "a1", "revision": 2, "index": 0, "time": 0,
+                "chunk": { "type": "text-delta", "index": 0, "text": "half an ans" },
+            }),
+        ] {
+            PluginMachine::handle(
+                &mut m,
+                MachineIn::Event {
+                    name: EventName::new("agent/assistant-stream"),
+                    payload: serde_json::json!({ "sessionId": sid, "frame": frame }),
+                },
+            );
+        }
+
+        let snapshot = open_follow_snapshot(&mut m, &sid, true).expect("snapshot");
+        let baseline = &snapshot["assistantStream"];
+        assert_eq!(baseline["activeAttempt"]["attemptId"], "a1");
+        assert_eq!(baseline["activeAttempt"]["nextIndex"], 1);
+        let texts = &baseline["activeAttempt"]["stream"][0]["texts"];
+        assert_eq!(
+            texts,
+            &serde_json::json!(["half an ans"]),
+            "the partial text is in the snapshot: {baseline}"
+        );
+
+        // A follower that did not opt in gets no `assistantStream` key at all:
+        // the key's presence is what tells a client the field is meaningful.
+        let plain = open_follow_snapshot(&mut m, &sid, false).expect("snapshot");
+        assert!(
+            plain.get("assistantStream").is_none(),
+            "an un-opted-in snapshot carries no assistantStream: {plain}"
+        );
+    }
+
+    /// Create a session the way `session/create` does, returning its id.
+    fn create_session(m: &mut SessionMachine, home: &Path) -> String {
+        let wd = home.join("ws");
+        std::fs::create_dir_all(&wd).expect("workspace dir");
+        let r = call(
+            m,
+            "create",
+            serde_json::json!({ "request": { "cwd": wd.to_string_lossy() } }),
+        );
+        assert!(r["ok"].as_bool().unwrap(), "create failed: {r}");
+        let sid = r["value"]["sessionId"].as_str().unwrap().to_string();
+        // The store mints the session id, so the caller must address the id the
+        // create actually produced — addressing a guessed one finds nothing and
+        // the follow answers `session/not-found` rather than opening.
+        sid
+    }
+
+    /// Open a follow stream, returning its stream id when it opened.
+    fn open_follow(m: &mut SessionMachine, sid: &str, assistant: bool) -> Option<String> {
+        let stream_id = format!("stream-{}", rpc::new_id());
+        let req = serde_json::json!({
+            "address": { "kind": "session", "sessionId": sid },
+            "maxMessages": 10,
+            "assistantStream": assistant,
+        });
+        let outs = crate::driver::drive(
+            m,
+            MachineIn::Event {
+                name: EventName::new(rpc::stream_open_event("session")),
+                payload: serde_json::json!({
+                    "streamId": stream_id,
+                    "method": "follow",
+                    "request": req,
+                }),
+            },
+        );
+        opened_stream_id(&outs)
+    }
+
+    /// The snapshot frame a follow open produced, or `None` if it errored.
+    fn open_follow_snapshot(
+        m: &mut SessionMachine,
+        sid: &str,
+        assistant: bool,
+    ) -> Option<serde_json::Value> {
+        let stream_id = format!("stream-{}", rpc::new_id());
+        let req = serde_json::json!({
+            "address": { "kind": "session", "sessionId": sid },
+            "maxMessages": 10,
+            "assistantStream": assistant,
+        });
+        let outs = crate::driver::drive(
+            m,
+            MachineIn::Event {
+                name: EventName::new(rpc::stream_open_event("session")),
+                payload: serde_json::json!({
+                    "streamId": stream_id,
+                    "method": "follow",
+                    "request": req,
+                }),
+            },
+        );
+        outs.iter().find_map(|o| match o {
+            MachineOut::Stream(vocoder_cordis::StreamFrame::Item { value, .. }) => {
+                Some(value.clone())
+            }
+            _ => None,
+        })
+    }
+
+    fn opened_stream_id(outs: &[MachineOut]) -> Option<String> {
+        outs.iter().find_map(|o| match o {
+            MachineOut::Stream(vocoder_cordis::StreamFrame::Item { stream_id, .. }) => {
+                Some(stream_id.clone())
+            }
+            _ => None,
+        })
     }
 }

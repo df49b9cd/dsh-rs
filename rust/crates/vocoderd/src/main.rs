@@ -27,7 +27,9 @@ use clap::Parser;
 use parking_lot::Mutex;
 use tokio::net::TcpListener;
 use tracing::info;
-use vocoder_cordis::{EventName, MachineId, MachineIn, PluginMachine, RouteIn, RouteOut, Router};
+use vocoder_cordis::{
+    EventName, MachineId, MachineIn, PluginMachine, RealizeRequest, RouteIn, RouteOut, Router,
+};
 use vocoder_typert::{
     ClientRequest, RpcError, RpcResult, ServerResponse, decode_rpc_client_request,
     encode_rpc_server_response, mux::MuxSessionMachine,
@@ -105,47 +107,96 @@ impl AppState {
     ///
     /// Returns the terminal outputs. Machines are pure, so this is the whole
     /// boundary between protocol logic and the world.
+    ///
+    /// A streaming effect ([`vocoder_cordis::RealizeRequest::FetchStream`])
+    /// delivers its bytes back through this loop *while it is still running*:
+    /// each read becomes a [`MachineIn::EffectChunk`] fed to the machine before
+    /// the final [`MachineIn::EffectResult`]. That is what lets the machine
+    /// forward a model's first token as it arrives rather than when the answer
+    /// completes.
+    ///
+    /// The chunk deliveries are made from *inside* the effect, and their stream
+    /// frames are routed immediately. Both are load-bearing: a design that
+    /// queued the chunks and replayed them after the fetch returned would
+    /// produce byte-identical frames at byte-identical offsets and deliver
+    /// every one of them at once at the end — the protocol would look right and
+    /// the latency would be untouched. Delivering during the read is the whole
+    /// feature, so it is done where the bytes are, not where they are
+    /// convenient.
     fn pump(&self, to: &MachineId, ev: MachineIn) -> Vec<RouteOut> {
         let mut terminal = Vec::new();
-        let mut pending = Some(ev);
+        // Inputs still to deliver, and effects still to run. Two queues rather
+        // than one because they drain in a fixed order: every queued input is
+        // delivered before the next effect starts. That order is the machine
+        // contract — a machine hangs one operation on one outstanding effect —
+        // and merging the queues would let a second effect start while the
+        // first one's chunks were still being delivered.
+        let mut pending: std::collections::VecDeque<MachineIn> = std::collections::VecDeque::new();
+        let mut todo: std::collections::VecDeque<(vocoder_cordis::EffectId, RealizeRequest)> =
+            std::collections::VecDeque::new();
+        pending.push_back(ev);
         // One whole effect loop at a time; see [`AppState::dispatch`].
         let _serialized = self.dispatch.lock();
-        for _ in 0..crate::driver::MAX_EFFECTS_PER_INPUT {
-            let Some(input) = pending.take() else { break };
-            let outs = self.router.lock().handle(RouteIn::Deliver {
-                to: to.clone(),
-                ev: input,
-            });
-
-            let mut effects = Vec::new();
-            for out in outs {
-                match out {
-                    RouteOut::Realize { id, request, .. } => effects.push((id, request)),
-                    terminal_out => terminal.push(terminal_out),
-                }
+        // Bounded by *effects*, not by iterations: chunk deliveries are not
+        // effects and must not consume the budget that exists to catch a
+        // machine looping on I/O. A long model answer is many chunks and one
+        // effect, which is exactly the shape this must not mistake for a loop.
+        let mut effect_count = 0usize;
+        loop {
+            if let Some(input) = pending.pop_front() {
+                let outs = self.deliver(to, input);
+                sort_outs(outs, &mut terminal, &mut todo);
+                continue;
             }
-            // Route any stream frames immediately; they are not answers.
-            if terminal
-                .iter()
-                .any(|o| matches!(o, RouteOut::Stream { .. }))
-            {
-                let (streams, rest): (Vec<_>, Vec<_>) = terminal
-                    .drain(..)
-                    .partition(|o| matches!(o, RouteOut::Stream { .. }));
-                self.route_stream_outs(streams);
-                terminal = rest;
-            }
-            if effects.is_empty() {
+            let Some((id, request)) = todo.pop_front() else {
+                break;
+            };
+            if effect_count >= crate::driver::MAX_EFFECTS_PER_INPUT {
                 break;
             }
-            // Feed the first answer back; a machine awaiting several effects
-            // issues them one at a time, so at most one is awaited per turn.
-            let (id, request) = effects.remove(0);
-            let result =
-                crate::driver::realize(request).unwrap_or(vocoder_cordis::EffectResult::Done);
-            pending = Some(MachineIn::EffectResult { id, result });
+            effect_count += 1;
+            // Outputs the chunk deliveries produced, collected because the sink
+            // runs inside `realize_with` and cannot hand them back.
+            let mut during: Vec<RouteOut> = Vec::new();
+            let result = crate::driver::realize_with(request, &mut |bytes| {
+                during.extend(self.deliver(to, MachineIn::EffectChunk { id, bytes }));
+            })
+            .unwrap_or(vocoder_cordis::EffectResult::Done);
+            sort_outs(during, &mut terminal, &mut todo);
+            pending.push_back(MachineIn::EffectResult { id, result });
         }
         terminal
+    }
+
+    /// Feed one input to one machine, routing its stream frames as they are
+    /// produced. Stream frames are not answers, so they never reach the caller.
+    fn deliver(&self, to: &MachineId, ev: MachineIn) -> Vec<RouteOut> {
+        let outs = self
+            .router
+            .lock()
+            .handle(RouteIn::Deliver { to: to.clone(), ev });
+        let (streams, rest): (Vec<_>, Vec<_>) = outs
+            .into_iter()
+            .partition(|o| matches!(o, RouteOut::Stream { .. }));
+        self.route_stream_outs(streams);
+        rest
+    }
+}
+
+/// Split one step's outputs into effects still to run, and everything else.
+///
+/// Stream frames are already routed by [`AppState::deliver`], so they cannot
+/// appear here.
+fn sort_outs(
+    outs: Vec<RouteOut>,
+    terminal: &mut Vec<RouteOut>,
+    todo: &mut std::collections::VecDeque<(vocoder_cordis::EffectId, RealizeRequest)>,
+) {
+    for out in outs {
+        match out {
+            RouteOut::Realize { id, request, .. } => todo.push_back((id, request)),
+            other => terminal.push(other),
+        }
     }
 }
 

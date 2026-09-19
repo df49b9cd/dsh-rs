@@ -53,6 +53,7 @@ use vocoder_cordis::{EffectResult, MachineIn, MachineOut, PluginMachine, Realize
 use super::agent_inbox::{Inbox, InboxTarget};
 use super::agent_loop::{AgentLoop, Draft, LoopOutput, StepOutcome};
 use super::llm_replay::{BlockType, FinishReason, StreamChunk, step_outcome};
+use super::markdown::DisplayAccumulator;
 use super::provider::{
     ProviderConfig, ProviderKind, ProviderStreamDecoder, SseDecoder, SseFrame, to_wire_request,
 };
@@ -133,6 +134,300 @@ struct TurnState {
     request_id: String,
     rows: Vec<Value>,
     fsm: AgentLoop,
+    /// How many rows the session had when this turn opened.
+    ///
+    /// The publishing step announces the rows *past* this point, so a follower
+    /// gets this turn's events and not the whole history again. Recorded here
+    /// rather than re-derived at publish time because the cache's row list is
+    /// not a reliable witness: the turn's own write invalidates it, so a
+    /// re-entry after the write would compare against the wrong length.
+    opened_with: usize,
+}
+
+/// The live decode of a model call, as its bytes arrive.
+///
+/// Three incrementally-maintained pieces, because each answers a different
+/// question and none can be re-derived cheaply from the others:
+///
+/// - `sse` and `stream` are the transport and protocol decoders. They are the
+///   *same* two the buffered path uses; the only difference is that they are fed
+///   as bytes land rather than once at the end. That is deliberate — two decode
+///   paths would be two chances to disagree about what the model said, and the
+///   durable record is written from the buffered path while the display comes
+///   from this one.
+/// - `acc` accumulates per-block text for display, mirroring what a client's
+///   own accumulator does when it folds the same chunk stream.
+///
+/// `index` and `revision` are the frame counters the assistant-stream protocol
+/// requires: `index` must be *dense* per attempt (the control's accumulator
+/// rejects a gap and drops the attempt), and `revision` increments on every
+/// frame so a client can detect a restart.
+struct Live {
+    sse: SseDecoder,
+    stream: ProviderStreamDecoder,
+    acc: DisplayAccumulator,
+    index: u64,
+    revision: u64,
+    attempt_id: String,
+    /// Blocks already announced with a `block-start`, so a block is opened once.
+    announced: BTreeMap<u64, BlockType>,
+    /// Whether the `start` frame has gone out. Set by the emitter rather than
+    /// by the decoder, because whether a start was sent is a fact about the
+    /// *stream*, not about the response's contents.
+    started: bool,
+}
+
+impl Live {
+    fn new(kind: ProviderKind) -> Self {
+        Self {
+            sse: SseDecoder::new(),
+            stream: ProviderStreamDecoder::new(kind),
+            acc: DisplayAccumulator::new(),
+            index: 0,
+            revision: 0,
+            attempt_id: format!("attempt-{}", rpc::new_id()),
+            announced: BTreeMap::new(),
+            started: false,
+        }
+    }
+
+    /// Decode `bytes` and produce the assistant-stream chunk frames they imply.
+    ///
+    /// The bytes are appended to the *same* buffers the buffered path would
+    /// have seen, so a chunk boundary that splits an SSE frame is handled by
+    /// the decoder's own buffering rather than by luck.
+    ///
+    /// Both decoders are stateful: they append only the chunks that a newly
+    /// arrived frame produced, so the returned batch is already only-new. A
+    /// caller must not re-feed bytes it has already fed.
+    fn feed(&mut self, bytes: &[u8]) -> Vec<Value> {
+        let mut frames = Vec::new();
+        self.sse.feed(bytes, &mut frames);
+        let mut chunks: Vec<StreamChunk> = Vec::new();
+        for frame in &frames {
+            self.stream.frame(frame, &mut chunks);
+        }
+        self.drain(&chunks)
+    }
+
+    /// Flush whatever the decoders are still holding, at end of stream.
+    fn end(&mut self) -> Vec<Value> {
+        let mut frames = Vec::new();
+        self.sse.finish(&mut frames);
+        let mut chunks: Vec<StreamChunk> = Vec::new();
+        for frame in &frames {
+            self.stream.frame(frame, &mut chunks);
+        }
+        self.stream.end(&mut chunks);
+        self.drain(&chunks)
+    }
+
+    /// Turn a batch of freshly-decoded chunks into wire frames.
+    ///
+    /// The batch is already only-new: both decoders are stateful and append
+    /// solely the chunks a newly-arrived frame produced, so there is nothing to
+    /// de-duplicate here. An earlier version carried an `emitted` cursor and
+    /// sliced the batch with it, which was wrong in a way that only showed up as
+    /// a panic once the *second* batch arrived — the cursor counted against a
+    /// list that was rebuilt per call, so it ran off the end.
+    fn drain(&mut self, chunks: &[StreamChunk]) -> Vec<Value> {
+        let mut out = Vec::new();
+        for chunk in chunks {
+            for value in self.frame_for(chunk) {
+                self.revision += 1;
+                let index = self.index;
+                self.index += 1;
+                out.push(json!({
+                    "type": "chunk",
+                    "attemptId": self.attempt_id,
+                    "revision": self.revision,
+                    "index": index,
+                    "time": super::session_now_ms(),
+                    "chunk": value,
+                }));
+            }
+        }
+        out
+    }
+
+    /// The display frame(s) one chunk produces.
+    ///
+    /// A `block-start` is emitted once per block index, at the first chunk that
+    /// touches it — which is where a client needs it, since its accumulator
+    /// keys blocks by index and a delta for an unannounced block would land on
+    /// a hole.
+    ///
+    /// Only *prose* blocks are announced with their text attached; a tool call's
+    /// arguments ride through as the raw deltas, because the display path must
+    /// not stitch JSON and the client assembles the arguments itself.
+    fn frame_for(&mut self, chunk: &StreamChunk) -> Vec<Value> {
+        let mut out = Vec::new();
+        // Announce the block this chunk belongs to, if it is a new one.
+        let (index, block_type) = match chunk {
+            StreamChunk::TextDelta { index, .. } => (Some(*index), Some(BlockType::Text)),
+            StreamChunk::ReasoningDelta { index, .. } => (Some(*index), Some(BlockType::Reasoning)),
+            StreamChunk::ToolCallDelta { index, .. } => (Some(*index), Some(BlockType::ToolCall)),
+            StreamChunk::BlockStart { index, block_type } => (Some(*index), Some(*block_type)),
+            _ => (None, None),
+        };
+        if let (Some(index), Some(block_type)) = (index, block_type)
+            && !self.announced.contains_key(&index)
+        {
+            self.announced.insert(index, block_type);
+            self.acc.open(index, block_type);
+            out.push(json!({ "type": "block-start", "index": index, "blockType": block_name(block_type) }));
+        }
+        // Then the chunk's own content.
+        match chunk {
+            StreamChunk::TextDelta { index, text } => {
+                // The **raw** fragment, not the stitched one, and this is a
+                // correctness requirement rather than a simplification.
+                //
+                // `text-delta` is append-only: a client accumulates with
+                // `prev + chunk.text`. Stitching inserts characters the model
+                // never wrote — closing `**bo` to `**bo**` appends two
+                // asterisks *before the answer continues* — so a stitched
+                // frame's inserted closer is baked into the concatenation and
+                // every later fragment lands after it. Concatenating stitched
+                // deltas yields `Here is **bo**** text` where the model wrote
+                // `Here is **bold** text`.
+                //
+                // There is no retraction in the protocol, so no delta sequence
+                // can both render well per-frame and sum to the stitched text.
+                // The repair therefore belongs where the whole text is known,
+                // which is the consumer's accumulated buffer; see
+                // `machines/markdown.rs` for the accumulator that does it and
+                // why the log must never see its output.
+                self.acc.push_delta(*index, BlockType::Text, text);
+                out.push(json!({
+                    "type": "text-delta",
+                    "index": index,
+                    "text": text,
+                }));
+            }
+            StreamChunk::ReasoningDelta { index, text } => {
+                self.acc.push_delta(*index, BlockType::Reasoning, text);
+                out.push(json!({
+                    "type": "reasoning-delta",
+                    "index": index,
+                    "text": text,
+                }));
+            }
+            StreamChunk::ToolCallDelta {
+                index,
+                id,
+                name,
+                arguments_delta,
+            } => {
+                let mut v = json!({
+                    "type": "tool-call-delta",
+                    "index": index,
+                    "id": id,
+                    "argumentsDelta": arguments_delta,
+                });
+                if let Some(name) = name {
+                    v["name"] = json!(name);
+                }
+                out.push(v);
+            }
+            StreamChunk::BlockEnd { index, block } => {
+                // The **one** legal point for stitched text on this wire, and it
+                // is legal for a structural reason rather than a stylistic one.
+                //
+                // A client replaces the block wholesale on `block-end`
+                // (`PartialAccumulator`: `blocks[index] = toAssistantBlock(chunk.block)`,
+                // tested upstream as "replaces the accumulated block wholesale on
+                // block-end"), so whatever the deltas accumulated is discarded
+                // and this value takes over. That makes `block-end` a
+                // *retraction point* — the only one in the protocol — and a
+                // retraction point is exactly what a repairer needs.
+                //
+                // It cannot go in `text-delta`. That field is append-only
+                // (`prev + chunk.text`), and stitching inserts characters the
+                // model never wrote: closing `**bo` to `**bo**` appends two
+                // asterisks *before the answer continues*, so the closer is
+                // baked into the concatenation and every later fragment lands
+                // after it. Concatenating stitched deltas gives
+                // `Here is **bo**** text` where the model wrote
+                // `Here is **bold** text`. No delta sequence can both render
+                // well per-frame and sum to the stitched text.
+                //
+                // Prose only: a tool call's block is JSON, and repairing it
+                // would hand the client arguments it cannot parse.
+                let block = self.stitched_block(*index, block);
+                out.push(json!({ "type": "block-end", "index": index, "block": block }));
+            }
+            StreamChunk::Usage { usage } => {
+                out.push(json!({ "type": "usage", "usage": usage }));
+            }
+            StreamChunk::Finish { .. } => {
+                // Deliberately not forwarded. `finish` is a durable-record
+                // concept — the client's own accumulator ignores it, and the
+                // `assistant/message` row that supersedes the partial is what
+                // tells a client the stream is over. Forwarding it would add a
+                // frame no client consumes.
+            }
+            StreamChunk::BlockStart { .. } => {}
+        }
+        out
+    }
+
+    /// The `block-end` payload for one block, with prose stitched.
+    ///
+    /// The decoder's own `block-end` block is deliberately empty — it owns the
+    /// chunk vocabulary, not block assembly — so the text comes from the
+    /// accumulator, which is the only place that has been collecting the
+    /// deltas. Building it from the decoder's placeholder is what made an early
+    /// version record empty content for every provider; the same mistake here
+    /// would send a client an empty final block, which *replaces* the text it
+    /// had been accumulating.
+    ///
+    /// A tool-call block is passed through untouched: its `arguments` are
+    /// assembled by the client from the deltas, and a block-end carrying a
+    /// rewritten copy would be the JSON corruption `is_prose` exists to
+    /// prevent. An unstitched block kind therefore keeps the decoder's payload,
+    /// which for a tool call is the block identity without arguments — the same
+    /// thing the durable row records.
+    fn stitched_block(&self, index: u64, block: &Value) -> Value {
+        let block_type = block
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let kind = match block_type {
+            "text" => BlockType::Text,
+            "reasoning" => BlockType::Reasoning,
+            _ => return block.clone(),
+        };
+        if !super::markdown::is_prose(kind) {
+            return block.clone();
+        }
+        let Some(text) = self.acc.display(index) else {
+            return block.clone();
+        };
+        json!({ "type": block_type, "text": text.into_string() })
+    }
+}
+
+/// The wire name of a block kind.
+fn block_name(block_type: BlockType) -> &'static str {
+    match block_type {
+        BlockType::Text => "text",
+        BlockType::Reasoning => "reasoning",
+        BlockType::ToolCall => "tool-call",
+    }
+}
+
+/// One `agent/assistant-stream` dispatch.
+///
+/// The event name and shape mirror upstream's own, so the session machine that
+/// consumes it is doing what the control's history controller does rather than
+/// speaking a vocabulary invented here.
+fn stream_event(session: &str, frame: Value) -> MachineOut {
+    MachineOut::Dispatch {
+        name: vocoder_cordis::EventName::new("agent/assistant-stream"),
+        payload: json!({ "sessionId": session, "frame": frame }),
+        mode: vocoder_cordis::DispatchMode::Emit,
+    }
 }
 
 /// How far the in-flight turn has advanced.
@@ -155,6 +450,22 @@ enum Op {
         provider: String,
         /// Built once, so a re-run sends the identical body.
         body: Value,
+        /// The incremental decode of the bytes that have arrived so far.
+        ///
+        /// Carried rather than rebuilt because the chunk deliveries arrive
+        /// *between* the fetch's request and its answer, and each one must
+        /// extend the same decode: a decoder re-created per chunk would treat
+        /// every chunk as the start of a stream and re-emit the blocks it had
+        /// already seen.
+        live: Box<Live>,
+        /// The effect this call's response is arriving under, once the fetch
+        /// has issued it. `None` only between building the call and issuing it.
+        ///
+        /// Chunks are matched against this rather than against a "some effect
+        /// is in flight" flag: a chunk from a *previous* call could otherwise
+        /// be applied to the next one, which would splice one model's text into
+        /// another's answer.
+        effect: Option<vocoder_cordis::EffectId>,
     },
     /// The call returned; decode it and settle the step.
     Settle {
@@ -177,6 +488,15 @@ pub struct AgentMachine {
     op: Option<Op>,
     /// Finished request ids, so a redelivered call does not start a new turn.
     completed: BTreeMap<String, Value>,
+    /// The attempt id, revision and next index of the call that just settled.
+    ///
+    /// The `Live` that produced them is dropped when `settle` runs, but the
+    /// `end` frame has to name the same attempt and continue the same counters —
+    /// a client validates that every frame of an attempt carries one id and that
+    /// chunk indices are dense, so an `end` that invented a fresh id would be
+    /// rejected and leave the partial live forever. Carrying the summary is how
+    /// the closing frame stays attributable after its decoder is gone.
+    last_attempt: Option<(String, u64, u64)>,
 }
 
 impl AgentMachine {
@@ -192,6 +512,7 @@ impl AgentMachine {
             effects: 0,
             op: None,
             completed: BTreeMap::new(),
+            last_attempt: None,
         }
     }
 
@@ -262,7 +583,7 @@ impl AgentMachine {
     /// effect is issued. Re-deriving the target after the write would name the
     /// *next* generation, since the version comes from the directory the write
     /// just changed.
-    fn publish(&mut self, session: &str, rows: &[Value]) -> Vec<MachineOut> {
+    fn publish(&mut self, session: &str, rows: &[Value], opened_with: usize) -> Vec<MachineOut> {
         let tree = match self.tree() {
             Ok(tree) => tree,
             Err(effects) => return effects,
@@ -285,8 +606,33 @@ impl AgentMachine {
         if self.cache.published.contains(&path) {
             return vec![];
         }
-        self.cache
-            .request_write(&path, bytes, &mut self.pending, &mut self.effects)
+        // Announce every row this generation adds, so followers receive the
+        // turn's durable events.
+        //
+        // The agent owns the log for the rows it writes — it appends the whole
+        // turn itself rather than going through `session/prompt`'s own recorder
+        // — and the follow stream's durable half is fed by whoever knows a row
+        // landed. Publishing without announcing left a follower seeing the live
+        // partial and then nothing: the `end` frame it received named a `seq`
+        // that never arrived, so the partial could never be retired.
+        //
+        // Only rows *beyond what the session already had* are announced. The
+        // cache holds the rows as of this turn's start, so the pre-existing
+        // prefix is not re-broadcast — a follower would otherwise see every
+        // earlier event again on each turn.
+        let mut outs = Vec::new();
+        for row in rows.iter().skip(opened_with) {
+            outs.push(MachineOut::Dispatch {
+                name: vocoder_cordis::EventName::new("session/event"),
+                payload: json!({ "sessionId": session, "event": row }),
+                mode: vocoder_cordis::DispatchMode::Emit,
+            });
+        }
+        let mut write =
+            self.cache
+                .request_write(&path, bytes, &mut self.pending, &mut self.effects);
+        outs.append(&mut write);
+        outs
     }
 
     /// Append one row, assigning `seq` and `time`.
@@ -434,26 +780,64 @@ impl AgentMachine {
         ))
     }
 
+    /// Open a model call, with a live decoder attached.
+    ///
+    /// The provider kind is resolved here rather than at decode time so the
+    /// decoder is built against the same route the request went to; a call
+    /// whose route vanished is left with the chat dialect, which is only a
+    /// fallback for a case `build_call` already refuses.
+    fn open_call(&self, state: TurnState, provider: String, body: Value) -> Op {
+        let kind = self
+            .routes
+            .get(&provider)
+            .map(|r| r.config.kind)
+            .unwrap_or(ProviderKind::OpenAiChat);
+        Op::Call {
+            state,
+            provider,
+            body,
+            live: Box::new(Live::new(kind)),
+            effect: None,
+        }
+    }
+
     /// Emit the provider fetch for the pending call.
     ///
     /// The API key is read from the environment here, at call time, and never
     /// enters the machine or the log: [`ProviderConfig::auth`] resolves a header
     /// pair from a variable *name*.
-    fn fetch(&mut self, provider: &str, body: &Value) -> Vec<MachineOut> {
-        let Some(route) = self.routes.get(provider) else {
-            return vec![];
-        };
+    ///
+    /// The streaming effect is used rather than the buffered one, so the
+    /// machine sees the model's output as it arrives and can forward it. The
+    /// answer still carries the whole body, which is what gets decoded a second
+    /// time for the durable record — the two decodes share their decoders, so
+    /// they cannot disagree.
+    ///
+    /// The effect id is returned rather than written onto `self.op`: the caller
+    /// has the op *taken* while it calls this (the resume path holds it in a
+    /// local), so writing through `self.op` here reaches nothing and the chunks
+    /// that follow would match no call. Returning it makes the caller — which is
+    /// the only frame that still owns the op — do the recording.
+    fn fetch(
+        &mut self,
+        provider: &str,
+        body: &Value,
+    ) -> Option<(vocoder_cordis::EffectId, Vec<MachineOut>)> {
+        let route = self.routes.get(provider)?;
         let headers: Vec<(String, String)> = route.config.auth().into_iter().collect();
         let url = route.config.url();
         let id = self.cache.next_effect(&mut self.pending, &mut self.effects);
-        vec![rpc::effect(
+        Some((
             id,
-            RealizeRequest::FetchJson {
-                url,
-                headers,
-                body: body.to_string(),
-            },
-        )]
+            vec![rpc::effect(
+                id,
+                RealizeRequest::FetchStream {
+                    url,
+                    headers,
+                    body: body.to_string(),
+                },
+            )],
+        ))
     }
 
     /// Publish the turn's rows and answer its call.
@@ -465,7 +849,7 @@ impl AgentMachine {
     fn finish(&mut self, state: &TurnState) -> Vec<MachineOut> {
         self.completed
             .insert(state.request_id.clone(), json!({ "accepted": true }));
-        let out = self.publish(&state.session, &state.rows);
+        let out = self.publish(&state.session, &state.rows, state.opened_with);
         if out.is_empty() {
             // The write already landed, so the operation is complete.
             self.op = None;
@@ -518,6 +902,11 @@ impl AgentMachine {
         rows: Vec<Value>,
     ) -> Vec<MachineOut> {
         let mut rows = rows;
+        // The boundary is taken *before* the splice row is appended: the splice
+        // is part of this turn, so a boundary captured after it would leave the
+        // row unannounced and a follower would see the event sequence skip from
+        // the prompt straight to `turn/start`. The client throws on a gap.
+        let opened_with = rows.len();
         // The message id from the log's own user row for this prompt, so the
         // splice references the message that actually exists rather than a
         // freshly minted id pointing at nothing.
@@ -574,6 +963,7 @@ impl AgentMachine {
             request_id,
             rows,
             fsm,
+            opened_with,
         };
         let call = self.apply(&mut state, outs);
         self.continue_turn(state, call)
@@ -589,11 +979,7 @@ impl AgentMachine {
         call: Option<(String, Value)>,
     ) -> Vec<MachineOut> {
         if let Some((provider, body)) = call {
-            self.op = Some(Op::Call {
-                state,
-                provider,
-                body,
-            });
+            self.op = Some(self.open_call(state, provider, body));
             return self.resume_op();
         }
         // A running turn with no call decided owes another step.
@@ -601,11 +987,7 @@ impl AgentMachine {
             let outs = state.fsm.enter_step();
             let call = self.apply(&mut state, outs);
             if let Some((provider, body)) = call {
-                self.op = Some(Op::Call {
-                    state,
-                    provider,
-                    body,
-                });
+                self.op = Some(self.open_call(state, provider, body));
                 return self.resume_op();
             }
         }
@@ -644,12 +1026,18 @@ impl AgentMachine {
                 state,
                 provider,
                 body,
+                live,
+                effect: _,
             }) => {
-                let effects = self.fetch(&provider, &body);
+                let Some((id, effects)) = self.fetch(&provider, &body) else {
+                    return vec![];
+                };
                 self.op = Some(Op::Call {
                     state,
                     provider,
                     body,
+                    live,
+                    effect: Some(id),
                 });
                 effects
             }
@@ -700,7 +1088,7 @@ impl AgentMachine {
             "assistant/attempt"
         };
         let (turn, step) = state.fsm.position();
-        Self::row(
+        let settled = Self::row(
             &mut state.rows,
             &Draft {
                 row_type,
@@ -713,6 +1101,17 @@ impl AgentMachine {
                 }),
             },
         );
+        // The attempt's closing frame, naming the row that supersedes it.
+        //
+        // Without this a client's partial stays live forever: the protocol's
+        // terminal marker is `end`, and the durable event that would otherwise
+        // retire the partial is delivered on the same follow stream *behind*
+        // these frames — so a client that stopped at the last chunk would render
+        // a partial that never resolves.
+        //
+        // `committed` carries the settling row's own seq, which is what a client
+        // needs to correlate the frame with the event that follows it.
+        let seq = settled.get("seq").and_then(Value::as_f64).unwrap_or(-1.0);
         let outcome = match &reason {
             Some(r) => step_outcome(r),
             None => StepOutcome::Error {
@@ -720,9 +1119,24 @@ impl AgentMachine {
                 message: "provider stream ended without a finish chunk".into(),
             },
         };
+        let mut end_frames = vec![stream_event(
+            &state.session,
+            json!({
+                "type": "end",
+                "attemptId": self.attempt_id_of(&state),
+                "revision": self.revision_of(&state) + 1,
+                "index": self.chunk_index_of(&state),
+                "outcome": if reason.is_some() {
+                    json!({ "kind": "committed", "eventType": row_type, "seq": seq })
+                } else {
+                    json!({ "kind": "abandoned" })
+                },
+            }),
+        )];
         let outs = state.fsm.step_reply(outcome, has_calls, false);
         let call = self.apply(&mut state, outs);
-        self.continue_turn(state, call)
+        end_frames.extend(self.continue_turn(state, call));
+        end_frames
     }
 }
 
@@ -744,6 +1158,7 @@ impl PluginMachine for AgentMachine {
                 let args = payload.get("args").cloned().unwrap_or(Value::Null);
                 self.begin(&method, &args)
             }
+            MachineIn::EffectChunk { id, bytes } => self.on_chunk(id, &bytes),
             MachineIn::EffectResult { id, result } => self.on_effect(id, result),
             _ => vec![],
         }
@@ -868,6 +1283,98 @@ impl AgentMachine {
     ///
     /// The pending op, not the effect id, decides what the answer means: only
     /// one effect is ever outstanding for this machine.
+    /// Decode a slice of a streaming call's response and publish what it says.
+    ///
+    /// The op is *taken* for the duration so the decode can borrow the `Live`
+    /// mutably and still produce outputs; it is put back before returning, since
+    /// the call is still in flight and the answer has not arrived.
+    ///
+    /// Ids are checked against the outstanding effect: a chunk for an effect this
+    /// machine is no longer waiting on is a late delivery, and applying it would
+    /// append text to a turn that has already settled.
+    fn on_chunk(&mut self, id: vocoder_cordis::EffectId, bytes: &[u8]) -> Vec<MachineOut> {
+        let Some(Op::Call {
+            state,
+            provider,
+            body,
+            mut live,
+            effect,
+        }) = self.op.take()
+        else {
+            return vec![];
+        };
+        // A chunk for any other effect is a late delivery for a call this
+        // machine has already moved past, and applying it would append text to
+        // a turn that has settled.
+        if effect != Some(id) {
+            self.op = Some(Op::Call {
+                state,
+                provider,
+                body,
+                live,
+                effect,
+            });
+            return vec![];
+        }
+        let frames = live.feed(bytes);
+        let outs = Self::stream_dispatches(&state, &live, frames);
+        // Marked *after* the dispatches are built: `stream_dispatches` reads
+        // this flag to decide whether the `start` frame is owed, so setting it
+        // first is what made the first version emit chunks with no start ahead
+        // of them — and a follower's accumulator drops a chunk that arrives
+        // before the start that names its attempt.
+        if !outs.is_empty() {
+            live.started = true;
+        }
+        self.op = Some(Op::Call {
+            state,
+            provider,
+            body,
+            live,
+            effect,
+        });
+        outs
+    }
+
+    /// The `agent/assistant-stream` events for a batch of decoded frames.
+    ///
+    /// A `start` frame is emitted once per attempt, ahead of the chunks that
+    /// reference it: a follower's accumulator keys its state on `attemptId` and
+    /// drops a chunk that arrives before the start that names it. The flag lives
+    /// on `Live` rather than in a map here so it travels with the attempt it
+    /// describes — a second map keyed by request id would have to be kept in
+    /// step with the op's own lifetime, which is the same fact stored twice.
+    fn stream_dispatches(state: &TurnState, live: &Live, frames: Vec<Value>) -> Vec<MachineOut> {
+        if frames.is_empty() {
+            return vec![];
+        }
+        let mut outs = Vec::new();
+        let (turn, step) = state.fsm.position();
+        if !live.started {
+            outs.push(stream_event(
+                &state.session,
+                json!({
+                    "type": "start",
+                    "attemptId": live.attempt_id,
+                    "revision": 1,
+                    // The cursor a follower is caught up to when this attempt
+                    // began: everything at or before it is already in the
+                    // snapshot, so frames after it are the ones the client
+                    // cannot have seen. `seq` is zero-based over events with
+                    // the header at row 0, which is why the last durable seq
+                    // is `len - 2`.
+                    "startedAfterSeq": state.rows.len().saturating_sub(2) as i64,
+                    "turn": turn,
+                    "step": step,
+                }),
+            ));
+        }
+        for frame in frames {
+            outs.push(stream_event(&state.session, frame));
+        }
+        outs
+    }
+
     fn on_effect(
         &mut self,
         _id: vocoder_cordis::EffectId,
@@ -907,6 +1414,8 @@ impl AgentMachine {
                     state,
                     provider,
                     body: _,
+                    live,
+                    effect: _,
                 },
                 EffectResult::HttpResponse { status, body },
             ) => {
@@ -917,12 +1426,32 @@ impl AgentMachine {
                         format!("provider returned HTTP {status}"),
                     );
                 }
+                // Flush the decoder's tail and emit whatever the last frame
+                // implied, so the display's final frame is the completed text
+                // rather than the text as of the last transport read. Without
+                // this the partial would end mid-word and only the superseding
+                // `assistant/message` would show the rest.
+                let mut live = live;
+                let tail = live.end();
+                let mut streamed = Self::stream_dispatches(&state, &live, tail);
+                if !streamed.is_empty() {
+                    live.started = true;
+                }
+                // Remember the attempt's identity and counters before the
+                // decoder is dropped: `settle` emits the closing `end` frame,
+                // and it has to name this attempt and continue these counters
+                // or a client rejects the frame and never retires its partial.
+                self.last_attempt = Some((live.attempt_id.clone(), live.revision, live.index));
+                // The step's own rows go out after the stream frames, so a
+                // client sees the partial complete before the message that
+                // supersedes it.
                 self.op = Some(Op::Settle {
                     state,
                     provider,
                     body,
                 });
-                self.resume_op()
+                streamed.extend(self.resume_op());
+                streamed
             }
             (Op::Call { state, .. }, EffectResult::Failed(e)) => self.fail_turn(
                 state,
@@ -938,6 +1467,42 @@ impl AgentMachine {
                 self.op = Some(op);
                 vec![]
             }
+        }
+    }
+    /// The attempt id of the call currently in flight, or — once it has settled —
+    /// the one that just did.
+    ///
+    /// The fallback matters: `settle` runs after the op is taken and consumed,
+    /// so there is no `Live` left to read; the recorded summary is what keeps
+    /// the closing frame attributable to the attempt whose chunks preceded it.
+    fn attempt_id_of(&self, state: &TurnState) -> String {
+        match self.op.as_ref() {
+            Some(Op::Call { state: s, live, .. }) if s.request_id == state.request_id => {
+                live.attempt_id.clone()
+            }
+            _ => self
+                .last_attempt
+                .as_ref()
+                .map(|(id, _, _)| id.clone())
+                .unwrap_or_else(|| format!("attempt-{}", rpc::new_id())),
+        }
+    }
+
+    /// The revision of the live attempt, or of the one that just settled.
+    fn revision_of(&self, state: &TurnState) -> u64 {
+        match self.op.as_ref() {
+            Some(Op::Call { state: s, live, .. }) if s.request_id == state.request_id => {
+                live.revision
+            }
+            _ => self.last_attempt.as_ref().map(|(_, r, _)| *r).unwrap_or(0),
+        }
+    }
+
+    /// The next chunk index the live attempt would use, or that of the settled one.
+    fn chunk_index_of(&self, state: &TurnState) -> u64 {
+        match self.op.as_ref() {
+            Some(Op::Call { state: s, live, .. }) if s.request_id == state.request_id => live.index,
+            _ => self.last_attempt.as_ref().map(|(_, _, i)| *i).unwrap_or(0),
         }
     }
 }
@@ -1328,51 +1893,30 @@ mod tests {
 
     /// Drive one input through the machine to quiescence, performing effects
     /// for real — including the provider call, when the environment names one.
-    fn drive(machine: &mut AgentMachine, mut pending: MachineIn) -> Vec<MachineOut> {
-        let mut terminal = Vec::new();
-        for _ in 0..64 {
-            let mut effects = Vec::new();
-            for out in machine.handle(pending) {
-                match out {
-                    MachineOut::Realize { id, request } => effects.push((id, request)),
-                    other => terminal.push(other),
-                }
-            }
-            if effects.is_empty() {
-                break;
-            }
-            let (id, request) = effects.remove(0);
-            let result = match &request {
-                // A `canned://` route is answered from the file it names
-                // instead of the network, so a whole turn is testable
-                // hermetically. Anything else goes through the real driver.
-                RealizeRequest::FetchJson { url, .. } if url.starts_with("canned://") => {
-                    // `ProviderConfig::url` appends the dialect's own path, so
-                    // the directory has to be recovered by stripping it back
-                    // off — stripping one component would leave `/chat` on the
-                    // end and look in a directory that does not exist.
-                    let mut dir = url.trim_start_matches("canned://").to_string();
-                    for suffix in ["/chat/completions", "/responses", "/messages"] {
-                        if let Some(stripped) = dir.strip_suffix(suffix) {
-                            dir = stripped.to_string();
-                            break;
-                        }
-                    }
-                    match std::fs::read_to_string(format!("{dir}/body.txt")) {
-                        Ok(body) => {
-                            vocoder_cordis::EffectResult::HttpResponse { status: 200, body }
-                        }
-                        Err(e) => vocoder_cordis::EffectResult::Failed(
-                            vocoder_cordis::EffectError::Other(format!("canned body: {e}")),
-                        ),
-                    }
-                }
-                other => crate::driver::realize(other.clone())
-                    .unwrap_or(vocoder_cordis::EffectResult::Done),
-            };
-            pending = MachineIn::EffectResult { id, result };
-        }
-        terminal
+    ///
+    /// Delegates to [`crate::driver::drive_with`] rather than reimplementing the
+    /// loop, so a test exercises the same chunk-then-result ordering the live
+    /// host uses. A private copy would have been free to skip the chunk
+    /// deliveries entirely, and every streaming assertion below would then have
+    /// been testing a code path production never runs.
+    fn drive(machine: &mut AgentMachine, pending: MachineIn) -> Vec<MachineOut> {
+        drive_collecting(machine, pending).0
+    }
+
+    /// [`drive`], also returning the outputs the *chunk* deliveries produced.
+    ///
+    /// Terminal outputs are by construction the ones that arrived after the
+    /// effect, so a test asserting that frames were published *during* the call
+    /// has to read them here.
+    fn drive_collecting(
+        machine: &mut AgentMachine,
+        pending: MachineIn,
+    ) -> (Vec<MachineOut>, Vec<MachineOut>) {
+        let mut during: Vec<MachineOut> = Vec::new();
+        let terminal = crate::driver::drive_with(machine, pending, &mut |outs| {
+            during.extend(outs.iter().cloned());
+        });
+        (terminal, during)
     }
 
     fn reply_of(outs: &[MachineOut]) -> RpcReply {
@@ -1931,25 +2475,441 @@ mod tests {
 
     /// Drive with real effects, for the live test.
     fn drive_live(machine: &mut AgentMachine, pending: MachineIn) -> Vec<MachineOut> {
-        let mut terminal = Vec::new();
-        let mut pending = Some(pending);
-        for _ in 0..64 {
-            let Some(input) = pending.take() else { break };
-            let mut effects = Vec::new();
-            for out in machine.handle(input) {
-                match out {
-                    MachineOut::Realize { id, request } => effects.push((id, request)),
-                    other => terminal.push(other),
+        drive_collecting(machine, pending).0
+    }
+
+    /// A body that streams markdown one token at a time, so the intermediate
+    /// frames are partially-written markdown rather than a complete document.
+    ///
+    /// The splits are chosen to land *inside* markers on purpose: `**` opens at
+    /// one delta and closes three deltas later, so a frame emitted mid-way is
+    /// genuinely unterminated. A body whose deltas happened to align with
+    /// marker boundaries would make every intermediate frame well-formed and the
+    /// stitching assertion would pass without the stitcher doing anything.
+    const MARKDOWN_BODY: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],",
+        "\"created\":1,\"id\":\"c\",\"model\":\"m\",\"object\":\"chat.completion.chunk\"}\n\n",
+        // "Here is **bo"
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Here is **bo\"},\"finish_reason\":null,",
+        "\"index\":0}],\"created\":1,\"id\":\"c\",\"model\":\"m\",\"object\":\"chat.completion.chunk\"}\n\n",
+        // "ld** text"
+        "data: {\"choices\":[{\"delta\":{\"content\":\"ld** text\"},\"finish_reason\":null,",
+        "\"index\":0}],\"created\":1,\"id\":\"c\",\"model\":\"m\",\"object\":\"chat.completion.chunk\"}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}],",
+        "\"created\":1,\"id\":\"c\",\"model\":\"m\",\"object\":\"chat.completion.chunk\"}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    /// Every `agent/assistant-stream` frame in a batch of outputs.
+    fn stream_frames(outs: &[MachineOut]) -> Vec<Value> {
+        outs.iter()
+            .filter_map(|o| match o {
+                MachineOut::Dispatch { name, payload, .. }
+                    if name.0 == "agent/assistant-stream" =>
+                {
+                    payload.get("frame").cloned()
                 }
-            }
-            if effects.is_empty() {
-                break;
-            }
-            let (id, request) = effects.remove(0);
-            let result =
-                crate::driver::realize(request).unwrap_or(vocoder_cordis::EffectResult::Done);
-            pending = Some(MachineIn::EffectResult { id, result });
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The text deltas among a frame list, in order.
+    fn text_deltas(frames: &[Value]) -> Vec<String> {
+        frames
+            .iter()
+            .filter_map(|f| f.pointer("/chunk"))
+            .filter(|c| c.get("type").and_then(Value::as_str) == Some("text-delta"))
+            .filter_map(|c| c.get("text").and_then(Value::as_str).map(str::to_string))
+            .collect()
+    }
+
+    /// A settled turn announces the rows it appended, so a follower's event
+    /// stream is gap-free.
+    ///
+    /// The agent writes the whole turn itself — it does not go through
+    /// `session/prompt`'s recorder — so without this announcement a follower
+    /// receives the live partial and then no settled event, and the `end`
+    /// frame's `seq` names a row the client never sees.
+    #[test]
+    fn a_published_turn_announces_its_new_rows() {
+        let session_id = "session-1";
+        let (_home, sessions) = session_home_with(session_id, true);
+        let mut machine = AgentMachine::new(sessions.clone(), vec![canned_provider(MARKDOWN_BODY)]);
+        let _ = machine.handle(MachineIn::ServicesReady { keys: vec![] });
+
+        let before = written_rows(&sessions, session_id).len();
+        let (terminal, _during) = drive_collecting(
+            &mut machine,
+            MachineIn::Event {
+                name: vocoder_cordis::EventName::new(rpc::call_event("agent")),
+                payload: json!({
+                    "method": "run",
+                    "args": {
+                        "sessionId": session_id,
+                        "requestId": "req-announce",
+                        "content": [{ "type": "text", "text": "hi" }],
+                    },
+                }),
+            },
+        );
+        assert!(matches!(reply_of(&terminal), RpcReply::Ok { .. }));
+
+        // Announcements are not stream frames, so they land in `terminal`.
+        let announced: Vec<&Value> = terminal
+            .iter()
+            .filter_map(|o| match o {
+                MachineOut::Dispatch { name, payload, .. } if name.0 == "session/event" => {
+                    payload.get("event")
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !announced.is_empty(),
+            "a published turn announces its rows: {terminal:?}"
+        );
+
+        // Every announced row exists in the log — an announcement of a row that
+        // was never written would hand a follower an event it cannot reconcile
+        // with the next snapshot.
+        let rows = written_rows(&sessions, session_id);
+        for event in &announced {
+            let seq = event.get("seq").and_then(Value::as_f64);
+            assert!(
+                rows.iter()
+                    .any(|r| r.get("seq").and_then(Value::as_f64) == seq),
+                "announced seq {seq:?} is in the log"
+            );
         }
-        terminal
+        // And they are exactly the *new* rows: announcing the pre-existing
+        // prefix would replay every earlier event to the follower on each turn.
+        //
+        // `written_rows` includes the log header (row 0) while the announcement
+        // counts only events, so the comparison drops the header from both.
+        assert_eq!(
+            announced.len(),
+            (rows.len() - 1) - (before - 1),
+            "only the rows this turn added are announced"
+        );
+        // The settled message is among them, which is what retires the partial.
+        assert!(
+            announced
+                .iter()
+                .any(|e| e.get("type").and_then(Value::as_str) == Some("assistant/message")),
+            "the settled message is announced: {announced:?}"
+        );
+    }
+    ///
+    /// Without this the client's partial never resolves. The durable
+    /// `assistant/message` event arrives on the same follow stream *behind*
+    /// these frames, so a client that stopped at the last chunk would show a
+    /// live partial forever — and `committed.seq` is what correlates the frame
+    /// with the event that follows it.
+    #[test]
+    fn a_settled_attempt_ends_with_a_committed_frame() {
+        let session_id = "session-1";
+        let (_home, sessions) = session_home(session_id);
+        let mut machine = AgentMachine::new(sessions.clone(), vec![canned_provider(MARKDOWN_BODY)]);
+        let _ = machine.handle(MachineIn::ServicesReady { keys: vec![] });
+
+        let (terminal, during) = drive_collecting(
+            &mut machine,
+            MachineIn::Event {
+                name: vocoder_cordis::EventName::new(rpc::call_event("agent")),
+                payload: json!({
+                    "method": "run",
+                    "args": {
+                        "sessionId": session_id,
+                        "requestId": "req-end",
+                        "content": [{ "type": "text", "text": "hi" }],
+                    },
+                }),
+            },
+        );
+        assert!(matches!(reply_of(&terminal), RpcReply::Ok { .. }));
+
+        // The `start` and chunks are emitted *during* the call; the `end` is
+        // emitted when the call's answer lands, so it is a terminal output.
+        // Both halves are the same attempt, which is the point.
+        let frames = stream_frames(&during);
+        let start = frames
+            .iter()
+            .find(|f| f.get("type").and_then(Value::as_str) == Some("start"))
+            .expect("a start frame");
+        let all: Vec<Value> = frames
+            .iter()
+            .cloned()
+            .chain(stream_frames(&terminal))
+            .collect();
+        let end = all
+            .iter()
+            .find(|f| f.get("type").and_then(Value::as_str) == Some("end"))
+            .expect("an end frame");
+        assert_eq!(
+            end.get("attemptId").and_then(Value::as_str),
+            start.get("attemptId").and_then(Value::as_str),
+            "the end names the attempt whose chunks preceded it"
+        );
+        assert_eq!(
+            end.pointer("/outcome/kind").and_then(Value::as_str),
+            Some("committed"),
+            "a finished call commits: {end:?}"
+        );
+        assert_eq!(
+            end.pointer("/outcome/eventType").and_then(Value::as_str),
+            Some("assistant/message")
+        );
+        // The seq must name the row that was actually appended, so a client can
+        // match the frame to the event. `-1` is the "no row" sentinel, so it
+        // would mean the frame points at nothing.
+        let seq = end
+            .pointer("/outcome/seq")
+            .and_then(Value::as_f64)
+            .expect("a seq");
+        let rows = written_rows(&sessions, session_id);
+        let msg = rows
+            .iter()
+            .find(|r| r.get("type").and_then(Value::as_str) == Some("assistant/message"))
+            .expect("the settled row");
+        assert_eq!(
+            seq,
+            msg.get("seq").and_then(Value::as_f64).unwrap(),
+            "the end frame points at the row it commits"
+        );
+        // The revision continues the attempt's own counter rather than
+        // restarting, which is what a client's continuity check compares.
+        let last_chunk_rev = all
+            .iter()
+            .filter(|f| f.get("type").and_then(Value::as_str) == Some("chunk"))
+            .filter_map(|f| f.get("revision").and_then(Value::as_u64))
+            .next_back()
+            .expect("chunks");
+        assert_eq!(
+            end.get("revision").and_then(Value::as_u64),
+            Some(last_chunk_rev + 1),
+            "the end continues the revision sequence"
+        );
+    }
+
+    /// A prompt drives the turn and the display frames arrive *while the call is
+    /// in flight*, not all at once at the end.
+    ///
+    /// This is the property the whole streaming path exists for, and it is
+    /// asserted by where the frames were collected rather than by their
+    /// contents: `during` is filled by the chunk deliveries that run inside the
+    /// effect, so a design that queued everything until the fetch returned would
+    /// leave it empty and still produce a frame-for-frame identical protocol.
+    #[test]
+    fn display_frames_are_emitted_while_the_call_is_in_flight() {
+        let session_id = "session-1";
+        let (_home, sessions) = session_home(session_id);
+        let mut machine = AgentMachine::new(sessions.clone(), vec![canned_provider(MARKDOWN_BODY)]);
+        let _ = machine.handle(MachineIn::ServicesReady { keys: vec![] });
+
+        let (terminal, during) = drive_collecting(
+            &mut machine,
+            MachineIn::Event {
+                name: vocoder_cordis::EventName::new(rpc::call_event("agent")),
+                payload: json!({
+                    "method": "run",
+                    "args": {
+                        "sessionId": session_id,
+                        "requestId": "req-stream",
+                        "content": [{ "type": "text", "text": "hi" }],
+                    },
+                }),
+            },
+        );
+        assert!(
+            matches!(reply_of(&terminal), RpcReply::Ok { .. }),
+            "turn accepted"
+        );
+
+        let frames = stream_frames(&during);
+        assert!(
+            !frames.is_empty(),
+            "frames must arrive during the call, not only at the end"
+        );
+        // The attempt opens with a `start`, then dense chunks.
+        assert_eq!(
+            frames[0].get("type").and_then(Value::as_str),
+            Some("start"),
+            "the attempt is announced before its chunks: {frames:?}"
+        );
+        let attempt = frames[0]["attemptId"]
+            .as_str()
+            .expect("attemptId")
+            .to_string();
+        let indices: Vec<u64> = frames
+            .iter()
+            .filter(|f| f.get("type").and_then(Value::as_str) == Some("chunk"))
+            .filter_map(|f| f.get("index").and_then(Value::as_u64))
+            .collect();
+        // Dense from zero: the control's accumulator drops an attempt on a gap,
+        // so a single skipped index would silently blank the live display.
+        assert_eq!(
+            indices,
+            (0..indices.len() as u64).collect::<Vec<_>>(),
+            "chunk indices must be dense"
+        );
+        for frame in &frames {
+            if let Some(id) = frame.get("attemptId").and_then(Value::as_str) {
+                assert_eq!(id, attempt, "every frame names the same attempt");
+            }
+        }
+    }
+
+    /// A partially-streamed markdown block is stitched for display, and the
+    /// durable record keeps the model's own bytes.
+    ///
+    /// Both halves matter and they pull in opposite directions: the display must
+    /// close `**bo` so the frame renders as bold rather than as literal
+    /// asterisks, and the log must keep `**bo` so replaying the session
+    /// reproduces the conversation the model actually had.
+    #[test]
+    fn a_partial_markdown_block_is_stitched_for_display_only() {
+        let session_id = "session-1";
+        let (_home, sessions) = session_home(session_id);
+        let mut machine = AgentMachine::new(sessions.clone(), vec![canned_provider(MARKDOWN_BODY)]);
+        let _ = machine.handle(MachineIn::ServicesReady { keys: vec![] });
+
+        let (terminal, during) = drive_collecting(
+            &mut machine,
+            MachineIn::Event {
+                name: vocoder_cordis::EventName::new(rpc::call_event("agent")),
+                payload: json!({
+                    "method": "run",
+                    "args": {
+                        "sessionId": session_id,
+                        "requestId": "req-md",
+                        "content": [{ "type": "text", "text": "hi" }],
+                    },
+                }),
+            },
+        );
+        assert!(matches!(reply_of(&terminal), RpcReply::Ok { .. }));
+
+        let frames = stream_frames(&during);
+        let deltas = text_deltas(&frames);
+        assert!(!deltas.is_empty(), "the text streamed");
+        // The deltas are the model's own bytes: an append-only field cannot
+        // carry a repair, because the inserted characters would survive into
+        // the client's concatenation. See `markdown.rs` for the proof.
+        assert_eq!(
+            deltas.concat(),
+            "Here is **bold** text",
+            "the deltas concatenate to exactly what the model wrote: {deltas:?}"
+        );
+        // The repair rides on `block-end`, which a client applies *wholesale* —
+        // it is the protocol's only retraction point. Mid-stream the block is
+        // unterminated, and this is where a client renders it closed.
+        let block_end = frames
+            .iter()
+            .filter_map(|f| f.pointer("/chunk"))
+            .find(|c| c.get("type").and_then(Value::as_str) == Some("block-end"))
+            .expect("a block-end frame");
+        assert_eq!(
+            block_end.pointer("/block/type").and_then(Value::as_str),
+            Some("text")
+        );
+        assert_eq!(
+            block_end.pointer("/block/text").and_then(Value::as_str),
+            Some("Here is **bold** text"),
+            "block-end carries the assembled, stitched block: {block_end:?}"
+        );
+
+        // The log, by contrast, holds exactly what the model sent.
+        let rows = written_rows(&sessions, session_id);
+        let msg = rows
+            .iter()
+            .find(|r| r.get("type").and_then(Value::as_str) == Some("assistant/message"))
+            .expect("an assistant message");
+        let text = msg
+            .pointer("/data/message/content/0/text")
+            .and_then(Value::as_str)
+            .expect("content text");
+        assert_eq!(
+            text, "Here is **bold** text",
+            "the durable record is the model's own bytes"
+        );
+        // And the *stream record* — the other durable copy — is unstitched too.
+        // It is the one that would be replayable, so a stitched byte here would
+        // fabricate a marker the model never wrote.
+        let stream = msg.pointer("/data/stream").expect("stream record");
+        let recorded: String = stream
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter(|r| r.get("type").and_then(Value::as_str) == Some("text-chunks"))
+            .flat_map(|r| {
+                r.get("texts")
+                    .and_then(Value::as_array)
+                    .map(|t| t.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(
+            recorded, "Here is **bold** text",
+            "the stream record keeps the deltas as they arrived"
+        );
+    }
+
+    /// A tool-call block is never stitched, even mid-fragment.
+    ///
+    /// Its fragments are JSON, and a markdown repairer over JSON produces
+    /// arguments the client cannot parse — the failure the prose check exists to
+    /// prevent, asserted here through the live path rather than only in the
+    /// markdown module's own unit test.
+    #[test]
+    fn a_tool_call_fragment_is_forwarded_unstitched() {
+        const BODY: &str = concat!(
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null,",
+            "\"index\":0}],\"created\":1,\"id\":\"c\",\"model\":\"m\",\"object\":\"chat.completion.chunk\"}\n\n",
+            // Arguments containing a markdown-lookalike that a repairer would
+            // rewrite: an unclosed bold marker and an open fence.
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",",
+            "\"function\":{\"name\":\"write\",\"arguments\":\"{\\\"body\\\":\\\"**unclosed\"}}]},",
+            "\"finish_reason\":null,\"index\":0}],\"created\":1,\"id\":\"c\",\"model\":\"m\",",
+            "\"object\":\"chat.completion.chunk\"}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\",\"index\":0}],",
+            "\"created\":1,\"id\":\"c\",\"model\":\"m\",\"object\":\"chat.completion.chunk\"}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let session_id = "session-1";
+        let (_home, sessions) = session_home(session_id);
+        let mut machine = AgentMachine::new(sessions.clone(), vec![canned_provider(BODY)]);
+        let _ = machine.handle(MachineIn::ServicesReady { keys: vec![] });
+
+        let (_, during) = drive_collecting(
+            &mut machine,
+            MachineIn::Event {
+                name: vocoder_cordis::EventName::new(rpc::call_event("agent")),
+                payload: json!({
+                    "method": "run",
+                    "args": {
+                        "sessionId": session_id,
+                        "requestId": "req-tool",
+                        "content": [{ "type": "text", "text": "go" }],
+                    },
+                }),
+            },
+        );
+        let frames = stream_frames(&during);
+        let args: Vec<&str> = frames
+            .iter()
+            .filter_map(|f| f.pointer("/chunk"))
+            .filter(|c| c.get("type").and_then(Value::as_str) == Some("tool-call-delta"))
+            .filter_map(|c| c.get("argumentsDelta").and_then(Value::as_str))
+            .collect();
+        let joined = args.concat();
+        assert!(
+            joined.contains("**unclosed"),
+            "the argument fragment arrives verbatim: {joined:?}"
+        );
+        assert!(
+            !joined.contains("**unclosed**"),
+            "a tool argument must not be markdown-repaired: {joined:?}"
+        );
     }
 }

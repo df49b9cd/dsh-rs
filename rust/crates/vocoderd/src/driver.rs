@@ -37,15 +37,49 @@ fn io_err(e: &std::io::Error) -> EffectError {
     }
 }
 
-/// Perform one effect. Returns `None` for driver-local effects (logging,
-/// socket writes, stream routing) that produce no machine answer — those are
-/// terminal for the machine that emitted them.
+/// Perform one effect, forwarding a streaming effect's intermediate bytes to
+/// `sink` as they arrive.
+///
+/// The sink is called *during* the effect, on this thread, with however many
+/// bytes one read returned — so a streaming caller must be able to accept a
+/// chunk at any byte boundary, including one that splits a UTF-8 character or
+/// an SSE frame in half. Both decoders downstream work on bytes or accumulate,
+/// so neither cares where the reads fell.
+///
+/// A sink that is never called means the effect had nothing to stream (every
+/// non-streaming effect), so a caller with nowhere to put progress passes
+/// `&mut |_| {}` and is unaffected.
+///
+/// Returns `None` for driver-local effects (logging, socket writes, stream
+/// routing) that produce no machine answer — those are terminal for the machine
+/// that emitted them.
 ///
 /// Synchronous `std::fs` is deliberate: the effects are small, and it keeps
 /// the machine contract pure (`handle` stays sync, no `async_trait` on
 /// machines). Were these to become slow (network, subprocess), this would move
 /// behind `spawn_blocking` without changing a single machine.
-pub fn realize(request: RealizeRequest) -> Option<EffectResult> {
+pub fn realize_with(
+    request: RealizeRequest,
+    sink: &mut dyn FnMut(Vec<u8>),
+) -> Option<EffectResult> {
+    // A `canned://` provider route is answered from the file it names rather
+    // than the network, so a whole turn is testable hermetically. It is handled
+    // here, in front of the real effect, rather than in a test-local copy of the
+    // loop: the copy was free to skip the chunk deliveries, which would have
+    // made every streaming assertion vacuous.
+    #[cfg(test)]
+    if let RealizeRequest::FetchJson { url, .. } | RealizeRequest::FetchStream { url, .. } =
+        &request
+        && let Some(body) = canned_body(url)
+    {
+        // Streamed in slices, not handed over whole: a canned body that skipped
+        // the sink would leave the incremental path untested for every
+        // non-live test, which is the same vacuity one level down.
+        for piece in body.as_bytes().chunks(64) {
+            sink(piece.to_vec());
+        }
+        return Some(EffectResult::HttpResponse { status: 200, body });
+    }
     Some(match request {
         // Driver-local: no answer goes back to the machine.
         RealizeRequest::Log { level, message } => {
@@ -174,7 +208,34 @@ pub fn realize(request: RealizeRequest) -> Option<EffectResult> {
             Ok((status, text)) => EffectResult::HttpResponse { status, body: text },
             Err(e) => EffectResult::Failed(EffectError::Other(e)),
         },
+        // Same request, read as it arrives. The body is returned as well, so a
+        // machine may stream *and* keep the whole thing; the agent does both
+        // (chunks for display, body for the durable record).
+        RealizeRequest::FetchStream { url, headers, body } => {
+            match fetch_streaming(&url, &headers, &body, sink) {
+                Ok((status, text)) => EffectResult::HttpResponse { status, body: text },
+                Err(e) => EffectResult::Failed(EffectError::Other(e)),
+            }
+        }
     })
+}
+
+/// The canned body a `canned://<dir>` route names, if any.
+///
+/// `ProviderConfig::url` appends the dialect's own path, so the directory has to
+/// be recovered by stripping it back off — stripping one component would leave
+/// `/chat` on the end and look in a directory that does not exist.
+#[cfg(test)]
+fn canned_body(url: &str) -> Option<String> {
+    let dir = url.strip_prefix("canned://")?;
+    let mut dir = dir.to_string();
+    for suffix in ["/chat/completions", "/responses", "/messages"] {
+        if let Some(stripped) = dir.strip_suffix(suffix) {
+            dir = stripped.to_string();
+            break;
+        }
+    }
+    std::fs::read_to_string(format!("{dir}/body.txt")).ok()
 }
 
 /// Per-request timeout for a provider call.
@@ -202,6 +263,73 @@ fn fetch_json(
     headers: &[(String, String)],
     body: &str,
 ) -> Result<(u16, String), String> {
+    let response = post(url, headers, body)?;
+    let status = response.status().as_u16();
+    response
+        .into_body()
+        .read_to_string()
+        .map(|text| (status, text))
+        .map_err(|e| format!("read response body: {e}"))
+}
+
+/// Byte size of one read from a streaming body.
+///
+/// The body is read in fixed slices rather than with `read_to_end` so each
+/// slice can be handed to the sink the moment it lands. The size is a
+/// throughput/latency knob and nothing more: correctness never depends on where
+/// a read boundary falls, because the sink accepts an arbitrary byte boundary
+/// and the SSE decoder downstream is incremental over bytes.
+const STREAM_READ_CHUNK: usize = 8 * 1024;
+
+/// POST a JSON body and read the response incrementally, handing each slice to
+/// `sink` as it arrives. Returns `(status, whole_body)`.
+///
+/// The body is accumulated as well as streamed, because both consumers need it:
+/// the sink renders the model's text live, and the returned body is what the
+/// session log records. Dropping the accumulation to "save" the copy would mean
+/// the durable record had to be rebuilt from the display feed, which is exactly
+/// the coupling the markdown module exists to prevent.
+///
+/// A read error mid-stream is a failure, not a truncated success: a provider
+/// stream that stopped early must not be recorded as a complete answer.
+fn fetch_streaming(
+    url: &str,
+    headers: &[(String, String)],
+    body: &str,
+    sink: &mut dyn FnMut(Vec<u8>),
+) -> Result<(u16, String), String> {
+    use std::io::Read;
+    let response = post(url, headers, body)?;
+    let status = response.status().as_u16();
+    let mut reader = response.into_body().into_reader();
+    let mut buf = vec![0u8; STREAM_READ_CHUNK];
+    let mut all: Vec<u8> = Vec::new();
+    loop {
+        match reader.read(&mut buf) {
+            // EOF.
+            Ok(0) => break,
+            Ok(n) => {
+                let slice = &buf[..n];
+                sink(slice.to_vec());
+                all.extend_from_slice(slice);
+            }
+            Err(e) => return Err(format!("read response body: {e}")),
+        }
+    }
+    // Lossy on purpose, and deliberately so: a provider that emits invalid
+    // UTF-8 mid-stream should cost the caller that character, not the whole
+    // turn. The buffered path is lossy too (ureq's `Body::read_to_string`), so
+    // the two agree on the malformed case rather than diverging on it.
+    Ok((status, String::from_utf8_lossy(&all).into_owned()))
+}
+
+/// Build and send one POST, shared by the buffered and streaming reads so the
+/// two cannot drift on headers, timeout, or status handling.
+fn post(
+    url: &str,
+    headers: &[(String, String)],
+    body: &str,
+) -> Result<ureq::http::Response<ureq::Body>, String> {
     // `Agent` is ureq's connection pool; building one per call is deliberate at
     // this stage (calls are rare and a shared agent would need a lifetime to
     // manage), and cheap enough that it is not the bottleneck.
@@ -217,13 +345,7 @@ fn fetch_json(
     for (name, value) in headers {
         request = request.header(name, value);
     }
-    let response = request.send(body).map_err(|e| format!("{e}"))?;
-    let status = response.status().as_u16();
-    response
-        .into_body()
-        .read_to_string()
-        .map(|text| (status, text))
-        .map_err(|e| format!("read response body: {e}"))
+    request.send(body).map_err(|e| format!("{e}"))
 }
 
 /// Every file beneath `root`, as absolute paths, sorted.
@@ -398,27 +520,64 @@ pub fn drive(
     machine: &mut dyn PluginMachine<In = MachineIn, Out = MachineOut>,
     input: MachineIn,
 ) -> Vec<MachineOut> {
-    let mut terminal: Vec<MachineOut> = Vec::new();
-    let mut pending = Some(input);
-    for _ in 0..MAX_EFFECTS_PER_INPUT {
-        let Some(next) = pending.take() else { break };
-        let outs = machine.handle(next);
+    drive_with(machine, input, &mut |_| {})
+}
 
-        let mut effects: Vec<(EffectId, RealizeRequest)> = Vec::new();
-        for out in outs {
-            match out {
-                MachineOut::Realize { id, request } => effects.push((id, request)),
-                other => terminal.push(other),
+/// [`drive`], with a hook for the bytes a streaming effect produces.
+///
+/// A test that wants to observe incremental delivery passes a recorder; one that
+/// only cares about the terminal outputs does not, which is why `drive` exists
+/// as the no-op wrapper.
+///
+/// `on_effect` is called as each effect's answer is produced, with the machine's
+/// outputs from the *chunk* deliveries already applied — but it is the *terminal*
+/// outputs that are returned. A test asserting on incremental behaviour reads
+/// what the hook saw, because terminal outputs are by construction the ones that
+/// arrived after the effect, i.e. after the streaming was over.
+#[cfg(test)]
+pub fn drive_with(
+    machine: &mut dyn PluginMachine<In = MachineIn, Out = MachineOut>,
+    input: MachineIn,
+    on_chunk: &mut dyn FnMut(&[MachineOut]),
+) -> Vec<MachineOut> {
+    let mut terminal: Vec<MachineOut> = Vec::new();
+    let mut pending: std::collections::VecDeque<MachineIn> = std::collections::VecDeque::new();
+    let mut todo: Vec<(EffectId, RealizeRequest)> = Vec::new();
+    pending.push_back(input);
+    let mut effects = 0;
+    loop {
+        if let Some(next) = pending.pop_front() {
+            let outs = machine.handle(next);
+            for out in outs {
+                match out {
+                    MachineOut::Realize { id, request } => todo.push((id, request)),
+                    other => terminal.push(other),
+                }
             }
+            continue;
         }
-        if effects.is_empty() {
+        if todo.is_empty() || effects >= MAX_EFFECTS_PER_INPUT {
             break;
         }
+        effects += 1;
         // A machine that awaits several effects issues them one at a time; at
         // most one is awaited per turn, and any others were fire-and-forget.
-        let (id, request) = effects.remove(0);
-        let result = realize(request).unwrap_or(EffectResult::Done);
-        pending = Some(MachineIn::EffectResult { id, result });
+        let (id, request) = todo.remove(0);
+        // Collected because the sink cannot borrow `pending`.
+        let mut during: Vec<Vec<u8>> = Vec::new();
+        let result =
+            realize_with(request, &mut |bytes| during.push(bytes)).unwrap_or(EffectResult::Done);
+        for bytes in during {
+            let chunk_outs = machine.handle(MachineIn::EffectChunk { id, bytes });
+            on_chunk(&chunk_outs);
+            for out in chunk_outs {
+                match out {
+                    MachineOut::Realize { id, request } => todo.push((id, request)),
+                    other => terminal.push(other),
+                }
+            }
+        }
+        pending.push_back(MachineIn::EffectResult { id, result });
     }
     terminal
 }

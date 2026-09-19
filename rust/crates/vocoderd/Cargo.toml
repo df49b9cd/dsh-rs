@@ -16,6 +16,10 @@ vocoder-typert = { path = "../vocoder-typert" }
 # See `machines/provider.rs` for which directions it supplies and which this
 # crate supplies itself.
 llm-dialect = "0.1.3"
+# Closes unterminated markdown as it streams (`**bold` -> `**bold**`), so every
+# intermediate frame a client renders is well-formed. Display-only: see
+# `machines/markdown.rs` for why stitching must never reach the session log.
+mdstitch = "0.1"
 parking_lot = "0.12"
 vocoder-spec-api = { path = "../vocoder-spec-api" }
 vocoder-session = { path = "../vocoder-session" }
