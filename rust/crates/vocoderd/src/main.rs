@@ -2,6 +2,7 @@
 
 #[cfg(test)]
 mod composition;
+mod driver;
 mod machines;
 mod registry;
 mod rpc;
@@ -87,6 +88,55 @@ struct ConnectionHub {
 }
 
 impl AppState {
+    /// Deliver one input to one machine and run the effect loop to quiescence:
+    /// execute each requested effect, feed the answer back, until the machine
+    /// produces a `Reply`/`Stream` (or the cap trips).
+    ///
+    /// Returns the terminal outputs. Machines are pure, so this is the whole
+    /// boundary between protocol logic and the world.
+    fn pump(&self, to: &MachineId, ev: MachineIn) -> Vec<RouteOut> {
+        let mut terminal = Vec::new();
+        let mut pending = Some(ev);
+        for _ in 0..crate::driver::MAX_EFFECTS_PER_INPUT {
+            let Some(input) = pending.take() else { break };
+            let outs = self.router.lock().handle(RouteIn::Deliver {
+                to: to.clone(),
+                ev: input,
+            });
+
+            let mut effects = Vec::new();
+            for out in outs {
+                match out {
+                    RouteOut::Realize { id, request, .. } => effects.push((id, request)),
+                    terminal_out => terminal.push(terminal_out),
+                }
+            }
+            // Route any stream frames immediately; they are not answers.
+            if terminal
+                .iter()
+                .any(|o| matches!(o, RouteOut::Stream { .. }))
+            {
+                let (streams, rest): (Vec<_>, Vec<_>) = terminal
+                    .drain(..)
+                    .partition(|o| matches!(o, RouteOut::Stream { .. }));
+                self.route_stream_outs(streams);
+                terminal = rest;
+            }
+            if effects.is_empty() {
+                break;
+            }
+            // Feed the first answer back; a machine awaiting several effects
+            // issues them one at a time, so at most one is awaited per turn.
+            let (id, request) = effects.remove(0);
+            let result =
+                crate::driver::realize(request).unwrap_or(vocoder_cordis::EffectResult::Done);
+            pending = Some(MachineIn::EffectResult { id, result });
+        }
+        terminal
+    }
+}
+
+impl AppState {
     /// Deliver one encoded stream frame to the owning connection. Returns
     /// true when the frame reached a live connection task.
     fn deliver_frame(&self, stream_id: &str, text: &str) -> bool {
@@ -101,53 +151,46 @@ impl AppState {
         false
     }
 
-    /// Route all stream Realize outputs from one router step to their
-    /// owning connection tasks. Removes the route on end/error.
+    /// Route all stream frames from one router step to their owning connection
+    /// tasks. Removes the route on end/error.
     fn route_stream_outs(&self, outs: Vec<RouteOut>) {
         for out in outs {
-            let RouteOut::Realize {
-                request: vocoder_cordis::RealizeRequest::Raw(v),
-                ..
-            } = out
-            else {
+            let RouteOut::Stream { frame, .. } = out else {
                 continue;
             };
-            let kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or_default();
-            if !matches!(kind, "stream.item" | "stream.end" | "stream.error") {
-                continue;
-            }
-            let Some(stream_id) = v.get("streamId").and_then(|s| s.as_str()) else {
-                continue;
-            };
-            let msg = match kind {
-                "stream.item" => vocoder_typert::StreamServerMessage::Item {
-                    stream_id: stream_id.to_string(),
-                    value: Some(v.get("value").cloned().unwrap_or(serde_json::Value::Null)),
-                },
-                "stream.end" => vocoder_typert::StreamServerMessage::End {
-                    stream_id: stream_id.to_string(),
-                },
-                _ => vocoder_typert::StreamServerMessage::Error {
-                    stream_id: stream_id.to_string(),
+            let msg = match frame {
+                vocoder_cordis::StreamFrame::Item { stream_id, value } => {
+                    vocoder_typert::StreamServerMessage::Item {
+                        stream_id,
+                        value: Some(value),
+                    }
+                }
+                vocoder_cordis::StreamFrame::End { stream_id } => {
+                    vocoder_typert::StreamServerMessage::End { stream_id }
+                }
+                vocoder_cordis::StreamFrame::Error {
+                    stream_id,
+                    name,
+                    message,
+                    details,
+                } => vocoder_typert::StreamServerMessage::Error {
+                    stream_id,
                     error: vocoder_typert::StreamFailure {
-                        name: v
-                            .get("name")
-                            .and_then(|s| s.as_str())
-                            .unwrap_or("RemoteError")
-                            .into(),
-                        message: v
-                            .get("message")
-                            .and_then(|s| s.as_str())
-                            .unwrap_or("stream failed")
-                            .into(),
-                        details: v.get("details").cloned().filter(|d| !d.is_null()),
+                        name,
+                        message,
+                        details: Some(details).filter(|d| !d.is_null()),
                     },
                 },
             };
+            let stream_id = match &msg {
+                vocoder_typert::StreamServerMessage::Item { stream_id, .. }
+                | vocoder_typert::StreamServerMessage::End { stream_id }
+                | vocoder_typert::StreamServerMessage::Error { stream_id, .. } => stream_id.clone(),
+            };
             let text = String::from_utf8(vocoder_typert::encode_stream_server(&msg)).unwrap();
-            let delivered = self.deliver_frame(stream_id, &text);
+            let delivered = self.deliver_frame(&stream_id, &text);
             if delivered && !matches!(msg, vocoder_typert::StreamServerMessage::Item { .. }) {
-                self.streams.lock().remove(stream_id);
+                self.streams.lock().remove(&stream_id);
             }
         }
     }
@@ -190,7 +233,12 @@ async fn main() -> Result<()> {
     });
     initial_router.handle(RouteIn::Mount {
         id: MachineId::new("settings"),
-        machine: Box::new(crate::machines::settings::SettingsMachine::new(&args.home)),
+        // The driver reads the document at boot and hands the machine its
+        // contents: reading is I/O, so it belongs here, not in the machine.
+        machine: Box::new(crate::machines::settings::SettingsMachine::new(
+            &args.home,
+            read_settings_document(&args.home).as_deref(),
+        )),
     });
     initial_router.handle(RouteIn::Mount {
         id: MachineId::new("$events"),
@@ -465,52 +513,46 @@ async fn api_rpc(
         );
     };
 
-    let outs = state.router.lock().handle(RouteIn::Deliver {
-        to: owner_id.clone(),
-        ev: MachineIn::Event {
+    let outs = state.pump(
+        &owner_id,
+        MachineIn::Event {
             name: EventName::new(crate::rpc::call_event(&namespace)),
             payload: serde_json::json!({
                 "method": method,
                 "args": req.payload.get("args").cloned().unwrap_or(serde_json::Value::Null),
             }),
         },
-    });
-    let (stream_outs, rpc_outs): (Vec<_>, Vec<_>) = outs.into_iter().partition(|o| {
-        matches!(&o, RouteOut::Realize { request: vocoder_cordis::RealizeRequest::Raw(v), .. }
-        if matches!(
-            v.get("kind").and_then(|k| k.as_str()),
-            Some("stream.item" | "stream.end" | "stream.error")
-        ))
-    });
-    state.route_stream_outs(stream_outs);
-    let outs = rpc_outs;
-    let _ = owner_id;
+    );
 
     for out in outs {
-        if let RouteOut::Realize { request, .. } = out
-            && let vocoder_cordis::RealizeRequest::Raw(v) = request
-            && v.get("kind").and_then(|k| k.as_str()) == Some("rpc.result")
-        {
-            let result = v["result"].clone();
-            let body = if result["ok"].as_bool() == Some(true) {
-                encode_rpc_server_response(&ServerResponse {
-                    rpc_id: req.rpc_id.clone(),
-                    result: vocoder_typert::RpcResult::Ok {
-                        ok: vocoder_typert::OkTag(true),
-                        value: result["value"].clone(),
-                    },
-                })
-            } else {
-                encode_rpc_server_response(&ServerResponse {
-                    rpc_id: req.rpc_id.clone(),
-                    result: vocoder_typert::RpcResult::Err {
-                        ok: vocoder_typert::OkTag(false),
-                        error: serde_json::from_value(result["error"].clone()).unwrap(),
-                    },
-                })
-            };
-            return (StatusCode::OK, String::from_utf8(body).unwrap());
-        }
+        let RouteOut::Reply { reply, .. } = out else {
+            continue;
+        };
+        let result = match reply {
+            vocoder_cordis::RpcReply::Ok { value } => vocoder_typert::RpcResult::Ok {
+                ok: vocoder_typert::OkTag(true),
+                value,
+            },
+            vocoder_cordis::RpcReply::Err {
+                code,
+                message,
+                details,
+            } => {
+                let mut error = serde_json::json!({ "code": code, "message": message });
+                if let Some(details) = details {
+                    error["details"] = details;
+                }
+                vocoder_typert::RpcResult::Err {
+                    ok: vocoder_typert::OkTag(false),
+                    error: serde_json::from_value(error).unwrap(),
+                }
+            }
+        };
+        let body = encode_rpc_server_response(&ServerResponse {
+            rpc_id: req.rpc_id.clone(),
+            result,
+        });
+        return (StatusCode::OK, String::from_utf8(body).unwrap());
     }
 
     respond_err(
@@ -530,6 +572,12 @@ fn registry_owner_register(
         name: EventName::new(REGISTER_NAMESPACE),
         payload: serde_json::json!({ "namespace": namespace, "owner": owner }),
     });
+}
+
+/// Read `<home>/settings.json` for the settings machine's constructor.
+/// Absent or unreadable is `None`; the machine treats that as an empty document.
+fn read_settings_document(home: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(home.join("settings.json")).ok()
 }
 
 fn boot_script(args: &ServeArgs) -> String {

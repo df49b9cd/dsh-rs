@@ -23,30 +23,31 @@ pub fn replay_trace(
             payload = payload.replace(&format!("${k}"), v);
         }
         let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
-        let outs = machine.handle(MachineIn::Event {
-            name: EventName::new(row["event"].as_str().unwrap()),
-            payload,
-        });
+        // Drive through the effect loop: a traced step may need filesystem
+        // effects, and the machine suspends on them.
+        let outs = crate::driver::drive(
+            machine,
+            MachineIn::Event {
+                name: EventName::new(row["event"].as_str().unwrap()),
+                payload,
+            },
+        );
         let result = outs.iter().find_map(|o| {
-            if let MachineOut::Realize(vocoder_cordis::RealizeRequest::Raw(v)) = o
-                && v.get("kind").and_then(|k| k.as_str()) == Some("rpc.result")
-            {
-                return Some(v["result"].clone());
+            if let MachineOut::Reply(reply) = o {
+                return Some(reply.clone());
             }
             None
         });
         let expect = &row["expect"];
         match expect["result"].as_str() {
             Some("ok") => {
-                let r = result.clone().expect("expected an rpc.result row");
-                assert!(
-                    r["ok"].as_bool().unwrap_or(false),
-                    "line {}: expected ok, got {r}",
-                    line_no + 1
-                );
+                let reply = result.clone().expect("expected an rpc reply row");
+                let vocoder_cordis::RpcReply::Ok { value } = reply else {
+                    panic!("line {}: expected ok, got {reply:?}", line_no + 1);
+                };
                 if let Some(capture) = expect["capture"].as_object() {
                     for (var, path) in capture {
-                        let mut cur = &r["value"];
+                        let mut cur = &value;
                         for seg in path.as_str().unwrap().split('.') {
                             cur = &cur[seg];
                         }
@@ -60,15 +61,12 @@ pub fn replay_trace(
                 }
             }
             Some("err") => {
-                let r = result.expect("expected an rpc.result row");
-                assert_eq!(r["ok"].as_bool(), Some(false), "line {}", line_no + 1);
-                if let Some(code) = expect["code"].as_str() {
-                    assert_eq!(
-                        r["error"]["code"].as_str(),
-                        Some(code),
-                        "line {}",
-                        line_no + 1
-                    );
+                let reply = result.expect("expected an rpc reply row");
+                let vocoder_cordis::RpcReply::Err { code, .. } = reply else {
+                    panic!("line {}: expected err, got {reply:?}", line_no + 1);
+                };
+                if let Some(expected) = expect["code"].as_str() {
+                    assert_eq!(code, expected, "line {}", line_no + 1);
                 }
             }
             other => panic!("line {}: unknown expect {other:?}", line_no + 1),

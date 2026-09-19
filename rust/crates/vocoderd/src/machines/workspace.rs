@@ -5,7 +5,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use vocoder_cordis::{MachineIn, MachineOut, PluginMachine};
+use vocoder_cordis::{
+    EffectId, EffectResult, MachineIn, MachineOut, PluginMachine, RealizeRequest,
+};
 
 use crate::machines::session::SessionStore;
 use crate::registry::{WorkspaceRecord, WorkspaceRegistryStore};
@@ -16,6 +18,19 @@ pub struct WorkspaceMachine {
     sessions: SessionStore,
     /// Live `workspace/follow` stream ids (baseline already sent).
     follow_streams: Vec<String>,
+    /// Monotonic effect-id counter; see [`WorkspaceMachine::next_effect`].
+    effects: u64,
+    /// An operation suspended on an effect. `create` awaits a `Stat` before it
+    /// can canonicalize the path it persists, which is the only effect-awaiting
+    /// path in this namespace today.
+    pending: Option<PendingCreate>,
+}
+
+/// A `workspace/create` waiting on its `Stat` effect.
+struct PendingCreate {
+    effect: EffectId,
+    /// The path exactly as the client sent it (for error details).
+    requested: String,
 }
 
 impl WorkspaceMachine {
@@ -24,7 +39,16 @@ impl WorkspaceMachine {
             registry,
             sessions: SessionStore::new(session_root),
             follow_streams: Vec::new(),
+            effects: 0,
+            pending: None,
         }
+    }
+
+    /// Claim the next effect id for this machine.
+    fn next_effect(&mut self) -> EffectId {
+        let id = EffectId::nth(self.effects);
+        self.effects += 1;
+        id
     }
 
     /// Broadcast a WorkspaceFollowIncrement to every live follow stream.
@@ -100,14 +124,10 @@ fn view_of(id: &str, r: &crate::registry::WorkspaceRecord) -> serde_json::Value 
     })
 }
 
-/// Extract `result.value.workspace` from a Raw rpc.ok output, if present.
+/// Extract `result.value.workspace` from a `rpc::ok` reply, if present.
 fn created_view(out: &MachineOut) -> Option<serde_json::Value> {
-    if let MachineOut::Realize(vocoder_cordis::RealizeRequest::Raw(v)) = out {
-        return v
-            .get("result")
-            .and_then(|r| r.get("value"))
-            .and_then(|v| v.get("workspace"))
-            .cloned();
+    if let MachineOut::Reply(vocoder_cordis::RpcReply::Ok { value }) = out {
+        return value.get("workspace").cloned();
     }
     None
 }
@@ -117,6 +137,15 @@ impl PluginMachine for WorkspaceMachine {
     type Out = MachineOut;
 
     fn handle(&mut self, ev: MachineIn) -> Vec<MachineOut> {
+        // Resume a suspended operation before anything else: its input carries
+        // no event name to dispatch on.
+        if let MachineIn::EffectResult { id, result } = ev {
+            let Some(pending) = self.pending.take() else {
+                return vec![];
+            };
+            debug_assert_eq!(pending.effect, id, "workspace: effect id mismatch");
+            return self.resume_create(&pending.requested, result);
+        }
         let MachineIn::Event { name, payload } = &ev else {
             return vec![];
         };
@@ -182,27 +211,63 @@ impl WorkspaceMachine {
         vec![rpc::stream_item(stream_id, baseline)]
     }
 
+    /// `workspace/create`. Two phases, because resolving the path needs the
+    /// driver (canonicalize + is-dir): phase 1 requests the `Stat` effect, and
+    /// the answer resumes in [`Self::resume_create`].
     fn create(&mut self, req: &serde_json::Value) -> Vec<MachineOut> {
         let Some(path) = req.get("path").and_then(|v| v.as_str()) else {
             return rpc::err("gateway/bad-request", "missing path");
         };
-        let canon = std::fs::canonicalize(path);
-        let Ok(canon) = canon else {
-            return rpc::err_details(
-                "workspace/invalid-path",
-                format!("not a resolvable directory: {path}"),
-                serde_json::json!({ "path": path }),
-            );
+        let id = self.next_effect();
+        self.pending = Some(PendingCreate {
+            effect: id,
+            requested: path.to_string(),
+        });
+        vec![rpc::effect(
+            id,
+            RealizeRequest::Stat {
+                path: path.to_string(),
+            },
+        )]
+    }
+
+    /// Complete a `workspace/create` once the driver has resolved the path.
+    fn resume_create(&mut self, requested: &str, result: EffectResult) -> Vec<MachineOut> {
+        let canonical = match result {
+            EffectResult::Stat {
+                canonical, is_dir, ..
+            } => {
+                if !is_dir {
+                    return rpc::err_details(
+                        "workspace/invalid-path",
+                        format!("not a directory: {requested}"),
+                        serde_json::json!({ "path": requested }),
+                    );
+                }
+                canonical
+            }
+            EffectResult::Failed(e) => {
+                // A missing path is the client's error; anything else is ours.
+                if e == vocoder_cordis::EffectError::NotFound {
+                    return rpc::err_details(
+                        "workspace/invalid-path",
+                        format!("not a resolvable directory: {requested}"),
+                        serde_json::json!({ "path": requested }),
+                    );
+                }
+                return rpc::err(
+                    "gateway/internal",
+                    format!("resolving workspace path: {}", e.message()),
+                );
+            }
+            _ => {
+                return rpc::err(
+                    "gateway/internal",
+                    "workspace/create got an unexpected effect result",
+                );
+            }
         };
-        let meta = std::fs::metadata(&canon).unwrap();
-        if !meta.is_dir() {
-            return rpc::err_details(
-                "workspace/invalid-path",
-                format!("not a directory: {path}"),
-                serde_json::json!({ "path": path }),
-            );
-        }
-        let path = canon.to_string_lossy().to_string();
+        let path = canonical;
 
         let result = self.registry.mutate(|d| {
             // Idempotent by canonical path.

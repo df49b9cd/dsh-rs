@@ -126,11 +126,14 @@ mod tests {
                 "args": merged_args(agent, args),
             }),
         });
-        let out = match &outs[0] {
-            MachineOut::Realize(vocoder_cordis::RealizeRequest::Raw(v)) => v.clone(),
-            _ => panic!("expected Raw"),
-        };
-        serde_json::to_string(&out["result"]).unwrap()
+        let reply = outs
+            .iter()
+            .find_map(|o| match o {
+                MachineOut::Reply(r) => Some(r.clone()),
+                _ => None,
+            })
+            .expect("expected a reply");
+        reply.to_wire_json().to_string()
     }
 
     #[test]

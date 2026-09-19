@@ -3,11 +3,15 @@
 //! The driver decodes the HTTP envelope and delivers one generic event to
 //! the owning namespace machine: EventName = "vocoder/{namespace}/call",
 //! payload = {"method": "<m>", "args": {…}}. The machine answers with one
-//! rpc.result Realize. Args mirror the Typert wire: payload.args keyed by
+//! `MachineOut::Reply`. Args mirror the Typert wire: payload.args keyed by
 //! the parameter's wire name (packages/api/gateway invokes remotes with
 //! {args}).
+//!
+//! Outputs are typed (`RpcReply` / `StreamFrame`) rather than JSON tagged with
+//! a `"kind"` field, so the driver's match over them is exhaustive and a new
+//! output shape cannot be silently ignored.
 
-use vocoder_cordis::{MachineOut, RealizeRequest};
+use vocoder_cordis::{EffectId, MachineOut, RealizeRequest, RpcReply, StreamFrame};
 
 /// The event name a namespace machine listens on.
 pub fn call_event(namespace: &str) -> String {
@@ -27,20 +31,18 @@ pub fn stream_close_event(namespace: &str) -> String {
 
 /// Emit one stream item frame to the client.
 pub fn stream_item(stream_id: &str, value: serde_json::Value) -> MachineOut {
-    MachineOut::Realize(RealizeRequest::Raw(serde_json::json!({
-        "kind": "stream.item",
-        "streamId": stream_id,
-        "value": value,
-    })))
+    MachineOut::Stream(StreamFrame::Item {
+        stream_id: stream_id.to_string(),
+        value,
+    })
 }
 
 /// Terminate a stream normally.
 #[allow(dead_code)] // streams stay open in the current profiles; used by future machines
 pub fn stream_end(stream_id: &str) -> MachineOut {
-    MachineOut::Realize(RealizeRequest::Raw(serde_json::json!({
-        "kind": "stream.end",
-        "streamId": stream_id,
-    })))
+    MachineOut::Stream(StreamFrame::End {
+        stream_id: stream_id.to_string(),
+    })
 }
 
 /// Terminate a stream with a RemoteError-shaped failure. The Typert error
@@ -55,33 +57,35 @@ pub fn stream_error(
     if let Some(obj) = details.as_object_mut() {
         obj.insert("code".into(), code.into());
     }
-    MachineOut::Realize(RealizeRequest::Raw(serde_json::json!({
-        "kind": "stream.error",
-        "streamId": stream_id,
-        "name": "RemoteError",
-        "message": message.into(),
-        "details": details,
-    })))
+    MachineOut::Stream(StreamFrame::Error {
+        stream_id: stream_id.to_string(),
+        name: "RemoteError".into(),
+        message: message.into(),
+        details,
+    })
+}
+
+/// Request one effect from the driver, tagged with this machine's id for it.
+///
+/// `id` must be unique per machine and stable across replays; see
+/// [`EffectId`]. Machines that await the answer track it against the id they
+/// passed here.
+pub fn effect(id: EffectId, request: RealizeRequest) -> MachineOut {
+    MachineOut::Realize { id, request }
 }
 
 /// Success result output.
 pub fn ok(value: serde_json::Value) -> Vec<MachineOut> {
-    vec![MachineOut::Realize(RealizeRequest::Raw(
-        serde_json::json!({
-            "kind": "rpc.result",
-            "result": { "ok": true, "value": value },
-        }),
-    ))]
+    vec![MachineOut::Reply(RpcReply::Ok { value })]
 }
 
 /// Failure result; code is a Typert RemoteError code.
 pub fn err(code: &str, message: impl Into<String>) -> Vec<MachineOut> {
-    vec![MachineOut::Realize(RealizeRequest::Raw(
-        serde_json::json!({
-            "kind": "rpc.result",
-            "result": { "ok": false, "error": { "code": code, "message": message.into() } },
-        }),
-    ))]
+    vec![MachineOut::Reply(RpcReply::Err {
+        code: code.to_string(),
+        message: message.into(),
+        details: None,
+    })]
 }
 
 /// Failure with a typed details payload (RemoteErrorDetailsMap entries).
@@ -90,12 +94,11 @@ pub fn err_details(
     message: impl Into<String>,
     details: serde_json::Value,
 ) -> Vec<MachineOut> {
-    vec![MachineOut::Realize(RealizeRequest::Raw(
-        serde_json::json!({
-            "kind": "rpc.result",
-            "result": { "ok": false, "error": { "code": code, "message": message.into(), "details": details } },
-        }),
-    ))]
+    vec![MachineOut::Reply(RpcReply::Err {
+        code: code.to_string(),
+        message: message.into(),
+        details: Some(details),
+    })]
 }
 
 /// Extract a string arg.

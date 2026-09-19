@@ -335,10 +335,13 @@ fn realize_requests_surface_to_the_driver() {
         &mut r,
         "noisy",
         Scripted::new(|ev| match ev {
-            MachineIn::ServicesReady { .. } => vec![MachineOut::Realize(RealizeRequest::Log {
-                level: "info".into(),
-                message: "booted".into(),
-            })],
+            MachineIn::ServicesReady { .. } => vec![MachineOut::Realize {
+                id: EffectId::nth(0),
+                request: RealizeRequest::Log {
+                    level: "info".into(),
+                    message: "booted".into(),
+                },
+            }],
             _ => vec![],
         }),
     );
@@ -350,6 +353,7 @@ fn realize_requests_surface_to_the_driver() {
         outs,
         vec![RouteOut::Realize {
             from: MachineId::new("noisy"),
+            id: EffectId::nth(0),
             request: RealizeRequest::Log {
                 level: "info".into(),
                 message: "booted".into()

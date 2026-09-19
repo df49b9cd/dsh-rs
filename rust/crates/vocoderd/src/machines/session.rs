@@ -1065,7 +1065,7 @@ mod tests {
         );
         let wd = tempfile::tempdir().unwrap();
         let wc = {
-            let outs = PluginMachine::handle(
+            let outs = crate::driver::drive(
                 &mut w,
                 MachineIn::Event {
                     name: EventName::new(rpc::call_event("workspace")),
@@ -1075,10 +1075,17 @@ mod tests {
                     }),
                 },
             );
-            let MachineOut::Realize(vocoder_cordis::RealizeRequest::Raw(v)) = &outs[0] else {
-                panic!()
+            let reply = outs
+                .iter()
+                .find_map(|o| match o {
+                    MachineOut::Reply(r) => Some(r.clone()),
+                    _ => None,
+                })
+                .expect("expected a reply");
+            let vocoder_cordis::RpcReply::Ok { value } = reply else {
+                panic!("workspace create failed: {reply:?}")
             };
-            v["result"]["value"]["workspace"]["workspaceId"]
+            value["workspace"]["workspaceId"]
                 .as_str()
                 .unwrap()
                 .to_string()
@@ -1114,24 +1121,38 @@ mod tests {
                     payload: serde_json::json!({ "method": "follow", "args": {} }),
                 },
             );
-            let MachineOut::Realize(vocoder_cordis::RealizeRequest::Raw(v)) = &outs[0] else {
-                panic!()
-            };
-            v.clone()
+            match &outs[0] {
+                MachineOut::Stream(vocoder_cordis::StreamFrame::Item { value, .. }) => {
+                    value.clone()
+                }
+                // The unary `follow` answers with the baseline as its ok-value;
+                // the streaming form is the mux `stream_open` path.
+                MachineOut::Reply(rpc) => rpc.to_wire_json()["value"].clone(),
+                other => panic!("expected a baseline, got {other:?}"),
+            }
         };
-        let ids = &f["result"]["value"]["value"]["items"][0]["sessionIds"];
+        let ids = &f["value"]["items"][0]["sessionIds"];
         assert!(ids.as_array().unwrap().iter().any(|s| s == &sid));
     }
 
+    /// Drive one session call through the real effect loop (the machine
+    /// suspends on filesystem effects) and return its reply as JSON.
     fn call(m: &mut SessionMachine, method: &str, args: serde_json::Value) -> serde_json::Value {
-        let outs = m.handle(MachineIn::Event {
-            name: EventName::new(rpc::call_event("session")),
-            payload: serde_json::json!({ "method": method, "args": args }),
-        });
-        let MachineOut::Realize(vocoder_cordis::RealizeRequest::Raw(v)) = &outs[0] else {
-            panic!("expected Raw");
-        };
-        v["result"].clone()
+        let outs = crate::driver::drive(
+            m,
+            MachineIn::Event {
+                name: EventName::new(rpc::call_event("session")),
+                payload: serde_json::json!({ "method": method, "args": args }),
+            },
+        );
+        let reply = outs
+            .iter()
+            .find_map(|o| match o {
+                MachineOut::Reply(r) => Some(r.clone()),
+                _ => None,
+            })
+            .expect("expected a reply");
+        reply.to_wire_json()
     }
 
     #[test]

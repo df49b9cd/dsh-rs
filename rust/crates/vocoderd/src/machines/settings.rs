@@ -11,7 +11,9 @@
 
 use std::path::PathBuf;
 
-use vocoder_cordis::{MachineIn, MachineOut, PluginMachine};
+use vocoder_cordis::{
+    EffectId, EffectResult, MachineIn, MachineOut, PluginMachine, RealizeRequest,
+};
 
 use crate::rpc;
 
@@ -127,14 +129,27 @@ pub struct SettingsMachine {
     document: Document,
     /// Composed base layers (later, profile injections).
     bases: std::collections::BTreeMap<String, serde_json::Value>,
+    /// Whether the settings document exists on disk. Tracked as state rather
+    /// than probed, because a machine may not touch the filesystem; the driver
+    /// supplies the initial answer and this flips true after a write.
+    has_document: bool,
+    /// Monotonic effect-id counter; see [`SettingsMachine::next_effect`].
+    effects: u64,
+    /// A mutation suspended on its write effect (the namespace whose new view
+    /// the reply carries once the write is confirmed).
+    pending_write: Option<(EffectId, String)>,
 }
 
 impl SettingsMachine {
-    pub fn new(home: &std::path::Path) -> Self {
-        let file = home.join("settings.json");
-        let document = std::fs::read_to_string(&file)
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+    /// Build from the document the driver read at boot.
+    ///
+    /// `contents` is the raw `settings.json` text, or `None` if the file does
+    /// not exist. Parsing lives here (it is pure); reading lives in the driver.
+    /// A malformed document is treated as absent, matching the previous
+    /// read-parse-or-default behavior.
+    pub fn new(home: &std::path::Path, contents: Option<&str>) -> Self {
+        let document = contents
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
             .map(|v| {
                 let mut d = Document::default();
                 if let Some(map) = v.get("sections").and_then(|s| s.as_object()) {
@@ -153,22 +168,39 @@ impl SettingsMachine {
             })
             .unwrap_or_default();
         Self {
-            file,
+            file: home.join("settings.json"),
             document,
             bases: std::collections::BTreeMap::new(),
+            has_document: contents.is_some(),
+            effects: 0,
+            pending_write: None,
         }
     }
 
-    fn persist(&self) -> Result<(), String> {
-        if let Some(parent) = self.file.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
+    /// Claim the next effect id for this machine.
+    fn next_effect(&mut self) -> EffectId {
+        let id = EffectId::nth(self.effects);
+        self.effects += 1;
+        id
+    }
+
+    /// Ask the driver to persist the document. Suspends the caller: the reply
+    /// is only produced once the write is confirmed, so a failed write still
+    /// surfaces as `gateway/internal` rather than a silent success.
+    fn persist(&mut self, ns: &str) -> Vec<MachineOut> {
         let body = serde_json::json!({
             "sections": self.document.sections,
             "revisions": self.document.revisions,
         });
-        std::fs::write(&self.file, serde_json::to_string_pretty(&body).unwrap())
-            .map_err(|e| e.to_string())
+        let id = self.next_effect();
+        self.pending_write = Some((id, ns.to_string()));
+        vec![rpc::effect(
+            id,
+            RealizeRequest::WriteText {
+                path: self.file.to_string_lossy().to_string(),
+                contents: serde_json::to_string_pretty(&body).unwrap(),
+            },
+        )]
     }
 
     fn view_of(&self, ns: &str) -> serde_json::Value {
@@ -247,10 +279,7 @@ impl SettingsMachine {
         }
         self.document.sections.insert(ns.to_string(), section);
         self.document.revisions.insert(ns.to_string(), current + 1);
-        if let Err(e) = self.persist() {
-            return rpc::err("gateway/internal", format!("persisting settings: {e}"));
-        }
-        rpc::ok(self.view_of(ns))
+        self.persist(ns)
     }
 }
 
@@ -259,6 +288,28 @@ impl PluginMachine for SettingsMachine {
     type Out = MachineOut;
 
     fn handle(&mut self, ev: MachineIn) -> Vec<MachineOut> {
+        // Resume a suspended write before dispatching: its input has no event
+        // name, and the reply it owes is for the earlier call.
+        if let MachineIn::EffectResult { id, result } = ev {
+            let Some((pending, ns)) = self.pending_write.take() else {
+                return vec![];
+            };
+            debug_assert_eq!(pending, id, "settings: effect id mismatch");
+            return match result {
+                EffectResult::Done => {
+                    self.has_document = true;
+                    rpc::ok(self.view_of(&ns))
+                }
+                EffectResult::Failed(e) => rpc::err(
+                    "gateway/internal",
+                    format!("persisting settings: {}", e.message()),
+                ),
+                _ => rpc::err(
+                    "gateway/internal",
+                    "settings write got an odd effect result",
+                ),
+            };
+        }
         let MachineIn::Event { name, payload } = &ev else {
             return vec![];
         };
@@ -283,7 +334,7 @@ impl PluginMachine for SettingsMachine {
                     names.iter().map(|ns| self.view_of(ns)).collect();
                 rpc::ok(serde_json::json!({
                     "writable": true,
-                    "hasDocument": self.file.exists(),
+                    "hasDocument": self.has_document,
                     "namespaces": namespaces,
                 }))
             }
@@ -360,20 +411,26 @@ mod tests {
     use vocoder_cordis::EventName;
 
     fn call(m: &mut SettingsMachine, method: &str, args: serde_json::Value) -> serde_json::Value {
-        let outs = m.handle(MachineIn::Event {
-            name: EventName::new(rpc::call_event("settings")),
-            payload: serde_json::json!({ "method": method, "args": args }),
-        });
-        let MachineOut::Realize(vocoder_cordis::RealizeRequest::Raw(v)) = &outs[0] else {
-            panic!("expected Raw");
-        };
-        v["result"].clone()
+        crate::driver::drive(
+            m,
+            MachineIn::Event {
+                name: EventName::new(rpc::call_event("settings")),
+                payload: serde_json::json!({ "method": method, "args": args }),
+            },
+        )
+        .iter()
+        .find_map(|o| match o {
+            MachineOut::Reply(r) => Some(r.clone()),
+            _ => None,
+        })
+        .expect("expected a reply")
+        .to_wire_json()
     }
 
     #[test]
     fn update_replace_conflict_flow() {
         let home = tempfile::tempdir().unwrap();
-        let mut m = SettingsMachine::new(home.path());
+        let mut m = SettingsMachine::new(home.path(), None);
         let v = call(
             &mut m,
             "update",
@@ -448,7 +505,7 @@ mod tests {
     #[test]
     fn secrets_are_redacted_and_reported() {
         let home = tempfile::tempdir().unwrap();
-        let mut m = SettingsMachine::new(home.path());
+        let mut m = SettingsMachine::new(home.path(), None);
         let v = call(
             &mut m,
             "update",

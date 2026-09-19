@@ -60,6 +60,119 @@ impl EventName {
 /// deserialize from this envelope themselves.
 pub type Payload = serde_json::Value;
 
+/// Correlation id for an effect the driver performs on a machine's behalf.
+///
+/// Machines assign these (monotonically, per machine) rather than the driver:
+/// a replayed input sequence then produces identical ids, which is what makes
+/// effect-awaiting machines replayable. A driver-assigned id would make the
+/// composition-replay axis order-dependent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EffectId(pub u64);
+
+impl EffectId {
+    /// The id a machine should use for its `n`th effect (0-based).
+    pub fn nth(n: u64) -> Self {
+        Self(n)
+    }
+}
+
+/// Why an effect failed. Distinguishing "absent" from "broken" is load-bearing:
+/// settings treats a missing file as "default document" but a malformed one as
+/// an error, and workspace maps a missing path to `workspace/invalid-path`
+/// while an I/O failure is a gateway error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EffectError {
+    /// The path does not exist (ENOENT).
+    NotFound,
+    /// Any other failure, with a rendered message.
+    Other(String),
+}
+
+impl EffectError {
+    /// Render as the message the current in-machine `std::fs` call sites
+    /// produce, so observable error text is unchanged by the migration.
+    pub fn message(&self) -> String {
+        match self {
+            EffectError::NotFound => "No such file or directory (os error 2)".into(),
+            EffectError::Other(m) => m.clone(),
+        }
+    }
+}
+
+/// What the driver observed when performing an effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EffectResult {
+    /// `ReadText` succeeded.
+    Text(String),
+    /// `ListDir` succeeded: the immediate entry names, sorted.
+    Entries(Vec<String>),
+    /// `Stat` succeeded. `canonical` is the resolved realpath.
+    Stat { canonical: String, is_dir: bool },
+    /// `WriteText` / `CreateDirAll` succeeded.
+    Done,
+    /// The effect failed.
+    Failed(EffectError),
+}
+
+/// A unary RPC answer. The driver pairs this with the request it is currently
+/// serving (one delivered call yields exactly one answer), so — unlike effects —
+/// no correlation id is needed.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RpcReply {
+    Ok {
+        value: Payload,
+    },
+    Err {
+        /// A Typert `RemoteError` code, e.g. `session/not-found`.
+        code: String,
+        message: String,
+        /// `RemoteErrorDetailsMap` entries.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        details: Option<Payload>,
+    },
+}
+
+impl RpcReply {
+    /// The `{ok: true, value}` / `{ok: false, error}` body the Typert wire
+    /// carries, as JSON. Test helpers and the driver both need this shape.
+    pub fn to_wire_json(&self) -> Payload {
+        match self {
+            RpcReply::Ok { value } => serde_json::json!({ "ok": true, "value": value }),
+            RpcReply::Err {
+                code,
+                message,
+                details,
+            } => {
+                let mut error = serde_json::json!({ "code": code, "message": message });
+                if let Some(details) = details {
+                    error["details"] = details.clone();
+                }
+                serde_json::json!({ "ok": false, "error": error })
+            }
+        }
+    }
+}
+
+/// One frame on a logical stream (`session/follow`, `workspace/follow`, …).
+#[derive(Debug, Clone, PartialEq)]
+pub enum StreamFrame {
+    Item {
+        stream_id: String,
+        value: Payload,
+    },
+    End {
+        stream_id: String,
+    },
+    /// Failure termination, shaped like a Typert `RemoteError`.
+    Error {
+        stream_id: String,
+        name: String,
+        message: String,
+        details: Payload,
+    },
+}
+
 /// Dispatch mode of an emitted event, mirroring Cordis. `Serial` and
 /// `Parallel` are awaited variants over the same wiring and belong to the
 /// async driver (`vocoderd`), not to this pure core.
@@ -96,6 +209,8 @@ pub enum MachineIn {
     StreamOpen { stream_id: String, payload: Payload },
     /// The client cancelled (or the connection dropped) a live stream.
     StreamClose { stream_id: String },
+    /// The driver finished an effect this machine requested under `id`.
+    EffectResult { id: EffectId, result: EffectResult },
 }
 
 /// Outputs a machine emits to the router.
@@ -119,17 +234,53 @@ pub enum MachineOut {
     WaterfallReturn { value: Payload },
     /// Saga compensation, produced when answering `DisposeRequested`.
     Compensate { label: String },
-    /// A real-world effect only the driver can perform.
-    Realize(RealizeRequest),
+    /// A real-world effect only the driver can perform; the driver answers with
+    /// [`MachineIn::EffectResult`] under the same [`EffectId`].
+    Realize {
+        id: EffectId,
+        request: RealizeRequest,
+    },
+    /// The answer to the unary RPC call currently being served.
+    Reply(RpcReply),
+    /// One frame on a logical stream.
+    Stream(StreamFrame),
 }
 
 /// Real-world effect requests. The driver interprets these; the core
 /// intentionally keeps them shallow and serializable.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// This is the *only* way a machine touches the world. Machines must not call
+/// `std::fs`/`std::net`/`std::process` directly (see docs/architecture.md):
+/// effects are what make a machine unit-testable without a filesystem and
+/// replayable from a recorded trace.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RealizeRequest {
     /// Structured log line.
     Log { level: String, message: String },
-    /// Uninterpreted escape hatch for host-specific effects.
+    /// Read a file as UTF-8 text.
+    ReadText { path: String },
+    /// Write a file as UTF-8 text, creating parent directories. Atomic
+    /// (temp + rename) — session generations rely on this.
+    WriteText { path: String, contents: String },
+    /// Create a directory and any missing parents.
+    CreateDirAll { path: String },
+    /// Resolve a path and report whether it is a directory. One turn, because
+    /// every current call site needs both answers together.
+    Stat { path: String },
+    /// List the immediate entry names of a directory.
+    ListDir { path: String },
+    /// Write raw text to the client's WebSocket (the mux machine's transport).
+    SendText { text: String },
+    /// A logical stream became live; the driver routes its frames to `owner`.
+    OpenStream {
+        stream_id: String,
+        endpoint: String,
+        payload: Payload,
+    },
+    /// A logical stream was cancelled by the client.
+    CancelStream { stream_id: String },
+    /// Uninterpreted escape hatch for host-specific effects. Being retired:
+    /// prefer a typed variant above, so the driver's match stays exhaustive.
     Raw(Payload),
 }
 
@@ -163,8 +314,13 @@ pub enum RouteOut {
     /// A machine asked for a real-world effect.
     Realize {
         from: MachineId,
+        id: EffectId,
         request: RealizeRequest,
     },
+    /// A machine answered the unary RPC call it is currently serving.
+    Reply { from: MachineId, reply: RpcReply },
+    /// A machine emitted a stream frame.
+    Stream { from: MachineId, frame: StreamFrame },
     /// A machine registered a service.
     ServiceRegistered { from: MachineId, key: ServiceKey },
     /// A disposed machine returned a saga compensation.
@@ -245,10 +401,23 @@ impl Router {
                         label,
                     });
                 }
-                MachineOut::Realize(request) => {
+                MachineOut::Realize { id, request } => {
                     results.push(RouteOut::Realize {
                         from: from.clone(),
+                        id,
                         request,
+                    });
+                }
+                MachineOut::Reply(reply) => {
+                    results.push(RouteOut::Reply {
+                        from: from.clone(),
+                        reply,
+                    });
+                }
+                MachineOut::Stream(frame) => {
+                    results.push(RouteOut::Stream {
+                        from: from.clone(),
+                        frame,
                     });
                 }
                 // Waterfall/bail answers are only meaningful *during* a chain

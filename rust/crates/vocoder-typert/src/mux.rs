@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use vocoder_cordis::{MachineId, MachineIn, MachineOut, PluginMachine};
+use vocoder_cordis::{EffectId, MachineId, MachineIn, MachineOut, PluginMachine, RealizeRequest};
 
 use crate::{
     StreamClientMessage, StreamFailure, StreamServerMessage, decode_stream_client,
@@ -20,28 +20,14 @@ struct StreamState {
     open: bool,
 }
 
-/// The mux driver-facing outputs.
-#[derive(Debug, Clone, PartialEq)]
-pub enum GatewayEffect {
-    /// Write one text frame back to this client's WebSocket.
-    SendWsText(String),
-    /// Open a logical stream against an upstream service: the actual RPC
-    /// dispatch is realized by the *router* (which hosts namespace machines).
-    OpenStream {
-        stream_id: String,
-        endpoint: String,
-        payload: serde_json::Value,
-    },
-    /// Cancel an already-open stream.
-    CancelStream { stream_id: String },
-}
-
 /// Mux-session machine, one per WS connection.
 #[derive(Debug, Default)]
 pub struct MuxSessionMachine {
     #[allow(dead_code)]
     me: Option<MachineId>,
     streams: BTreeMap<String, StreamState>,
+    /// Monotonic effect counter; see [`MuxSessionMachine::send`].
+    effects: u64,
 }
 
 impl MuxSessionMachine {
@@ -49,13 +35,24 @@ impl MuxSessionMachine {
         Self::default()
     }
 
-    fn send(msg: StreamServerMessage) -> MachineOut {
-        // The router needs the raw bytes to write to the socket; carry them
-        // as a JSON payload on a Realize(log) with a well-known level.
+    /// Claim the next effect id for this machine.
+    fn next_effect(&mut self) -> EffectId {
+        let id = EffectId::nth(self.effects);
+        self.effects += 1;
+        id
+    }
+
+    /// Encode one mux frame and hand it to the driver to write to the socket.
+    ///
+    /// `id` is the machine's monotonic effect counter: these writes are
+    /// fire-and-forget (the machine never awaits an `EffectResult`), but the
+    /// id must still be unique per machine so the driver can correlate.
+    fn send(id: EffectId, msg: StreamServerMessage) -> MachineOut {
         let text = String::from_utf8(encode_stream_server(&msg)).unwrap();
-        MachineOut::Realize(vocoder_cordis::RealizeRequest::Raw(
-            serde_json::json!({ "kind": "ws.send-text", "text": text }),
-        ))
+        MachineOut::Realize {
+            id,
+            request: RealizeRequest::SendText { text },
+        }
     }
 }
 
@@ -75,10 +72,13 @@ impl PluginMachine for MuxSessionMachine {
                 let client = match decode_stream_client(text.as_bytes()) {
                     Ok(c) => c,
                     Err(err) => {
-                        return vec![MachineOut::Realize(vocoder_cordis::RealizeRequest::Log {
-                            level: "warn".into(),
-                            message: format!("mux: bad frame: {err}"),
-                        })];
+                        return vec![MachineOut::Realize {
+                            id: self.next_effect(),
+                            request: RealizeRequest::Log {
+                                level: "warn".into(),
+                                message: format!("mux: bad frame: {err}"),
+                            },
+                        }];
                     }
                 };
                 match client {
@@ -89,25 +89,25 @@ impl PluginMachine for MuxSessionMachine {
                     } => {
                         self.streams
                             .insert(stream_id.clone(), StreamState { open: true });
-                        vec![MachineOut::Realize(vocoder_cordis::RealizeRequest::Raw(
-                            serde_json::json!({
-                                "kind": "stream.open",
-                                "streamId": stream_id,
-                                "endpoint": endpoint,
-                                "payload": payload,
-                            }),
-                        ))]
+                        vec![MachineOut::Realize {
+                            id: self.next_effect(),
+                            request: RealizeRequest::OpenStream {
+                                stream_id,
+                                endpoint,
+                                payload,
+                            },
+                        }]
                     }
                     StreamClientMessage::Cancel { stream_id } => {
                         self.streams.remove(&stream_id);
                         vec![
-                            MachineOut::Realize(vocoder_cordis::RealizeRequest::Raw(
-                                serde_json::json!({
-                                    "kind": "stream.cancel",
-                                    "streamId": stream_id,
-                                }),
-                            )),
-                            Self::send(StreamServerMessage::End { stream_id }),
+                            MachineOut::Realize {
+                                id: self.next_effect(),
+                                request: RealizeRequest::CancelStream {
+                                    stream_id: stream_id.clone(),
+                                },
+                            },
+                            Self::send(self.next_effect(), StreamServerMessage::End { stream_id }),
                         ]
                     }
                 }
@@ -130,7 +130,7 @@ impl PluginMachine for MuxSessionMachine {
                     },
                     None => StreamServerMessage::End { stream_id },
                 };
-                vec![Self::send(msg)]
+                vec![Self::send(self.next_effect(), msg)]
             }
             MachineIn::Event { name, payload } if name.0 == "stream.error" => {
                 let stream_id = payload
@@ -151,17 +151,22 @@ impl PluginMachine for MuxSessionMachine {
                         .into(),
                     details: payload.get("details").cloned(),
                 };
-                vec![Self::send(StreamServerMessage::Error {
-                    stream_id,
-                    error: failure,
-                })]
+                vec![Self::send(
+                    self.next_effect(),
+                    StreamServerMessage::Error {
+                        stream_id,
+                        error: failure,
+                    },
+                )]
             }
             MachineIn::DisposeRequested => {
                 let names = self.streams.keys().cloned().collect::<Vec<_>>();
                 self.streams.clear();
                 names
                     .into_iter()
-                    .map(|stream_id| Self::send(StreamServerMessage::End { stream_id }))
+                    .map(|stream_id| {
+                        Self::send(self.next_effect(), StreamServerMessage::End { stream_id })
+                    })
                     .collect()
             }
             _ => vec![],
