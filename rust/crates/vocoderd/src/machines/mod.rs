@@ -3,11 +3,17 @@
 //! Each namespace is one Sans-I/O plugin machine; the driver feeds it
 //! "vocoder/<ns>/call" events and realizes its rpc.result outputs.
 
+pub mod agent_presets;
+pub mod commands;
+pub mod credentials;
+pub mod directory_picker;
 pub mod events;
+pub mod file_references;
 pub mod goals;
 pub mod readcache;
 pub mod session;
 pub mod settings;
+pub mod skills;
 pub mod workspace;
 pub mod workspace_files;
 

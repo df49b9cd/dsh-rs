@@ -223,26 +223,29 @@ fn coverage_report() -> Result<()> {
     // arms. This is a projection of the code, not the tests — CI runs the
     // wire cells for the runtime verdict; the report answers "what shape
     // do we claim" vs the spec.
-    let session_src = fs::read_to_string(
-        root.join("rust/crates/vocoderd/src/machines/session.rs"),
-    )
-    .context("session machine source")?;
-    let workspace_src = fs::read_to_string(
-        root.join("rust/crates/vocoderd/src/machines/workspace.rs"),
-    )
-    .context("workspace machine source")?;
-    let settings_src = fs::read_to_string(
-        root.join("rust/crates/vocoderd/src/machines/settings.rs"),
-    )
-    .context("settings machine source")?;
-    let goals_src = fs::read_to_string(
-        root.join("rust/crates/vocoderd/src/machines/goals.rs"),
-    )
-    .context("goals machine source")?;
-    let workspace_files_src = fs::read_to_string(
-        root.join("rust/crates/vocoderd/src/machines/workspace_files.rs"),
-    )
-    .context("workspace_files machine source")?;
+    // One source file per implemented namespace. Keyed by the wire namespace
+    // (not the file name: `workspace_files.rs` implements `workspaceFiles`).
+    let machine_sources: Vec<(&str, String)> = [
+        ("session", "session.rs"),
+        ("workspace", "workspace.rs"),
+        ("settings", "settings.rs"),
+        ("goals", "goals.rs"),
+        ("workspaceFiles", "workspace_files.rs"),
+        ("directoryPicker", "directory_picker.rs"),
+        ("credentials", "credentials.rs"),
+        ("skills", "skills.rs"),
+        ("fileReferences", "file_references.rs"),
+        ("commands", "commands.rs"),
+        ("agentPresets", "agent_presets.rs"),
+    ]
+    .into_iter()
+    .map(|(ns, file)| {
+        let path = root.join("rust/crates/vocoderd/src/machines").join(file);
+        let src = fs::read_to_string(&path)
+            .with_context(|| format!("{ns} machine source ({})", path.display()))?;
+        Ok((ns, src))
+    })
+    .collect::<Result<Vec<_>>>()?;
 
     // Every wire method name this source matches on. Handles the
     // `"a" | "b" | "c" => …` alternation form: reading only the first literal
@@ -279,11 +282,11 @@ fn coverage_report() -> Result<()> {
         }
         out
     };
-    let session = methods_of(&session_src);
-    let workspace = methods_of(&workspace_src);
-    let settings = methods_of(&settings_src);
-    let goals = methods_of(&goals_src);
-    let workspace_files = methods_of(&workspace_files_src);
+    let implemented: std::collections::BTreeMap<&str, std::collections::BTreeSet<String>> =
+        machine_sources
+            .iter()
+            .map(|(ns, src)| (*ns, methods_of(src)))
+            .collect();
 
     let mut md = String::new();
     md.push_str("# Spec coverage report\n\n");
@@ -305,15 +308,9 @@ fn coverage_report() -> Result<()> {
     ];
     for ep in &spec.endpoints {
         let fq = format!("{}/{}", ep.namespace, ep.method);
-        let implemented = match ep.namespace.as_str() {
-            "session" => session.contains(ep.method.as_str()),
-            "workspace" => workspace.contains(ep.method.as_str()),
-            "settings" => settings.contains(ep.method.as_str()),
-            "goals" => goals.contains(ep.method.as_str()),
-            "workspaceFiles" => workspace_files.contains(ep.method.as_str()),
-            "$events" => false, // gateway-internal, not in the business registry
-            _ => false,
-        };
+        let implemented = implemented
+            .get(ep.namespace.as_str())
+            .is_some_and(|methods| methods.contains(ep.method.as_str()));
         total += 1;
         if implemented {
             have += 1;

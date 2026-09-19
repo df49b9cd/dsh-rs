@@ -2,9 +2,19 @@
 
 use std::collections::BTreeMap;
 
-use vocoder_cordis::{MachineIn, MachineOut, PluginMachine};
+use vocoder_cordis::{DispatchMode, EventName, MachineIn, MachineOut, PluginMachine};
 
 use crate::rpc;
+
+/// The event a goal state change is published on.
+///
+/// The `commands` machine's `/goal` command and this namespace are one goal,
+/// so the command must observe what this machine writes. Rather than
+/// re-parsing the RPC args — a shadow copy that could drift — this machine
+/// publishes each committed change and the command subscribes.
+pub fn changed_event() -> EventName {
+    EventName::new("vocoder/goals/changed")
+}
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -24,6 +34,20 @@ impl PluginMachine for GoalsMachine {
     type Out = MachineOut;
 
     fn handle(&mut self, ev: MachineIn) -> Vec<MachineOut> {
+        if let MachineIn::ServicesReady { .. } = &ev {
+            // Subscribe to this namespace's own call event, so the namespace is
+            // addressable two ways: the driver delivers `vocoder/goals/call`
+            // directly for a wire RPC, and another machine's
+            // [`MachineOut::Dispatch`] reaches it through the router's fan-out.
+            // Without this, a cross-namespace call (the `commands` machine's
+            // `/goal`) would fan out to subscribers and never arrive here.
+            //
+            // The direct delivery is not a dispatch, so a wire call is still
+            // handled exactly once.
+            return vec![MachineOut::Subscribe {
+                name: EventName::new(rpc::call_event("goals")),
+            }];
+        }
         let MachineIn::Event { name, payload } = &ev else {
             return vec![];
         };
@@ -39,7 +63,7 @@ impl PluginMachine for GoalsMachine {
             .unwrap_or_default()
             .to_string();
 
-        match method {
+        let (outs, changed) = match method {
             "create" => {
                 let objective = rpc::arg_str(&args, "objective")
                     .unwrap_or_default()
@@ -55,15 +79,21 @@ impl PluginMachine for GoalsMachine {
                         },
                     );
                 }
-                rpc::ok(serde_json::json!({ "accepted": accepted }))
+                (
+                    rpc::ok(serde_json::json!({ "accepted": accepted })),
+                    accepted,
+                )
             }
-            "get" => match self.goals.get(&agent) {
-                Some(g) => rpc::ok(serde_json::to_value(g).unwrap()),
-                None => rpc::ok(serde_json::Value::Null),
-            },
+            "get" => (
+                match self.goals.get(&agent) {
+                    Some(g) => rpc::ok(serde_json::to_value(g).unwrap()),
+                    None => rpc::ok(serde_json::Value::Null),
+                },
+                false,
+            ),
             "clear" => {
-                self.goals.remove(&agent);
-                rpc::ok(serde_json::json!({ "kind": "current" }))
+                let had = self.goals.remove(&agent).is_some();
+                (rpc::ok(serde_json::json!({ "kind": "current" })), had)
             }
             "complete" | "pause" | "resume" => {
                 let state = match method {
@@ -75,9 +105,9 @@ impl PluginMachine for GoalsMachine {
                     Some(g) => {
                         g.state = state.into();
                         g.revision += 1;
-                        rpc::ok(serde_json::to_value(g).unwrap())
+                        (rpc::ok(serde_json::to_value(g).unwrap()), true)
                     }
-                    None => rpc::err("goal/not-found", "no current goal"),
+                    None => (rpc::err("goal/not-found", "no current goal"), false),
                 }
             }
             "edit" => {
@@ -91,16 +121,36 @@ impl PluginMachine for GoalsMachine {
                     Some(g) => {
                         g.objective = objective;
                         g.revision += 1;
-                        rpc::ok(serde_json::to_value(g).unwrap())
+                        (rpc::ok(serde_json::to_value(g).unwrap()), true)
                     }
-                    None => rpc::err("goal/not-found", "no current goal"),
+                    None => (rpc::err("goal/not-found", "no current goal"), false),
                 }
             }
-            other => rpc::err(
-                "gateway/bad-request",
-                format!("unsupported goals method: {other}"),
+            other => (
+                rpc::err(
+                    "gateway/bad-request",
+                    format!("unsupported goals method: {other}"),
+                ),
+                false,
             ),
+        };
+
+        // Publish the committed change so observers (the `commands` machine's
+        // `/goal`) track this namespace's authoritative state rather than
+        // re-deriving it from RPC arguments.
+        if changed {
+            let mut out = outs;
+            out.push(MachineOut::Dispatch {
+                name: changed_event(),
+                payload: serde_json::json!({
+                    "agentId": agent,
+                    "goal": self.goals.get(&agent),
+                }),
+                mode: DispatchMode::Emit,
+            });
+            return out;
         }
+        outs
     }
 }
 

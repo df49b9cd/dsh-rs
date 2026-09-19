@@ -183,12 +183,6 @@ fn waterfall_chains_through_subscribers_then_returns_result() {
             _ => vec![],
         }),
     );
-    for id in ["add1", "mul10", "init"] {
-        r.handle(RouteIn::Deliver {
-            to: MachineId::new(id),
-            ev: MachineIn::ServicesReady { keys: vec![] },
-        });
-    }
     // (1 + 1) * 10 = 20, delivered back to the initiator.
     assert_eq!(*initiator_log.lock().unwrap(), vec![json!(20)]);
 }

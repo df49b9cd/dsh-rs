@@ -24,11 +24,16 @@ use vocoder_cordis::{EffectId, MachineIn, MachineOut, PluginMachine};
 pub const MAX_EFFECTS_PER_INPUT: usize = 256;
 
 /// Map an `io::Error` to the cases machines distinguish between.
+///
+/// `NotFound` and `Exists` are separated because callers branch on them:
+/// "absent" is a different answer from "occupied" for the directory picker
+/// (`directory-picker/exists`) and for preset authoring (`agent-preset/invalid`),
+/// and folding either into a generic failure would lose the wire code.
 fn io_err(e: &std::io::Error) -> EffectError {
-    if e.kind() == std::io::ErrorKind::NotFound {
-        EffectError::NotFound
-    } else {
-        EffectError::Other(e.to_string())
+    match e.kind() {
+        std::io::ErrorKind::NotFound => EffectError::NotFound,
+        std::io::ErrorKind::AlreadyExists => EffectError::Exists,
+        _ => EffectError::Other(e.to_string()),
     }
 }
 
@@ -93,6 +98,32 @@ pub fn realize(request: RealizeRequest) -> Option<EffectResult> {
             Ok(()) => EffectResult::Done,
             Err(e) => EffectResult::Failed(io_err(&e)),
         },
+        // Non-recursive on purpose: the caller is browsing a directory it can
+        // already see, so a missing parent is a real failure, not a level to
+        // invent — and an occupied target must reach the caller as `Exists`
+        // rather than being swallowed into success.
+        RealizeRequest::CreateDir { path } => match std::fs::create_dir(&path) {
+            Ok(()) => EffectResult::Done,
+            Err(e) => EffectResult::Failed(io_err(&e)),
+        },
+        RealizeRequest::RemoveDirAll { path } => match std::fs::remove_dir_all(&path) {
+            // Absent is the same outcome as removed: the caller asked for the
+            // tree not to be there, and it is not.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => EffectResult::Done,
+            Ok(()) => EffectResult::Done,
+            Err(e) => EffectResult::Failed(io_err(&e)),
+        },
+        RealizeRequest::RemoveFile { path } => match std::fs::remove_file(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => EffectResult::Done,
+            Ok(()) => EffectResult::Done,
+            Err(e) => EffectResult::Failed(io_err(&e)),
+        },
+        RealizeRequest::CopyTree { from, to } => {
+            match copy_tree(std::path::Path::new(&from), std::path::Path::new(&to)) {
+                Ok(()) => EffectResult::Done,
+                Err(e) => EffectResult::Failed(io_err(&e)),
+            }
+        }
         RealizeRequest::ReadRange {
             path,
             offset,
@@ -231,6 +262,44 @@ fn list_dir_detailed(path: &str) -> std::io::Result<Vec<vocoder_cordis::DirEntry
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(out)
+}
+
+/// Copy a directory tree, dereferencing symlinks.
+///
+/// Symlinks are followed so the copy is self-contained: a preset is copied
+/// *out of* an install, and a copy holding links back into that install would
+/// break the moment it is upgraded. The destination must not exist — a copy
+/// never overwrites, and reporting that as `Exists` is what lets preset
+/// authoring answer `agent-preset/invalid` instead of clobbering a preset.
+///
+/// On any failure the partial destination is removed: half a preset is
+/// invisible to discovery at best and a mountable-but-incomplete one at worst.
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    if to.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("{} already exists", to.display()),
+        ));
+    }
+    let result = copy_tree_inner(from, to);
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(to);
+    }
+    result
+}
+
+fn copy_tree_inner(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    let meta = std::fs::metadata(from)?;
+    if meta.is_dir() {
+        std::fs::create_dir_all(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            copy_tree_inner(&entry.path(), &to.join(entry.file_name()))?;
+        }
+    } else {
+        std::fs::copy(from, to)?;
+    }
+    Ok(())
 }
 
 /// Write bytes via temp-file + rename, so a reader never observes a partial

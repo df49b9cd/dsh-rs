@@ -259,12 +259,60 @@ async fn main() -> Result<()> {
         ),
     });
     initial_router.handle(RouteIn::Mount {
+        id: MachineId::new("directoryPicker"),
+        // The home directory is a process fact the machine may not look up
+        // (that would be I/O), so the driver resolves it at mount.
+        machine: Box::new(
+            crate::machines::directory_picker::DirectoryPickerMachine::new(home_dir()),
+        ),
+    });
+    initial_router.handle(RouteIn::Mount {
+        id: MachineId::new("credentials"),
+        // Every layer the machine resolves against is a boot read: the
+        // document's text, the launching environment, and the two `.env`
+        // fallbacks. Reading them here is what keeps the machine Sans-I/O.
+        machine: Box::new({
+            let (inherited, project_env, user_env) = credentials_boot(&args.home);
+            crate::machines::credentials::CredentialsMachine::new(
+                args.home.join(".credentials.yaml").display().to_string(),
+                std::fs::read_to_string(args.home.join(".credentials.yaml")).ok(),
+                inherited,
+                project_env,
+                user_env,
+            )
+        }),
+    });
+    initial_router.handle(RouteIn::Mount {
+        id: MachineId::new("skills"),
+        // Both roots are process facts (`$DSH_HOME` and `~/.agents`), so the
+        // driver resolves them and the machine never reads the environment.
+        machine: Box::new(crate::machines::skills::SkillsMachine::new(
+            sessions_root.clone(),
+            args.home.display().to_string(),
+            agents_home(),
+        )),
+    });
+    initial_router.handle(RouteIn::Mount {
+        id: MachineId::new("fileReferences"),
+        machine: Box::new(
+            crate::machines::file_references::FileReferencesMachine::new(sessions_root.clone()),
+        ),
+    });
+    initial_router.handle(RouteIn::Mount {
+        id: MachineId::new("agentPresets"),
+        // The writable root (`$DSH_HOME/.agent-presets`) is derived from the
+        // home the driver was given, so the machine never reads the process.
+        machine: Box::new(crate::machines::agent_presets::AgentPresetsMachine::new(
+            args.home.display().to_string(),
+        )),
+    });
+    initial_router.handle(RouteIn::Mount {
+        id: MachineId::new("commands"),
+        machine: Box::new(crate::machines::commands::CommandsMachine::default()),
+    });
+    initial_router.handle(RouteIn::Mount {
         id: MachineId::new("$events"),
         machine: Box::new(crate::machines::events::EventsMachine::default()),
-    });
-    initial_router.handle(RouteIn::Deliver {
-        to: MachineId::new("$events"),
-        ev: MachineIn::ServicesReady { keys: vec![] },
     });
     let mut registry = vocoder_typert::dispatch::NamespaceRegistry::new();
     registry_owner_register(&mut registry, "goals", "goals");
@@ -272,6 +320,12 @@ async fn main() -> Result<()> {
     registry_owner_register(&mut registry, "workspace", "workspace");
     registry_owner_register(&mut registry, "workspaceFiles", "workspaceFiles");
     registry_owner_register(&mut registry, "settings", "settings");
+    registry_owner_register(&mut registry, "directoryPicker", "directoryPicker");
+    registry_owner_register(&mut registry, "credentials", "credentials");
+    registry_owner_register(&mut registry, "skills", "skills");
+    registry_owner_register(&mut registry, "fileReferences", "fileReferences");
+    registry_owner_register(&mut registry, "commands", "commands");
+    registry_owner_register(&mut registry, "agentPresets", "agentPresets");
     registry_owner_register(&mut registry, "$events", "$events");
 
     let state = Arc::new(AppState {
@@ -607,6 +661,90 @@ fn registry_owner_register(
 /// Absent or unreadable is `None`; the machine treats that as an empty document.
 fn read_settings_document(home: &std::path::Path) -> Option<String> {
     std::fs::read_to_string(home.join("settings.json")).ok()
+}
+
+/// The host account's home directory, for the directory picker's listing root.
+///
+/// A machine may not consult the environment (that is a process read, like
+/// any other I/O), so the driver resolves it at mount and hands it over.
+/// Falls back to `/` when unset — a browse root that always exists beats
+/// refusing the namespace outright.
+fn home_dir() -> String {
+    std::env::var("HOME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "/".to_string())
+}
+
+/// The shared-agent config root (`$DSH_AGENTS_HOME`, else `~/.agents`).
+///
+/// Upstream's skill and preset discovery both read it, and both are process
+/// facts rather than machine state, so the driver resolves it once.
+fn agents_home() -> String {
+    std::env::var("DSH_AGENTS_HOME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| format!("{}/.agents", home_dir()))
+}
+
+/// The credentials machine's boot reads.
+///
+/// All four are I/O, so they happen here: the managed document's text, the
+/// launching environment, and the two `.env` fallback layers. Both `.env`
+/// paths mirror upstream's layered launch environment — the invoking
+/// directory's file, then the harness home's.
+fn credentials_boot(
+    home: &std::path::Path,
+) -> (
+    std::collections::BTreeMap<String, String>,
+    std::collections::BTreeMap<String, String>,
+    std::collections::BTreeMap<String, String>,
+) {
+    let inherited = std::env::vars().collect();
+    let cwd_env = std::env::current_dir()
+        .ok()
+        .map(|cwd| parse_env_file(&cwd.join(".env")))
+        .unwrap_or_default();
+    let user_env = parse_env_file(&home.join(".env"));
+    (inherited, cwd_env, user_env)
+}
+
+/// Parse a `.env` file's `NAME=value` lines.
+///
+/// Deliberately the simple shape: `#` comments, a leading `export`, and
+/// optionally-quoted values. Nothing here is authoritative — these are the
+/// lowest-precedence fallback layer, and a line this does not understand is
+/// skipped rather than failing the boot.
+fn parse_env_file(path: &std::path::Path) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return out;
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let mut value = value.trim();
+        // Strip one matching pair of surrounding quotes, keeping interior
+        // spaces — which is exactly what the trimming above would lose.
+        for q in ['"', '\''] {
+            if value.len() >= 2 && value.starts_with(q) && value.ends_with(q) {
+                value = &value[1..value.len() - 1];
+                break;
+            }
+        }
+        out.insert(name.to_string(), value.to_string());
+    }
+    out
 }
 
 fn boot_script(args: &ServeArgs) -> String {

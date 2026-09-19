@@ -26,6 +26,10 @@ hyper = { version = "1.8", features = ["full"] }
 # wire
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Two on-disk formats are YAML rather than JSON because upstream owns them and
+# a shared home must stay readable by both hosts: `.credentials.yaml` (the
+# credential store) and `preset.yml` (a preset's display metadata).
+serde_yaml = "0.9"
 # errors / misc
 anyhow = "1"
 thiserror = "2"

@@ -35,6 +35,13 @@ const LIVE_NAMESPACES: &[&str] = &[
     "session",
     "workspace",
     "settings",
+    "workspaceFiles",
+    "directoryPicker",
+    "credentials",
+    "skills",
+    "fileReferences",
+    "commands",
+    "agentPresets",
 ];
 
 struct Endpoint {
@@ -149,7 +156,7 @@ async fn every_unary_endpoint_answers_typed_envelope() {
             None => failures.push(format!("{method}: result lacks ok: {v}")),
         }
     }
-    assert!(covered >= 20, "expected ≥20 live unary endpoints, saw {covered}");
+    assert!(covered >= 46, "expected ≥46 live unary endpoints, saw {covered}");
     assert!(failures.is_empty(), "cell failures:\n{}", failures.join("\n"));
 }
 

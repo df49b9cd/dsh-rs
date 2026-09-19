@@ -84,6 +84,12 @@ impl EffectId {
 pub enum EffectError {
     /// The path does not exist (ENOENT).
     NotFound,
+    /// The path already exists (EEXIST).
+    ///
+    /// Distinct from `Other` because two namespaces answer it with their own
+    /// wire code rather than a gateway error: the directory picker reports
+    /// `directory-picker/exists` and preset authoring `agent-preset/invalid`.
+    Exists,
     /// Any other failure, with a rendered message.
     Other(String),
 }
@@ -94,6 +100,7 @@ impl EffectError {
     pub fn message(&self) -> String {
         match self {
             EffectError::NotFound => "No such file or directory (os error 2)".into(),
+            EffectError::Exists => "File exists (os error 17)".into(),
             EffectError::Other(m) => m.clone(),
         }
     }
@@ -306,6 +313,31 @@ pub enum RealizeRequest {
     WriteBytes { path: String, contents: Vec<u8> },
     /// Create a directory and any missing parents.
     CreateDirAll { path: String },
+    /// Create one directory, non-recursively.
+    ///
+    /// Separate from [`CreateDirAll`] because an existing target must be
+    /// *distinguishable*: the directory picker answers `directory-picker/exists`
+    /// for it, and a recursive create reports that case as success, so the
+    /// caller could not tell a fresh directory from one that was already there.
+    CreateDir { path: String },
+    /// Remove a directory and everything beneath it.
+    ///
+    /// Preset deletion needs this: a preset *is* its directory, so removing the
+    /// row means removing the tree (composition, metadata, bundled skills).
+    /// Absent targets are not an error — deleting what is already gone is the
+    /// caller's intent either way.
+    RemoveDirAll { path: String },
+    /// Remove one file. Absent is not an error, for the same reason as
+    /// [`RemoveDirAll`].
+    RemoveFile { path: String },
+    /// Copy a directory tree, dereferencing symlinks so the copy is
+    /// self-contained rather than a set of links back into the source.
+    ///
+    /// One effect rather than a walk emitting a write per file: the machine
+    /// would have to enumerate the tree itself, and preset authoring copies a
+    /// directory it never inspects. Fails with [`EffectError::Exists`] when the
+    /// destination is occupied — a copy never overwrites.
+    CopyTree { from: String, to: String },
     /// Resolve a path and report whether it is a directory. One turn, because
     /// every current call site needs both answers together.
     Stat { path: String },
@@ -563,7 +595,13 @@ impl PluginMachine for Router {
 
         match ev {
             RouteIn::Mount { id, machine } => {
-                self.machines.insert(id, machine);
+                self.machines.insert(id.clone(), machine);
+                // Activate on mount. A machine's subscription set is built in
+                // response to this notice, so a machine that is mounted but
+                // never activated is silently unreachable by dispatch —
+                // a footgun that costs nothing to close here and cannot be
+                // closed correctly by every caller remembering to send it.
+                queue.push_back((id, MachineIn::ServicesReady { keys: vec![] }));
             }
             RouteIn::Unmount { id } => {
                 if let Some(mut machine) = self.machines.remove(&id) {
