@@ -437,6 +437,15 @@ impl Router {
         self.machines.len()
     }
 
+    /// Every mounted machine's id, in id order.
+    ///
+    /// Exposed for the inventory projection: in vocoderd a machine *is* a
+    /// plugin, so "which machines are mounted" is the honest answer to "which
+    /// plugins are loaded". The order is `BTreeMap`'s, so two boots agree.
+    pub fn machine_ids(&self) -> Vec<MachineId> {
+        self.machines.keys().cloned().collect()
+    }
+
     pub fn subscribers(&self, name: &EventName) -> &[MachineId] {
         self.subscriptions
             .get(name)

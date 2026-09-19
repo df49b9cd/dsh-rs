@@ -311,6 +311,26 @@ async fn main() -> Result<()> {
         machine: Box::new(crate::machines::commands::CommandsMachine::default()),
     });
     initial_router.handle(RouteIn::Mount {
+        id: MachineId::new("messageFeedback"),
+        machine: Box::new(
+            crate::machines::message_feedback::MessageFeedbackMachine::new(sessions_root.clone()),
+        ),
+    });
+    initial_router.handle(RouteIn::Mount {
+        id: MachineId::new("sessionFeedback"),
+        machine: Box::new(
+            crate::machines::session_feedback::SessionFeedbackMachine::new(sessions_root.clone()),
+        ),
+    });
+    initial_router.handle(RouteIn::Mount {
+        id: MachineId::new("sessionReferenceResolver"),
+        machine: Box::new(
+            crate::machines::session_references::SessionReferencesMachine::new(
+                sessions_root.clone(),
+            ),
+        ),
+    });
+    initial_router.handle(RouteIn::Mount {
         id: MachineId::new("$events"),
         machine: Box::new(crate::machines::events::EventsMachine::default()),
     });
@@ -326,7 +346,40 @@ async fn main() -> Result<()> {
     registry_owner_register(&mut registry, "fileReferences", "fileReferences");
     registry_owner_register(&mut registry, "commands", "commands");
     registry_owner_register(&mut registry, "agentPresets", "agentPresets");
+    registry_owner_register(&mut registry, "messageFeedback", "messageFeedback");
+    registry_owner_register(&mut registry, "sessionFeedback", "sessionFeedback");
+    registry_owner_register(
+        &mut registry,
+        "sessionReferenceResolver",
+        "sessionReferenceResolver",
+    );
     registry_owner_register(&mut registry, "$events", "$events");
+
+    // `pluginInventory` is mounted last and takes its answer from the two facts
+    // that only exist now: the mounted machine tree and the namespace registry.
+    // In this host a machine *is* a plugin, so this is the load result of the
+    // composition rather than a second, parallel bookkeeping of it.
+    initial_router.handle(RouteIn::Mount {
+        id: MachineId::new("pluginInventory"),
+        machine: Box::new(
+            crate::machines::plugin_inventory::PluginInventoryMachine::new(
+                initial_router
+                    .machine_ids()
+                    .into_iter()
+                    .map(|id| id.0)
+                    .collect(),
+                registry
+                    .namespaces()
+                    .filter_map(|ns| {
+                        registry
+                            .owner_of(ns)
+                            .map(|owner| (ns.to_string(), owner.0.clone()))
+                    })
+                    .collect(),
+            ),
+        ),
+    });
+    registry_owner_register(&mut registry, "pluginInventory", "pluginInventory");
 
     let state = Arc::new(AppState {
         router: Mutex::new(initial_router),

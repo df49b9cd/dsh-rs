@@ -33,7 +33,7 @@ directly: it does not import dsh code. Each endpoint in the spec is a cell:
 Spec coverage report (`just coverage-report`) lists every spec endpoint and
 which cells pass per host, so drift shows as table changes.
 
-**Both hosts are green** (28 cells, 12 namespaces). The control run needs the
+**Both hosts are green** (34 cells, 16 namespaces). The control run needs the
 auth cookie: the `dsh` host gates all of `/api` behind browser auth, so
 `CONFORMANCE_COOKIE_FILE` must point at the cookie `harness/runners/run.sh`
 mints, and a cell that omits it sees an HTML redirect rather than an envelope.
@@ -42,14 +42,45 @@ checkout (a lefthook `postinstall` tripping over a legacy submodule git-config
 entry); starting the host directly with
 `node --import tsx/esm apps/cli/src/bin.ts web` bypasses it.
 
-**One recorded divergence.** An unknown method is refused in two different
-shapes: the control answers a bare HTTP **404** (its router has no route for an
-unregistered method) while the candidate answers HTTP 200 with a typed
-`gateway/bad-request` envelope (it registers one catch-all `/api/{*endpoint}`
-route and judges everything in the gateway). The candidate's shape is the more
-useful one for a client, but it *is* a difference, so the cell asserts the
-invariant both satisfy — never a 5xx, never HTML, never a silent success — and
-documents the split rather than asserting one host's shape.
+**What the parity run is for.** Running the same cells against the control is
+what turns this axis from a smoke test into a check, and it has now earned its
+keep: the first genuine control run (2026-09-19) found four candidate defects
+that candidate-only testing could not, all of which are fixed. They are recorded
+here because each is a class of mistake worth recognizing again:
+
+1. **`goals/*` answered invented shapes.** `create` returned
+   `{accepted: bool}` and the rest a record whose lifecycle field was `state`,
+   value `"completed"`. The spec says `{ref: {id, revision}}` and `GoalView`
+   with `phase ∈ {active, paused, blocked, complete}`. A client reading `phase`
+   saw nothing. Invisible before because the cells passed a synthetic agent id
+   the control rejects before any goal logic runs.
+2. **`session/page` clamped a `throughSeq` past the log's end** instead of
+   refusing it, making an out-of-range request look like a short read.
+3. **`settings/update` bumped the revision on a no-op patch**, invalidating
+   every held compare-and-set token without a state change.
+4. **Cells themselves were wrong in three ways**: `goals/create` passed a bare
+   `objective` (the spec puts it under `request`); `session/list` passed
+   `request` where its wire name is `_request`; and the settings cells assumed
+   a fresh revision and a constant patch, so a second run in one home turned an
+   assertion into a tautology.
+
+**Recorded divergences** — real differences the cells assert around rather than
+paper over. Each asserts the invariant *both* hosts meet:
+
+| Case | control (dsh) | candidate (vocoderd) |
+|---|---|---|
+| Unknown method / namespace | bare HTTP 404, `text/plain` | 200 + typed `gateway/*` envelope |
+| Non-JSON body | HTTP 400, `text/plain` | 200 + `gateway/bad-request` |
+| Malformed args | `gateway/input-invalid`, naming the field | `gateway/bad-request` |
+| `goals/complete` with a `ref` that names no goal | `gateway/internal` "no current goal" | `goal/not-found` |
+| `sessionReferenceResolver/candidates` for an unknown agent | `session/not-found` | empty array |
+| `directoryPicker/pick` | **blocks forever** on a native dialog | `directory-picker/unavailable` |
+
+The last one is why `endpoints_spec.rs` carries a per-request timeout: without
+it the matrix hangs instead of reporting, which is precisely the failure mode a
+parity check must not have. The cell records that endpoint as *blocked on this
+host*, not as passing.
+
 
 ## Axis 2 — session log replay
 

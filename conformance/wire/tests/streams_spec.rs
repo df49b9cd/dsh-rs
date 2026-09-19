@@ -19,12 +19,14 @@ fn base_url() -> String {
 }
 
 fn ws_url() -> String {
-    base_url().replace("http://", "ws://").replace("https://", "wss://") + "/api/remote.mux"
+    base_url()
+        .replace("http://", "ws://")
+        .replace("https://", "wss://")
+        + "/api/remote.mux"
 }
 
-async fn ws_connect() -> tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-> {
+async fn ws_connect()
+-> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
     let (socket, _) = tokio_tungstenite::connect_async(ws_url()).await.unwrap();
     socket
 }
@@ -133,7 +135,10 @@ async fn session_follow_streams_snapshot_then_live_event() {
         } }),
     )
     .await;
-    assert!(prompted["ok"].as_bool().unwrap(), "prompt failed: {prompted}");
+    assert!(
+        prompted["ok"].as_bool().unwrap(),
+        "prompt failed: {prompted}"
+    );
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     let live = loop {
@@ -156,7 +161,9 @@ async fn session_follow_streams_snapshot_then_live_event() {
     // Cancel → end frame
     socket
         .send(Message::Text(
-            json!({ "type": "cancel", "streamId": stream_id }).to_string().into(),
+            json!({ "type": "cancel", "streamId": stream_id })
+                .to_string()
+                .into(),
         ))
         .await
         .unwrap();
@@ -189,7 +196,13 @@ async fn session_follow_unknown_session_errors() {
 async fn session_control_streams_baseline() {
     let mut socket = ws_connect().await;
     let stream_id = format!("s-{}", uuid());
-    let first = open_stream(&mut socket, &stream_id, "session/control", json!({ "args": {} })).await;
+    let first = open_stream(
+        &mut socket,
+        &stream_id,
+        "session/control",
+        json!({ "args": {} }),
+    )
+    .await;
     assert_eq!(first["type"], "item", "{first}");
     assert_eq!(first["value"]["type"], "baseline");
     assert!(first["value"]["value"]["queues"].is_object());
@@ -201,7 +214,13 @@ async fn session_control_streams_baseline() {
 async fn workspace_follow_streams_baseline() {
     let mut socket = ws_connect().await;
     let stream_id = format!("s-{}", uuid());
-    let first = open_stream(&mut socket, &stream_id, "workspace/follow", json!({ "args": {} })).await;
+    let first = open_stream(
+        &mut socket,
+        &stream_id,
+        "workspace/follow",
+        json!({ "args": {} }),
+    )
+    .await;
     assert_eq!(first["type"], "item", "{first}");
     assert_eq!(first["value"]["type"], "baseline");
     assert!(first["value"]["value"]["items"].is_array());
@@ -247,12 +266,17 @@ async fn events_stream_ready_then_forwards_session_added() {
     assert!(emit["value"]["args"].is_array(), "{emit}");
 }
 
-
 #[tokio::test]
 async fn workspace_follow_streams_upsert_increment_on_create() {
     let mut socket = ws_connect().await;
     let stream_id = format!("s-{}", uuid());
-    let first = open_stream(&mut socket, &stream_id, "workspace/follow", json!({ "args": {} })).await;
+    let first = open_stream(
+        &mut socket,
+        &stream_id,
+        "workspace/follow",
+        json!({ "args": {} }),
+    )
+    .await;
     assert_eq!(first["value"]["type"], "baseline");
 
     // Create a workspace over unary HTTP; the follow stream gets an upsert.
@@ -264,7 +288,10 @@ async fn workspace_follow_streams_upsert_increment_on_create() {
     )
     .await;
     assert!(created["ok"].as_bool().unwrap(), "{created}");
-    let ws_id = created["value"]["workspace"]["workspaceId"].as_str().unwrap().to_string();
+    let ws_id = created["value"]["workspace"]["workspaceId"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     let inc = loop {
@@ -310,7 +337,13 @@ async fn workspace_follow_streams_upsert_increment_on_create() {
 async fn unknown_namespace_stream_errors() {
     let mut socket = ws_connect().await;
     let stream_id = format!("s-{}", uuid());
-    let first = open_stream(&mut socket, &stream_id, "bogusNamespace/follow", json!({ "args": {} })).await;
+    let first = open_stream(
+        &mut socket,
+        &stream_id,
+        "bogusNamespace/follow",
+        json!({ "args": {} }),
+    )
+    .await;
     assert_eq!(first["type"], "error", "{first}");
     assert_eq!(first["error"]["name"], "RemoteError");
 }
@@ -324,7 +357,10 @@ async fn malformed_frame_closes_connection() {
         .unwrap();
     let mut saw_close = false;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while let Ok(Some(m)) = tokio::time::timeout_at(deadline, socket.next()).await.map(|o| o) {
+    while let Ok(Some(m)) = tokio::time::timeout_at(deadline, socket.next())
+        .await
+        .map(|o| o)
+    {
         match m {
             Ok(Message::Close(_)) | Err(_) => {
                 saw_close = true;
@@ -335,5 +371,8 @@ async fn malformed_frame_closes_connection() {
     }
     // dsh closes on bad frames; assert we observed termination either by
     // close frame or EOF.
-    assert!(saw_close || true, "placeholder assertion; termination observed: {saw_close}");
+    assert!(
+        saw_close || true,
+        "placeholder assertion; termination observed: {saw_close}"
+    );
 }

@@ -175,6 +175,48 @@ impl FsCache {
         )])
     }
 
+    /// Every generation file the walked tree mentions whose bytes are not yet
+    /// cached, requested, or known-failed.
+    ///
+    /// Four machines now read the session log through this cache, and each one
+    /// wrote this same filter. It is worth sharing precisely because it is easy
+    /// to get subtly wrong: dropping the `requested` test makes a re-run ask
+    /// for the same file forever, and dropping `failed` makes an unreadable
+    /// generation retry until the effect cap instead of reporting absence.
+    ///
+    /// The order is the tree's, which is stable, so two machines issuing reads
+    /// against one tree request them in the same sequence.
+    pub fn unread_generations(&self, tree: &[String]) -> Vec<String> {
+        tree.iter()
+            .filter(|p| {
+                let Some(name) = p.rsplit('/').next() else {
+                    return false;
+                };
+                vocoder_session::parse_generation_filename(name).is_some()
+                    && !self.files.contains_key(*p)
+                    && !self.requested.contains(*p)
+                    && !self.failed.contains_key(*p)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The rows of one session directory's latest generation, once its bytes
+    /// are cached; `None` when there is no readable generation.
+    ///
+    /// Pair this with [`Self::unread_generations`]: read those first, then ask.
+    /// The two steps are separate because the cache only grows — a caller
+    /// requests one file, is re-run, and asks again.
+    pub fn session_rows(&self, dir: &str, tree: &[String]) -> Option<Vec<serde_json::Value>> {
+        let (_, path) = crate::machines::session::SessionStore::latest_generation_in(dir, tree)?;
+        let bytes = self.files.get(&path)?;
+        vocoder_session::decode_generation(
+            bytes,
+            crate::machines::session::SessionStore::is_compressed(&path),
+        )
+        .ok()
+    }
+
     /// Ask the driver to publish bytes at `path`.
     ///
     /// Records the path as published *before* returning, so a re-run triggered

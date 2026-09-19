@@ -8,7 +8,12 @@ fn base_url() -> String {
 #[tokio::test]
 async fn host_serves_boot_document() {
     let url = base_url();
-    let body = reqwest::get(format!("{url}/")).await.unwrap().text().await.unwrap();
+    let body = reqwest::get(format!("{url}/"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     assert!(body.contains("<html"), "boot document should be HTML");
 }
 

@@ -235,22 +235,11 @@ impl FileReferencesMachine {
         let tree = self
             .cache
             .tree(&root, &mut self.pending, &mut self.effects)?;
-        for path in &tree {
-            let Some(name) = path.rsplit('/').next() else {
-                continue;
-            };
-            if vocoder_session::parse_generation_filename(name).is_none() {
-                continue;
-            }
-            if !self.cache.files.contains_key(path)
-                && !self.cache.requested.contains(path)
-                && !self.cache.failed.contains_key(path)
-            {
-                self.cache.requested.insert(path.clone());
-                return Err(self
-                    .cache
-                    .request_read(path, &mut self.pending, &mut self.effects));
-            }
+        if let Some(path) = self.cache.unread_generations(&tree).first().cloned() {
+            self.cache.requested.insert(path.clone());
+            return Err(self
+                .cache
+                .request_read(&path, &mut self.pending, &mut self.effects));
         }
         Ok(SessionStore::stateless_scan(&tree, &self.cache.files)
             .into_iter()

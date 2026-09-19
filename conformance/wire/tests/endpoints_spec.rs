@@ -42,6 +42,10 @@ const LIVE_NAMESPACES: &[&str] = &[
     "fileReferences",
     "commands",
     "agentPresets",
+    "messageFeedback",
+    "sessionFeedback",
+    "sessionReferenceResolver",
+    "pluginInventory",
 ];
 
 struct Endpoint {
@@ -86,11 +90,32 @@ fn auth_cookie() -> Option<String> {
 async fn post_raw(path: &str, body: &serde_json::Value) -> (u16, serde_json::Value) {
     let mut req = reqwest::Client::new()
         .post(format!("{}/api/{}", base_url(), path))
-        .json(body);
+        .json(body)
+        // A per-request deadline, because one endpoint on the control blocks
+        // forever: `directoryPicker/pick` opens a native dialog and waits for a
+        // human, so a matrix cell that reaches it hangs the whole run instead
+        // of reporting. Without this the suite cannot complete against the
+        // oracle at all — the failure mode is a silent 10-minute timeout, not a
+        // red cell, which is exactly the kind of thing a parity check must not
+        // have.
+        .timeout(std::time::Duration::from_secs(15));
     if let Some(c) = auth_cookie() {
         req = req.header("cookie", c);
     }
-    let res = req.send().await.unwrap();
+    let res = match req.send().await {
+        Ok(res) => res,
+        // A timeout or transport failure is reported as such rather than
+        // panicking: the cell then fails with a readable cause.
+        Err(e) => {
+            return (
+                0,
+                serde_json::json!({
+                    "__transportError": e.is_timeout().then_some("timeout").unwrap_or("send"),
+                    "__message": e.to_string(),
+                }),
+            );
+        }
+    };
     let status = res.status().as_u16();
     let v: serde_json::Value = res
         .json()
@@ -149,7 +174,10 @@ async fn unknown_method_is_refused_cleanly() {
     )
     .await;
 
-    assert!(status < 500, "must not be a server fault (got {status}): {v}");
+    assert!(
+        status < 500,
+        "must not be a server fault (got {status}): {v}"
+    );
     if v["type"] == "server-response" {
         // The candidate: a typed failure with a code.
         assert_eq!(v["result"]["ok"], false, "{v}");
@@ -168,11 +196,19 @@ async fn unknown_method_is_refused_cleanly() {
 /// The generated per-endpoint matrix: for every unary endpoint in a live
 /// namespace, the envelope round-trips with ok-or-typed-error (never a
 /// 5xx, never HTML, never a hang).
+/// One endpoint is exempt, and the reason is worth stating: `directoryPicker/pick`
+/// on the control opens a **native file dialog** and blocks until a human
+/// answers it. There is no timeout inside the host and no way for a headless
+/// cell to dismiss it, so the honest report is that this endpoint cannot be
+/// exercised black-box on the control — not that it passed. The candidate
+/// answers it immediately with `directory-picker/unavailable`, which is the
+/// correct typed refusal for a host with no native picker.
 #[tokio::test]
 async fn every_unary_endpoint_answers_typed_envelope() {
     let endpoints = load_endpoints();
     let mut failures: Vec<String> = Vec::new();
     let mut covered = 0usize;
+    let mut blocked: Vec<String> = Vec::new();
     for ep in endpoints
         .iter()
         .filter(|e| LIVE_NAMESPACES.contains(&e.namespace.as_str()) && e.mode != "stream")
@@ -180,6 +216,15 @@ async fn every_unary_endpoint_answers_typed_envelope() {
         covered += 1;
         let method = format!("{}/{}", ep.namespace, ep.method);
         let v = call(&method, json!({})).await;
+        // A blocked endpoint is recorded, not failed: see the doc comment.
+        if v["__transportError"].is_string() && method == "directoryPicker/pick" {
+            blocked.push(method);
+            continue;
+        }
+        if let Some(kind) = v["__transportError"].as_str() {
+            failures.push(format!("{method}: transport {kind}: {v}"));
+            continue;
+        }
         if v["type"] != "server-response" {
             failures.push(format!("{method}: not a server-response: {v}"));
             continue;
@@ -196,15 +241,31 @@ async fn every_unary_endpoint_answers_typed_envelope() {
                 if code.is_empty() {
                     failures.push(format!("{method}: error without code: {v}"));
                 }
-                if result["error"]["message"].as_str().is_none_or(str::is_empty) {
+                if result["error"]["message"]
+                    .as_str()
+                    .is_none_or(str::is_empty)
+                {
                     failures.push(format!("{method}: error without message: {v}"));
                 }
             }
             None => failures.push(format!("{method}: result lacks ok: {v}")),
         }
     }
-    assert!(covered >= 46, "expected ≥46 live unary endpoints, saw {covered}");
-    assert!(failures.is_empty(), "cell failures:\n{}", failures.join("\n"));
+    assert!(
+        covered >= 61,
+        "expected ≥61 live unary endpoints, saw {covered}"
+    );
+    if !blocked.is_empty() {
+        eprintln!(
+            "blocked on this host (not exercised): {}",
+            blocked.join(", ")
+        );
+    }
+    assert!(
+        failures.is_empty(),
+        "cell failures:\n{}",
+        failures.join("\n")
+    );
 }
 
 /// Error-detail shape: known conflict cases carry structured details.
@@ -240,11 +301,7 @@ async fn settings_conflict_details() {
     // the host registers: the control refuses an invented one with
     // `settings/rejected` before any revision is consulted.
     let ns = "locale";
-    let v1 = call(
-        "settings/update",
-        json!({ "ns": ns, "patch": { "k": 1 } }),
-    )
-    .await;
+    let v1 = call("settings/update", json!({ "ns": ns, "patch": { "k": 1 } })).await;
     assert_eq!(v1["result"]["ok"], true, "{v1}");
     let v2 = call(
         "settings/update",
@@ -252,6 +309,9 @@ async fn settings_conflict_details() {
     )
     .await;
     assert_eq!(v2["result"]["error"]["code"], "settings/conflict", "{v2}");
-    assert_eq!(v2["result"]["error"]["details"]["ns"], serde_json::json!(ns));
+    assert_eq!(
+        v2["result"]["error"]["details"]["ns"],
+        serde_json::json!(ns)
+    );
     assert!(v2["result"]["error"]["details"]["actual"].is_number());
 }

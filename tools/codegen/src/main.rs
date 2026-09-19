@@ -237,6 +237,10 @@ fn coverage_report() -> Result<()> {
         ("fileReferences", "file_references.rs"),
         ("commands", "commands.rs"),
         ("agentPresets", "agent_presets.rs"),
+        ("messageFeedback", "message_feedback.rs"),
+        ("sessionFeedback", "session_feedback.rs"),
+        ("sessionReferenceResolver", "session_references.rs"),
+        ("pluginInventory", "plugin_inventory.rs"),
     ]
     .into_iter()
     .map(|(ns, file)| {
