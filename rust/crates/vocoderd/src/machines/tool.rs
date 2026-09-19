@@ -136,9 +136,19 @@ pub struct ToolSpec {
 /// `unknown tool`, which teaches the model the tool exists and is broken. A
 /// shorter honest list is the only correct choice until the rest exist.
 ///
-/// The descriptions and schemas are `tool-fs`'s, verbatim. The escalation fields
-/// (`sandbox_permissions`, `justification`) are **absent** because this host's
-/// confinement offers no wider mode to escalate to; see [`super::sandbox`].
+/// The descriptions and schemas are `tool-fs`'s, verbatim, including the two
+/// escalation fields on the mutators.
+///
+/// **The escalation fields are advertised, and their absence was a defect.** An
+/// earlier version omitted `sandbox_permissions` and `justification` on the
+/// reasoning that this host "offers no wider mode to escalate to". That was
+/// wrong: `ESCALATION_TARGETS` is a closed vocabulary of modes a call may
+/// escalate *to*, [`Mode::targets`] carries it, and the executor's gate already
+/// asks on a strictly-wider request. Omitting the fields did not remove
+/// escalation — it removed the *discovery* of it, leaving a model that hit a
+/// denial with no sanctioned move except to fail. `tool-fs` spreads
+/// `schemaFields()` into exactly the two mutators whenever a confining backend is
+/// mounted, and this host's backend confines, so the fields belong here.
 pub fn catalog() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
@@ -164,6 +174,15 @@ pub fn catalog() -> Vec<ToolSpec> {
                 "properties": {
                     "file_path": { "type": "string", "description": "Path to write, resolved by the filesystem backend." },
                     "content": { "type": "string", "description": "Full UTF-8 text content to write." },
+                    "sandbox_permissions": {
+                        "type": "string",
+                        "enum": escalation_targets(),
+                        "description": ESCALATION_PERMISSIONS_DESCRIPTION,
+                    },
+                    "justification": {
+                        "type": "string",
+                        "description": ESCALATION_JUSTIFICATION_DESCRIPTION,
+                    },
                 },
                 "required": ["file_path", "content"],
             }),
@@ -179,11 +198,60 @@ pub fn catalog() -> Vec<ToolSpec> {
                     "old_string": { "type": "string", "description": "Literal text to replace. Must match exactly." },
                     "new_string": { "type": "string", "description": "Literal replacement text. Use an empty string to delete the match." },
                     "replace_all": { "type": "boolean", "description": "Replace all matches. Defaults to false; when false, old_string must appear exactly once." },
+                    "sandbox_permissions": {
+                        "type": "string",
+                        "enum": escalation_targets(),
+                        "description": ESCALATION_PERMISSIONS_DESCRIPTION,
+                    },
+                    "justification": {
+                        "type": "string",
+                        "description": ESCALATION_JUSTIFICATION_DESCRIPTION,
+                    },
                 },
                 "required": ["file_path", "old_string", "new_string"],
             }),
         },
     ]
+}
+
+/// The escalation target names, as the schema's `enum` carries them.
+///
+/// `read-only` is absent because it is the floor: nothing escalates *to* it.
+/// The list is [`Mode::targets`]' spelling, kept in one place so the vocabulary a
+/// model is offered and the vocabulary the gate validates cannot drift.
+pub fn escalation_targets() -> Vec<&'static str> {
+    Mode::targets().iter().map(|m| m.as_str()).collect()
+}
+
+/// `sandbox_permissions`' description, verbatim from `schemaFields()`.
+///
+/// The clause "Only valid as a one-shot retry of an operation the sandbox just
+/// denied" is doing real work: without it a model may read the field as a
+/// standing grant and set it prophylactically, which turns a narrow escalation
+/// into a blanket one.
+pub const ESCALATION_PERMISSIONS_DESCRIPTION: &str = "The wider sandbox mode this file operation needs. Only valid as a one-shot retry \
+     of an operation the sandbox just denied; requires justification and user approval.";
+
+/// `justification`'s description, verbatim.
+pub const ESCALATION_JUSTIFICATION_DESCRIPTION: &str = "Required with sandbox_permissions: one sentence for the user explaining \
+     why this exact file operation needs the wider access.";
+
+/// The same-turn escalation hint that rides a denial.
+///
+/// `escalationHintMarker`, verbatim. It lives *at the decision point* on purpose,
+/// so the sanctioned retry does not depend on the model recalling the tool
+/// description — which is why it is emitted on the denial rather than only
+/// advertised in the schema.
+///
+/// `subject` is the family's noun: `operation` for a filesystem mutation,
+/// `command` for bash. The two differ because a model retrying the wrong kind of
+/// thing is a live failure mode.
+pub fn escalation_hint(subject: &str) -> String {
+    format!(
+        "[sandbox: escalation available — retry this exact {subject} once with \
+         sandbox_permissions (the narrowest wider mode that suffices) + justification; \
+         the approval prompt asks the user]"
+    )
 }
 
 /// The canonical [`ToolSpec`] list as `llm_dialect` tools.
@@ -221,8 +289,57 @@ pub struct Outcome {
     /// The tool's private presentation payload, persisted so a UI card survives
     /// replay (`meta` in the row).
     pub meta: Option<Value>,
-    /// The failure's structured info, for `data.error` and the part's own field.
+    /// The failure's structured info, for `data.error`.
+    ///
+    /// **`data.error`, and only there.** The corpus is unambiguous: of 107
+    /// `tool/result` rows, five carry an `error` key and every one of them has it
+    /// on `data` — never on the message part — and every one is shaped
+    /// `{ name, code }`. An earlier version of this struct put a `{ message }`
+    /// object on the *part* as well, which was wrong twice over: in the wrong
+    /// place, and in a vocabulary no reader of the log knows. The text the model
+    /// sees is already in the content block; `error` is the structured
+    /// classification a *program* reads, and none of the five recorded names
+    /// (`FsError`, `SandboxUnavailableError`, `WebError`) is a message.
     pub error: Option<Value>,
+}
+
+/// A structured failure classification, as `data.error` carries it.
+///
+/// Two fields and no third: the corpus's five examples are all
+/// `{name, code}` and nothing else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErrorInfo {
+    /// The error class, e.g. `FsError`, `SandboxUnavailableError`.
+    pub name: String,
+    /// The machine-readable code, e.g. `FS_NOT_FOUND`, `SANDBOX_UNAVAILABLE`.
+    pub code: String,
+}
+
+impl ErrorInfo {
+    pub fn new(name: impl Into<String>, code: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            code: code.into(),
+        }
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({ "name": self.name, "code": self.code })
+    }
+}
+
+/// The fail-closed sandbox error's class, as the corpus records it.
+///
+/// A function rather than a `const`: `ErrorInfo` owns `String`s, and a `const`
+/// cannot hold one. Returning a fresh value also keeps it impossible for a
+/// caller to mutate a shared classification.
+pub fn sandbox_unavailable() -> ErrorInfo {
+    ErrorInfo::new("SandboxUnavailableError", "SANDBOX_UNAVAILABLE")
+}
+
+/// The filesystem error class, as the corpus records it.
+pub fn fs_error(code: &str) -> ErrorInfo {
+    ErrorInfo::new("FsError", code)
 }
 
 impl Outcome {
@@ -241,18 +358,30 @@ impl Outcome {
     /// The prefix is upstream's, applied where a denial or a thrown error is
     /// materialized into content — it is what lets the model tell a refusal from
     /// a tool's own output.
+    ///
+    /// No structured `error` by default: a denial that is the *tool's own*
+    /// judgment (an unknown tool name, a bad argument) has no upstream error
+    /// class, and inventing one would put a name in the log that no reader
+    /// recognizes. Callers that do have a class attach it with
+    /// [`Self::with_error`].
     pub fn denied(text: impl Into<String>) -> Self {
         let text = text.into();
         Self {
             content: vec![json!({ "type": "text", "text": format!("Error: {text}") })],
             is_error: true,
             meta: None,
-            error: Some(json!({ "message": text })),
+            error: None,
         }
     }
 
     pub fn with_meta(mut self, meta: Value) -> Self {
         self.meta = Some(meta);
+        self
+    }
+
+    /// Attach the structured classification `data.error` carries.
+    pub fn with_error(mut self, error: ErrorInfo) -> Self {
+        self.error = Some(error.to_json());
         self
     }
 
@@ -265,17 +394,12 @@ impl Outcome {
     /// pair them after the fact; `surfaceOp: "append"` is the surface bookkeeping
     /// every corpus tool/result carries.
     pub fn row_data(&self, turn: u64, step: u64, call: &Call, call_seq: u64) -> Value {
-        let mut part = json!({
+        let part = json!({
             "type": "tool-result",
             "toolCallId": call.id,
             "content": self.content,
             "isError": self.is_error,
         });
-        // A failure's structured info rides the part too, not only the envelope,
-        // so a reader that never looks at `data.error` still sees it.
-        if let Some(error) = &self.error {
-            part["error"] = error.clone();
-        }
         let mut data = json!({
             "turn": turn,
             "step": step,
@@ -289,6 +413,11 @@ impl Outcome {
         });
         if let Some(meta) = &self.meta {
             data["meta"] = meta.clone();
+        }
+        // Last, and on `data`: the classification is a sibling of the message,
+        // not a field of it.
+        if let Some(error) = &self.error {
+            data["error"] = error.clone();
         }
         data
     }
@@ -887,8 +1016,19 @@ pub fn escalated_fence(fence: &Fence, requested: &str) -> Fence {
 }
 
 /// The confinement refusal, as `super::sandbox` renders it.
+///
+/// Carries the structured `FS_SANDBOX_DENIED` code, which is load-bearing rather
+/// than decorative: upstream's comment on the mapping says why —
+///
+/// > `ToolRuntime` populates `result.error` only for `HarnessError` instances, so
+/// > a plain `Error` would strip the code retry/observers key off.
+///
+/// That is, the code is what a *reader* of the log keys a retry or an observer
+/// off. A denial whose text is right but whose code is absent is a denial no
+/// program can act on, and the text alone would leave the two enforcement
+/// families (filesystem and shell) distinguishable only by a string match.
 pub fn confinement(denial: &Denial) -> Outcome {
-    Outcome::denied(denial.message())
+    Outcome::denied(denial.message()).with_error(fs_error("FS_SANDBOX_DENIED"))
 }
 
 #[cfg(test)]
@@ -1183,12 +1323,18 @@ mod tests {
                 .unwrap()
                 .contains("no approval channel is available")
         );
-        // A denial is an error result with structured info, so a reader that
-        // never looks at `data.error` still sees the message on the part.
+        // **A denial is an error result, and its structured info lives on
+        // `data.error` — not on the part, and not as a message.** The corpus is
+        // unambiguous about both halves: of 107 recorded `tool/result` rows, five
+        // carry `error` and every one has it on `data` shaped `{name, code}`.
         assert!(r.is_error);
+        assert!(
+            r.error.is_none(),
+            "an approval denial is the gate's own judgment, so it has no upstream error class"
+        );
         assert_eq!(
-            r.error.as_ref().unwrap()["message"],
-            "the user rejected tool \"write\""
+            r.content[0]["text"],
+            json!("Error: the user rejected tool \"write\"")
         );
     }
 
@@ -1378,6 +1524,52 @@ mod tests {
         assert_eq!(call_row["name"], "read");
     }
 
+    /// **`error` is a sibling of the message, not a field of it, and it is
+    /// `{name, code}` rather than a message.**
+    ///
+    /// Both halves are fixed by the corpus. Across 107 recorded `tool/result`
+    /// rows, five carry an `error` key; every one is on `data` (never on the
+    /// message part) and every one has exactly the two keys `name` and `code` —
+    /// `FsError`/`FS_NOT_FOUND`, `FsError`/`FS_NOT_OBSERVED`,
+    /// `SandboxUnavailableError`/`SANDBOX_UNAVAILABLE`,
+    /// `WebError`/`WEB_PROVIDER_ERROR`. A `{message}` object on the part is
+    /// therefore wrong twice over, and it is what this module shipped first.
+    #[test]
+    fn a_structured_error_is_a_sibling_of_the_message_and_names_a_class() {
+        let call = Call {
+            id: "call_1".into(),
+            name: "write".into(),
+            arguments: "{}".into(),
+        };
+        let data = Outcome::denied("nope")
+            .with_error(sandbox_unavailable())
+            .row_data(1, 1, &call, 9);
+
+        // On `data`, beside `message`.
+        assert_eq!(
+            data["error"],
+            json!({ "name": "SandboxUnavailableError", "code": "SANDBOX_UNAVAILABLE" })
+        );
+        assert_eq!(
+            data["error"].as_object().unwrap().len(),
+            2,
+            "two keys, no third"
+        );
+        // And *not* on the part.
+        assert!(data["message"]["content"][0].get("error").is_none());
+        // The text the model reads is still the content block, which is why
+        // `error` need not carry a message.
+        assert_eq!(
+            data["message"]["content"][0]["content"][0]["text"],
+            json!("Error: nope")
+        );
+
+        // A `data.error`'s presence is independent of `isError` being true for
+        // the *part*: the corpus's `fs-policy-reject` is both, but the honest
+        // statement is that the classification is what a program reads.
+        assert_eq!(data["message"]["content"][0]["isError"], json!(true));
+    }
+
     /// The catalog is a closed set, and every entry has a name and a schema.
     #[test]
     fn the_catalog_is_small_and_executable() {
@@ -1391,12 +1583,78 @@ mod tests {
                 spec.name
             );
         }
-        // The escalation fields are not advertised: this host offers no wider
-        // mode, and a schema promising one would make every escalation a
-        // malformed call.
+        // **The escalation fields ARE advertised, on the two mutators and only
+        // there.** `tool-fs` spreads `schemaFields()` into exactly `write` and
+        // `edit` when a confining backend is mounted, and this host's filesystem
+        // backend confines. An earlier version of this test asserted the
+        // opposite — that nothing here advertises a wider mode — which was the
+        // defect rather than the contract: the gate already understood
+        // escalation, so withholding the fields left the ladder unreachable.
+        //
+        // `read` is excluded because it mutates nothing, so there is no denial
+        // it could escalate out of.
         let write = &catalog()[1].input_schema;
-        assert!(write["properties"].get("sandbox_permissions").is_none());
+        let edit = &catalog()[2].input_schema;
+        for (name, schema) in [("write", write), ("edit", edit)] {
+            assert_eq!(
+                schema["properties"]["sandbox_permissions"]["enum"],
+                json!(["workspace-write", "danger-full-access"]),
+                "{name} must offer the closed escalation vocabulary"
+            );
+            assert!(
+                schema["properties"]["justification"].is_object(),
+                "{name} must offer the justification the pair requires"
+            );
+        }
+        assert!(
+            catalog()[0].input_schema["properties"]
+                .get("sandbox_permissions")
+                .is_none(),
+            "read mutates nothing, so it has no denial to escalate"
+        );
         assert!(tool_definitions()[0].name == "read");
+    }
+
+    /// The escalation vocabulary a model is *offered* is the one the gate
+    /// *validates*, and neither includes the floor.
+    ///
+    /// `read-only` is absent from both because it is the narrowest mode: a
+    /// request to escalate to it asks for nothing, and [`widening`] would call it
+    /// `Narrower`. A drift between the two lists would be a schema offering a
+    /// target the gate then refuses as malformed — a call the model could not
+    /// have known was invalid.
+    #[test]
+    fn the_advertised_targets_are_the_validated_ones() {
+        for name in ["write", "edit"] {
+            let specs = catalog();
+            let spec = specs.iter().find(|t| t.name == name).unwrap();
+            let advertised: Vec<&str> =
+                spec.input_schema["properties"]["sandbox_permissions"]["enum"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap())
+                    .collect();
+            let validated: Vec<&str> = Mode::targets().iter().map(|m| m.as_str()).collect();
+            assert_eq!(
+                advertised, validated,
+                "{name}'s enum must match Mode::targets"
+            );
+            assert!(
+                !advertised.contains(&"read-only"),
+                "the floor is not a target"
+            );
+
+            // And every advertised target really is strictly wider than the
+            // narrowest mode a session can start in — the property the gate
+            // checks per call.
+            for target in &advertised {
+                assert_eq!(
+                    widening(Mode::ReadOnly, Mode::parse(target).unwrap()),
+                    Escape::Wider
+                );
+            }
+        }
     }
 
     /// `is_mutating` is the gate's whole policy, so it is asserted rather than

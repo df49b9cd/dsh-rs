@@ -223,6 +223,38 @@ pub fn realize_with(
                 Err(e) => EffectResult::Failed(EffectError::Other(e)),
             }
         }
+        // The argv arrives already wrapped in whatever confinement the machine
+        // chose, so this is a plain spawn: the driver's whole contribution is
+        // the process mechanics, and it never decides *whether* to confine.
+        RealizeRequest::ProcessExec {
+            argv,
+            workdir,
+            env,
+            timeout_ms,
+            stdout_max_bytes,
+            stdin,
+        } => match run_process(
+            &argv,
+            workdir.as_deref(),
+            &env,
+            timeout_ms,
+            stdout_max_bytes,
+            stdin.as_deref(),
+        ) {
+            Ok(done) => EffectResult::ProcessDone {
+                exit_code: done.exit_code,
+                stdout: done.stdout,
+                stderr: done.stderr,
+                truncated: done.truncated,
+                timed_out: done.timed_out,
+            },
+            Err(e) => EffectResult::Failed(EffectError::Other(e)),
+        },
+        // Existence and executability, not execution. See the request's own doc
+        // for why probing by running the program would defeat the probe.
+        RealizeRequest::ProbeProgram { program } => EffectResult::Probe {
+            found: program_is_executable(&program),
+        },
     })
 }
 
@@ -260,6 +292,200 @@ fn canned_body(url: &str) -> Option<String> {
         }
     }
     std::fs::read_to_string(format!("{dir}/body.txt")).ok()
+}
+
+/// Whether a program can be executed: it exists and carries an execute bit.
+///
+/// Deliberately not `which`: the caller passes an absolute path (a sandbox
+/// runner is located by the deployment, not searched for on `PATH`), and a
+/// `PATH` search would introduce an environment dependency the machine cannot
+/// see. A relative name is still accepted and resolved the way the OS would —
+/// `Command` does its own `PATH` lookup at spawn time — but the answer here is
+/// about the *path as given*, so a bare name reports "not found" rather than
+/// pretending to have searched.
+fn program_is_executable(program: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(program) {
+        Ok(meta) => meta.is_file() && meta.permissions().mode() & 0o111 != 0,
+        Err(_) => false,
+    }
+}
+
+/// What one finished process reported.
+struct ProcessOutcome {
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    truncated: bool,
+    timed_out: bool,
+}
+
+/// Run a process to completion, bounded in time and in output size.
+///
+/// Spawned from a thread rather than the async runtime because the effect
+/// contract is synchronous (`realize_with` is called from `spawn_blocking`
+/// already), so there is nothing to await on.
+///
+/// **Output is read on two threads and the child is killed on timeout.** A
+/// single-threaded read-then-wait would deadlock the moment a child filled a
+/// pipe buffer: the child blocks writing, the parent blocks waiting, and
+/// neither moves. That failure is not hypothetical for a shell tool — `yes` is
+/// one line of input away from it — so the reads happen concurrently with the
+/// wait.
+///
+/// A timeout kills the child but still reports what it produced before the
+/// kill, because "it timed out" and "here is what it printed first" are both
+/// facts the model needs and the caller cannot recover the second one later.
+fn run_process(
+    argv: &[String],
+    workdir: Option<&str>,
+    env: &[(String, String)],
+    timeout_ms: Option<u64>,
+    stdout_max_bytes: Option<usize>,
+    stdin: Option<&str>,
+) -> Result<ProcessOutcome, String> {
+    use std::io::{Read, Write};
+    use std::sync::mpsc;
+
+    let Some(program) = argv.first() else {
+        return Err("ProcessExec requires a non-empty argv".to_string());
+    };
+    let mut command = std::process::Command::new(program);
+    command.args(&argv[1..]);
+    if let Some(dir) = workdir {
+        command.current_dir(dir);
+    }
+    // `env_clear` then the given pairs: the server's environment holds provider
+    // credentials, and a model-authored command must not inherit them.
+    command.env_clear();
+    for (k, v) in env {
+        command.env(k, v);
+    }
+    command.stdin(std::process::Stdio::piped());
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("failed to spawn {program}: {e}"))?;
+
+    let bound = stdout_max_bytes.unwrap_or(usize::MAX);
+    let (tx, rx) = mpsc::channel::<(bool, Vec<u8>, bool)>();
+    let mut readers = Vec::new();
+    for (is_stdout, pipe) in [
+        (
+            true,
+            child
+                .stdout
+                .take()
+                .map(|p| Box::new(p) as Box<dyn Read + Send>),
+        ),
+        (
+            false,
+            child
+                .stderr
+                .take()
+                .map(|p| Box::new(p) as Box<dyn Read + Send>),
+        ),
+    ] {
+        let Some(pipe) = pipe else { continue };
+        let tx = tx.clone();
+        readers.push(std::thread::spawn(move || {
+            // Read to the bound *plus a sentinel byte*, so exceeding the bound
+            // is detectable rather than looking like an exact fit.
+            let mut buf = Vec::new();
+            let mut reader = pipe;
+            let mut chunk = [0u8; 8192];
+            let mut over = false;
+            loop {
+                match reader.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if buf.len() < bound + 1 {
+                            let take = (bound + 1 - buf.len()).min(n);
+                            buf.extend_from_slice(&chunk[..take]);
+                        }
+                        if buf.len() > bound {
+                            over = true;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = tx.send((is_stdout, buf, over));
+        }));
+    }
+    drop(tx);
+
+    if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        let _ = pipe.write_all(text.as_bytes());
+        // Dropping the handle closes the pipe, which is what lets a child
+        // waiting on EOF proceed. Without it a `cat` would hang until timeout.
+        drop(pipe);
+    }
+
+    let deadline =
+        timeout_ms.map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
+    let mut timed_out = false;
+    let exit_code = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code(),
+            Ok(None) => {}
+            Err(e) => return Err(format!("failed to wait for {program}: {e}")),
+        }
+        if let Some(deadline) = deadline
+            && std::time::Instant::now() >= deadline
+        {
+            let _ = child.kill();
+            timed_out = true;
+            match child.wait() {
+                Ok(status) => break status.code(),
+                Err(e) => return Err(format!("failed to reap {program}: {e}")),
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut truncated = false;
+    for _ in 0..readers.len() {
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok((true, buf, over)) => {
+                stdout = buf;
+                truncated |= over;
+            }
+            Ok((false, buf, over)) => {
+                stderr = buf;
+                truncated |= over;
+            }
+            // The reader thread died, or outlived a killed child's pipes. Its
+            // output is already lost; reporting a spawn failure now would be
+            // less accurate than reporting what came back.
+            Err(_) => break,
+        }
+    }
+
+    Ok(ProcessOutcome {
+        exit_code,
+        stdout: bound_text(stdout, bound),
+        stderr: bound_text(stderr, bound),
+        truncated,
+        timed_out,
+    })
+}
+
+/// Render collected bytes as text, honoring the byte bound.
+///
+/// Lossy rather than fallible: a command's output is not required to be UTF-8
+/// (a compiler diagnostic on a path with invalid bytes is enough), and refusing
+/// the whole result over one bad byte would be worse than a replacement
+/// character. The caller that needs exact bytes is not a shell tool.
+fn bound_text(mut bytes: Vec<u8>, bound: usize) -> String {
+    if bytes.len() > bound {
+        bytes.truncate(bound);
+    }
+    String::from_utf8_lossy(&bytes).to_string()
 }
 
 /// Per-request timeout for a provider call.

@@ -178,22 +178,34 @@ pub struct Denial {
 }
 
 impl Denial {
-    /// The model-facing text.
+    /// The model-facing text: the marker, the path and reason, then the hint.
     ///
-    /// `sandboxDenialMarker`'s line, verbatim, plus the path and root. The marker
-    /// is the shared vocabulary both enforcing families teach, so a model that
-    /// has seen bash's denial recognizes this one. Upstream appends
-    /// `escalationHintMarker` when the composition advertises escalation fields;
-    /// this host does not (see [`super::tool::catalog`]), so the hint is absent
-    /// and the path is what takes its place — without it the model learns that
-    /// *something* was denied but not what to do differently, and there is no
-    /// hint line to tell it.
+    /// `sandboxDenialMarker`'s line is the shared vocabulary both enforcing
+    /// families teach, so a model that has seen bash's denial recognizes this
+    /// one.
+    ///
+    /// **The escalation hint follows, and it is not optional.** Upstream appends
+    /// `escalationHintMarker` whenever the composition advertises the escalation
+    /// fields, and this host does: `write` and `edit` carry `sandbox_permissions`
+    /// and `justification` in their schemas, exactly as `tool-fs` spreads
+    /// `schemaFields()` under a confining backend. An earlier version of this
+    /// function omitted the hint on the belief that nothing here advertised
+    /// escalation — which was true of the catalog at the time and was the actual
+    /// defect: the gate understood escalation, the schema did not offer it, and
+    /// the denial did not mention it, so the ladder was unreachable and a denied
+    /// model had no move but to fail. A denial that names the remedy is the
+    /// difference between a sandbox that guides and one that stonewalls.
+    ///
+    /// The path and the reason sit between the marker and the hint rather than
+    /// being omitted: without them the model learns that *something* was denied
+    /// but not what, and the hint tells it to retry an operation it cannot name.
     pub fn message(&self) -> String {
         format!(
-            "[sandbox: file access denied under {} mode]\n{}: {}",
+            "[sandbox: file access denied under {} mode]\n{}: {}\n{}",
             self.mode.as_str(),
             self.path,
-            self.reason
+            self.reason,
+            super::tool::escalation_hint("operation")
         )
     }
 }
@@ -236,18 +248,7 @@ impl Fence {
     /// `writableRoots`' derivation; the two spellings are kept separate here
     /// (upstream resolves `os.tmpdir()` per host) but the set is the same.
     pub fn writable_roots(&self) -> Vec<String> {
-        if self.mode != Mode::WorkspaceWrite {
-            return Vec::new();
-        }
-        let mut roots = vec![self.root.clone(), "/tmp".to_string()];
-        let tmp = std::env::temp_dir();
-        let tmp = tmp.to_string_lossy().to_string();
-        if !roots.contains(&tmp) {
-            roots.push(tmp);
-        }
-        roots.sort();
-        roots.dedup();
-        roots
+        writable_roots_for(self.mode, &self.root)
     }
 
     /// Whether a *canonicalized* target lies under a writable root.
@@ -282,6 +283,45 @@ impl Fence {
             reason,
         })
     }
+}
+
+/// The canonical roots a mutation may write under, for one mode and workspace.
+///
+/// A free function rather than a method because **two** enforcers need it and
+/// they must not be able to disagree: the in-process containment fence
+/// ([`Fence::allows`]) and the kernel profiles in
+/// [`super::sandbox_runner::profile_args`] — Seatbelt's write grant in
+/// particular. Upstream says the same thing about its own shared
+/// `writableRoots` helper: it exists "so the Seatbelt grant and the in-process
+/// fs fence can never drift apart". If the kernel granted a root the fence
+/// denied, a confined process would be refused by policy on a path the sandbox
+/// allows; the reverse is worse, because the fence would report confinement
+/// the kernel is not applying.
+///
+/// `read-only` allows nothing. `workspace-write` allows the workspace root plus
+/// the host temp areas — `/tmp` and `std::env::temp_dir()` — because
+/// `workspace-write` promises the temp area to mkstemp-family tools, and
+/// omitting it would deny what the mode says it grants.
+///
+/// **This reads the process environment** (`temp_dir`), which a machine may not
+/// do. It is called during fence and profile construction, which the machine
+/// performs from data it was handed, and the temp path is a deployment fact
+/// rather than a decision — but a caller that needs purity should pass the
+/// resolved temp root in. Stated because the rule is otherwise easy to violate
+/// here by accident.
+pub fn writable_roots_for(mode: Mode, workspace_root: &str) -> Vec<String> {
+    if mode != Mode::WorkspaceWrite {
+        return Vec::new();
+    }
+    let mut roots = vec![workspace_root.to_string(), "/tmp".to_string()];
+    let tmp = std::env::temp_dir();
+    let tmp = tmp.to_string_lossy().to_string();
+    if !roots.contains(&tmp) {
+        roots.push(tmp);
+    }
+    roots.sort();
+    roots.dedup();
+    roots
 }
 
 /// Whether `target` is `root` or lies beneath it, by path components.

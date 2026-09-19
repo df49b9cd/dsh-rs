@@ -151,6 +151,26 @@ pub enum EffectResult {
     /// it — and a machine that only saw "failed" could not tell a rate limit
     /// from a bad request.
     HttpResponse { status: u16, body: String },
+    /// A [`RealizeRequest::ProcessExec`] settled. `exit_code` is `None` when the
+    /// child died from a signal, which is not the same as exiting nonzero —
+    /// upstream's classifiers treat a signal death as "no evidence" rather than
+    /// as a denial.
+    ///
+    /// Output is already truncated to the requested bound and is carried as
+    /// bytes-then-rendered by the machine, because whether the tail was cut is a
+    /// fact the caller must be able to state.
+    ProcessDone {
+        exit_code: Option<i32>,
+        stdout: String,
+        stderr: String,
+        /// Whether output was dropped by the byte bound or the timeout killed
+        /// the child. A machine renders this into the tool result; it is not
+        /// inferable from the text.
+        truncated: bool,
+        timed_out: bool,
+    },
+    /// A [`RealizeRequest::ProbeProgram`] settled.
+    Probe { found: bool },
     /// The effect failed.
     Failed(EffectError),
 }
@@ -442,6 +462,54 @@ pub enum RealizeRequest {
         headers: Vec<(String, String)>,
         body: String,
     },
+    /// Run a subprocess to completion and collect its output.
+    ///
+    /// The argv is **already wrapped** by the time it gets here: a machine
+    /// resolves the sandbox policy and produces the confinement invocation, and
+    /// this effect only executes what it is given. That split is deliberate and
+    /// it is the whole reason the sandbox is testable — the interesting half
+    /// (which runner, which profile arguments, what the invocation means) is
+    /// pure and runs without spawning anything, while the half that touches the
+    /// kernel is a `Command::new(argv[0]).args(argv[1..])`.
+    ///
+    /// A machine may not decide confinement at execution time, because it cannot
+    /// see whether `bwrap` exists. So the *choice* of runner is an input (see
+    /// [`RealizeRequest::ProbeProgram`]) and this effect receives the
+    /// consequence.
+    ///
+    /// The exit code is carried even when nonzero: a confined command that exits
+    /// 1 ran fine, and the sandbox classification rules cannot be applied
+    /// without it (`classifyRunnerFailure` is exit-gated). Only a spawn failure
+    /// — the program is absent, or the kernel refused to execute it — is an
+    /// [`EffectError`].
+    ProcessExec {
+        argv: Vec<String>,
+        /// Working directory, absolute. `None` inherits the server's cwd, which
+        /// only an unconfined call should do.
+        workdir: Option<String>,
+        /// Environment, as name/value pairs. Deliberately *not* inherited: the
+        /// server's environment holds credentials, and a shell tool must not
+        /// hand them to a model-authored command.
+        env: Vec<(String, String)>,
+        /// Kill the child after this many milliseconds. `None` means no bound.
+        timeout_ms: Option<u64>,
+        /// Truncate each of stdout and stderr to this many bytes.
+        stdout_max_bytes: Option<usize>,
+        stdin: Option<String>,
+    },
+    /// Probe whether a program can be executed at all.
+    ///
+    /// The sandbox runner chain is selected by *functional* probe upstream — a
+    /// runner is usable only if it can create a profile and run `true` under it.
+    /// A machine cannot spawn, so the verdict arrives as data and the chain is
+    /// then walked purely.
+    ///
+    /// This is a `stat`-plus-`access` check, not an execution. The driver does
+    /// not run the program, because probing by execution would mean this host
+    /// spawns an arbitrary path a machine named, which is the thing the probe
+    /// exists to decide. Callers that need execution-grade evidence run the
+    /// runner for real and classify its output.
+    ProbeProgram { program: String },
 }
 
 // ---------------------------------------------------------------------------

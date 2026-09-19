@@ -24,6 +24,7 @@ pub mod plugin_inventory;
 pub mod provider;
 pub mod readcache;
 pub mod sandbox;
+pub mod sandbox_runner;
 pub mod session;
 pub mod session_feedback;
 pub mod session_references;

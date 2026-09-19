@@ -359,6 +359,11 @@ impl FsCache {
                 }
                 false
             }
+            // Neither of these is a filesystem observation, so neither is ever
+            // in flight here: a re-run cannot answer a subprocess from a cached
+            // file read, and pretending otherwise would replay a command with
+            // stale output.
+            EffectResult::ProcessDone { .. } | EffectResult::Probe { .. } => false,
             // A failure is remembered against whatever was in flight, so the
             // re-run treats it as absent rather than re-requesting forever.
             EffectResult::Failed(e) => match self.in_flight.take() {
