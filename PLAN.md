@@ -169,6 +169,38 @@ problems than a credential.
     `thinking: {block_index, kind, text}` object, not the `reasoning_content`
     string every fixture had assumed, so the decoder was silently dropping every
     reasoning token.
+- [x] **live streaming and the display channel (step 2b)** — a turn now reaches
+  a follower while the model is still talking. The provider call became a
+  *streaming* effect (`FetchStream`, with `MachineIn::EffectChunk` delivering
+  bytes **during** the read — the delivery is made from inside the sink, since
+  queueing chunks and replaying them after the fetch returns would produce a
+  byte-identical protocol at unchanged latency), `machines/agent.rs` decodes
+  incrementally, and `session/follow` grew the `assistantStream: true` half the
+  spec always had: live `start`/`chunk`/`end` frames plus the compacted
+  reconnect baseline (`machines/assistant_stream.rs`) a late joiner needs.
+  - **Where stitched markdown may legally ride is a constraint, not a choice.**
+    `text-delta.text` is append-only (a client accumulates `prev + text`), so a
+    *stitched* delta cannot exist: closing `**bo` to `**bo**` inserts characters
+    the model never wrote, the closer is baked into the client's concatenation,
+    and every later fragment lands after it — `Here is **bo**** text` where the
+    model wrote `Here is **bold** text`. `block-end` is the protocol's only
+    *retraction point* (a client applies the block wholesale), so the repair
+    rides there. `machines/markdown.rs` pins the impossibility as a test rather
+    than a comment. Deltas carry the model's own bytes; so does the durable
+    record.
+  - The agent now **announces the rows it writes**. It owns the log for a turn
+    it drives, so the follow stream's durable half has to hear about those rows
+    from the machine that appended them; without it a follower saw the live
+    partial and then nothing, while the `end` frame named a seq that never
+    arrived.
+  - Three defects the live run found and no unit test would have: chunks dropped
+    entirely (`fetch` recorded its effect id through `self.op` while the caller
+    had the op taken, so every chunk matched no call); the `start` frame never
+    emitted (the emitter set the flag it reads to decide whether the frame is
+    owed); and `agent/inbox/spliced` unannounced, so a follower's event sequence
+    skipped a seq. Verified by `conformance/wire/tests/live_stream.rs` against a
+    live gateway — 151 frames, deltas summing to the model's exact output, all
+    six rows announced gap-free.
 - [ ] tool seam + approval machine (step 3) — **the approval half has landed**:
   `machines/approval.rs` answers the `approval/request` waterfall (mounted and
   reachable through the real router, verified) and writes the
