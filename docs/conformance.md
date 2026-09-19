@@ -68,8 +68,8 @@ Both are pure file-level assertions — no host needs to run.
 
 ## Axis 3 — e2e replay
 
-`conformance/e2e-replay/` reuses the upstream web suite in `dsh/apps/web/tests`
-(~98 Playwright `.e2e.ts` cases). The adapter:
+`conformance/e2e-replay/` is named for the upstream web suite in
+`dsh/apps/web/tests` (98 Playwright `.e2e.ts` files). The eventual adapter:
 
 1. launches the candidate host under a scratch `$DSH_HOME` via
    `harness/runners/run.sh $HOST start`,
@@ -78,16 +78,35 @@ Both are pure file-level assertions — no host needs to run.
 3. emits **cell diffs** against the control run (`test X passed under JS but
    failed under vocoderd`).
 
-**What actually exists today** (the above is the M3 target, not the current
-state): `conformance/e2e-replay/e2e-client.mjs` is a 59-line standalone smoke
-test with four hand-written cells — shell boots, root mounts, no console errors,
-boot payload observed. It does not reuse the upstream `.e2e.ts` specs, and there
-is no control comparison or `adapter.ts` yet. Current baseline against vocoderd:
-3/4 cells pass; the failure is real and informative — the GUI aborts with
+**What actually exists today** (the above is the target, not the current state):
+`conformance/e2e-replay/e2e-client.mjs` is a standalone smoke test with four
+hand-written cells — shell boots, root mounts, no console errors, boot payload
+observed. It does not reuse the upstream `.e2e.ts` specs, and there is no
+control comparison or `adapter.ts` yet. Current baseline against vocoderd: 3/4
+cells pass; the failure is real and informative — the GUI aborts with
 `window.__ModuleLoader__ bootstrap facade is missing`, i.e. vocoderd injects
 `__DSH_BOOT__` but not the module-loader facade the shell requires.
 
-Real-API cases self-skip without `DEEPSEEK_API_KEY`, like upstream; the recorded
+**Two independent obstacles, both larger than a missing credential.** An earlier
+draft of this section claimed the suite self-skips ~94 of 98 cases without
+`DEEPSEEK_API_KEY` and that the axis therefore had a 4-cell ceiling. That is
+backwards and has been removed. Keyless replay is upstream's *default* mode:
+`launchWebScaffold` disables `llm-deepseek` and installs the replay provider
+(`dsh/apps/web/tests/scaffold.ts`), `scripts/run-gates.ts` runs the whole web
+lane as `DSH_SNAPSHOT=replay … test:web:ci`, and the snapshots job in
+`dsh/.github/workflows/ci.yml` carries no key. 94 of the 98 files never mention
+it. What actually blocks the replay:
+
+1. **`launchWebScaffold` is not an HTTP adapter.** It boots the real Cordis
+   Loader *in-process* over the shipped profile bundles and hands the test the
+   live `Context`. 60 of the 98 specs consume that host-side surface directly
+   (49 `scaffold.ctx`, 33 `whenTurnSettled()`, 12 `harnessHome`/`persistenceRoot`,
+   3 `hostFetch`). For those, the test *is* the host.
+2. **The client-module pipeline does not exist** (M5): the shell cannot boot
+   against a static dist.
+
+`conformance/e2e-replay/spec-classification.mjs` measures (1) per spec rather
+than assuming it; its URL-only list is the target M5 will replay. The recorded
 snapshot corpus (`snapshots/web`) is the default fidelity source.
 
 ## Axis 4 — composition replay

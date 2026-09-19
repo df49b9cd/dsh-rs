@@ -67,12 +67,49 @@ run: see *Known gaps* below.
 
 - API controller machines (goals, sessions, workspace, settings) behind descriptors
 - [x] Static client asset serving (`--web-dist`); `window.__DSH_BOOT__` boot manifest
-- [ ] `window.__ModuleLoader__` bootstrap facade — the shell aborts without it,
-  which is the one failing e2e cell today
-- [ ] `conformance/e2e-replay` adapter live; cell-level diff reporting vs control
-  (today it is a 4-cell boot smoke test, not the upstream-suite replay)
+- [ ] `conformance/e2e-replay` as a boot smoke test — 4 cells, **3/4 passing**.
+  The failure is real and diagnosed; see the M5 bullet on the client-module
+  pipeline. This is the honest ceiling until that pipeline exists.
+- [ ] Per-spec classification of the 98 upstream web specs — which can run
+  against a URL, which need the in-process scaffold, which need the M5 pipeline.
+  Measured by `conformance/e2e-replay/spec-classification.mjs`; the URL-only
+  list is M5's e2e target.
 
-**Exit:** e2e diff report exists and shrinks release-over-release.
+**Exit:** the e2e axis reports what it actually measures — a 4-cell boot smoke
+test with its one failure named, plus a measured classification of the upstream
+suite it is named for — and the *non*-e2e business surface is complete for the
+namespaces that do not depend on the agent core.
+
+**Why the original exit criterion moved.** It read "e2e diff report exists and
+shrinks release-over-release", inherited from the intent to replay upstream's
+`apps/web/tests/*.e2e.ts`. That target is not reachable from here, for two
+reasons now established:
+
+1. The replay needs the **client-module pipeline** (below), which is M5 work.
+2. `launchWebScaffold` is not an HTTP adapter: it boots the real Cordis Loader
+   *in-process* (`dsh/apps/web/tests/scaffold.ts`) and hands each test the live
+   `Context`. 60 of the 98 upstream web specs consume that host-side surface
+   directly — 49 reach for `scaffold.ctx`, 33 call `whenTurnSettled()`, 12 use
+   `harnessHome`/`persistenceRoot`, 3 use `hostFetch`. For two thirds of the
+   suite the test *is* the host, so pointing a `baseUrl` at vocoderd does not
+   replay them.
+
+Only 38 specs are free of in-process coupling; how many of those are *also*
+blocked by M5, by the `?fixture` Connection mode, or by namespaces vocoderd does
+not yet answer is what `conformance/e2e-replay/` now measures rather than
+assumes.
+
+**An earlier draft of this section was wrong, and the correction is load-bearing.**
+It claimed "only 4 of the 98 upstream `.e2e.ts` specs are keyless — the other ~94
+self-skip without `DEEPSEEK_API_KEY`", and concluded the axis could never measure
+much. The reverse is true: keyless replay is upstream's *default* mode and its
+own CI runs the whole web lane that way (`scripts/run-gates.ts` runs
+`DSH_SNAPSHOT=replay … test:web:ci`, and the snapshots job in
+`dsh/.github/workflows/ci.yml` carries no key at all). 94 of the 98 files never
+mention the key; across all of dsh only 11 `.e2e.ts` files self-skip for a
+missing key. The axis's ceiling is ~98 cells, not 4 — the obstacle is the
+in-process scaffold and the missing client-module pipeline, which are larger
+problems than a credential.
 
 ## M4 — Agent core
 
@@ -84,6 +121,19 @@ run: see *Known gaps* below.
 
 - Typert-over-subprocess machine ("vocoder plugin ABI") — already the default
   shape; M5 is productionizing, not researching
+- **Client-module pipeline** — the prerequisite for a working web GUI, and the
+  reason e2e-replay is stuck at 3/4. Upstream does not serve a static dist:
+  `ClientModuleRegistry` (`dsh/packages/client/modules/src/index.ts`,
+  `bootInjections()`) scans loaded entries for `dsh.client` declarations at
+  runtime, builds a `WebBootGraph`, serves each plugin's client bundle from its
+  own batch routes, and *generates* the index injection table — the inline
+  `__ModuleLoader__` registration queue, the application preloads, the blocking
+  bootstrap scripts, and finally the `__DSH_BOOT__` graph global. vocoderd serves
+  `apps/web/dist/` as static files (which holds only `index.html`, one app chunk,
+  one vendor chunk, CSS, fonts, and languages — **no client-modules bundle and no
+  per-plugin bundles**) and injects a stub `__DSH_BOOT__`, so the shell throws
+  `web boot: window.__ModuleLoader__ bootstrap facade is missing` before mount.
+  Building this is what moves e2e-replay from 3/4 toward 4/4.
 - Composition-replay axis reaches full profile coverage
 - Optional JS-compat island (rquickjs) scoped to `Out::SpawnScope` subtrees
 
@@ -96,8 +146,10 @@ than it is:
   axes — `session-replay`, `e2e-replay`, `composition-replay` — are still
   candidate-only, so their parity half remains unmeasured.
 - **`M1`'s generated traits are dead code** (see M1).
-- **e2e-replay does not replay upstream specs** (see M3), and its one failure is
-  a real product gap (`__ModuleLoader__`), not a missing assertion.
+- **e2e-replay does not replay upstream specs** (see M3). Two independent gaps
+  block it, both larger than a credential: the missing `__ModuleLoader__`
+  pipeline (M5) and the in-process `launchWebScaffold` that 60 of the 98 specs
+  depend on. Its one failing cell is a real product gap, not a missing assertion.
 - **Composition traces are hand-authored**, not recorded from JS (see M5).
 - **`session-replay` has no suite directory**; its tests live in
   `rust/crates/vocoder-session/tests/interop.rs`.

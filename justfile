@@ -21,6 +21,10 @@ codegen:
 coverage-report:
     cargo run --manifest-path tools/codegen/Cargo.toml -- coverage-report
 
+# Classify the upstream web e2e suite: what each spec would need to run here.
+e2e-classify:
+    node conformance/e2e-replay/spec-classification.mjs --json conformance/e2e-replay/spec-classification.json
+
 # Rust housekeeping.
 build:
     cargo build --workspace

@@ -1,0 +1,666 @@
+{
+  "generatedFrom": "conformance/e2e-replay/spec-classification.mjs",
+  "specFileCount": 98,
+  "unimplementedEndpointCount": 28,
+  "counts": {
+    "url-only": 35,
+    "needs-fixture-mode": 3,
+    "needs-unimplemented-namespace": 0,
+    "in-process-coupled": 60
+  },
+  "rows": [
+    {
+      "file": "access-confirmation.e2e.ts",
+      "category": "url-only",
+      "evidence": []
+    },
+    {
+      "file": "agent-preset-authoring.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "hostFetch"
+      ]
+    },
+    {
+      "file": "agent-preset-selection.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx",
+        "hostFetch"
+      ]
+    },
+    {
+      "file": "agent-team-panel.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx"
+      ]
+    },
+    {
+      "file": "approval-composer.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx",
+        "whenTurnSettled"
+      ]
+    },
+    {
+      "file": "background-job-list.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx"
+      ]
+    },
+    {
+      "file": "bash-abort-row.e2e.ts",
+      "category": "url-only",
+      "evidence": []
+    },
+    {
+      "file": "built-boot.expected.e2e.ts",
+      "category": "needs-fixture-mode",
+      "evidence": [
+        "?fixture"
+      ]
+    },
+    {
+      "file": "chat-continuous-conversation.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx",
+        "whenTurnSettled"
+      ]
+    },
+    {
+      "file": "chat-long-interactions.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx",
+        "whenTurnSettled"
+      ]
+    },
+    {
+      "file": "chat-scroll-contract.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx",
+        "whenTurnSettled"
+      ]
+    },
+    {
+      "file": "clickable-links-gallery.e2e.ts",
+      "category": "url-only",
+      "evidence": []
+    },
+    {
+      "file": "command-image-envelope.expected.e2e.ts",
+      "category": "url-only",
+      "evidence": []
+    },
+    {
+      "file": "composer-draft-scroll.e2e.ts",
+      "category": "url-only",
+      "evidence": []
+    },
+    {
+      "file": "composer-placeholder.e2e.ts",
+      "category": "url-only",
+      "evidence": []
+    },
+    {
+      "file": "composer-tab-geometry.e2e.ts",
+      "category": "url-only",
+      "evidence": []
+    },
+    {
+      "file": "cordis-tool-round.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx",
+        "whenTurnSettled"
+      ]
+    },
+    {
+      "file": "declared-reasoning.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx",
+        "harnessHome"
+      ]
+    },
+    {
+      "file": "default-model.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx",
+        "harnessHome"
+      ]
+    },
+    {
+      "file": "details-session-lifecycle.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "whenTurnSettled"
+      ]
+    },
+    {
+      "file": "document-preview.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx",
+        "whenTurnSettled"
+      ]
+    },
+    {
+      "file": "feedback-command.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "whenTurnSettled"
+      ]
+    },
+    {
+      "file": "feedback-release.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx",
+        "whenTurnSettled"
+      ]
+    },
+    {
+      "file": "file-upload-round.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx",
+        "whenTurnSettled"
+      ]
+    },
+    {
+      "file": "github-ready-review.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx"
+      ]
+    },
+    {
+      "file": "goal-bar.e2e.ts",
+      "category": "needs-fixture-mode",
+      "evidence": [
+        "?fixture"
+      ]
+    },
+    {
+      "file": "goal-command-presentation.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx"
+      ]
+    },
+    {
+      "file": "goal-multi-turn-actions.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx"
+      ]
+    },
+    {
+      "file": "hmr-live.e2e.ts",
+      "category": "url-only",
+      "evidence": []
+    },
+    {
+      "file": "home-path-tilde.expected.e2e.ts",
+      "category": "url-only",
+      "evidence": []
+    },
+    {
+      "file": "image-display.expected.e2e.ts",
+      "category": "needs-fixture-mode",
+      "evidence": [
+        "?fixture"
+      ]
+    },
+    {
+      "file": "lifecycle-chrome.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx",
+        "whenTurnSettled"
+      ]
+    },
+    {
+      "file": "live-interactions.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx",
+        "whenTurnSettled"
+      ]
+    },
+    {
+      "file": "markdown-cjk-strong.e2e.ts",
+      "category": "url-only",
+      "evidence": []
+    },
+    {
+      "file": "markdown-images.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "persistenceRoot"
+      ]
+    },
+    {
+      "file": "markdown-inline-code-links.e2e.ts",
+      "category": "url-only",
+      "evidence": []
+    },
+    {
+      "file": "markdown-wide-table.e2e.ts",
+      "category": "url-only",
+      "evidence": []
+    },
+    {
+      "file": "math-rendering.e2e.ts",
+      "category": "url-only",
+      "evidence": []
+    },
+    {
+      "file": "max-tokens-notice.expected.e2e.ts",
+      "category": "url-only",
+      "evidence": []
+    },
+    {
+      "file": "message-actions.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx"
+      ]
+    },
+    {
+      "file": "message-feedback.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx"
+      ]
+    },
+    {
+      "file": "models-settings-recovery.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "harnessHome"
+      ]
+    },
+    {
+      "file": "models-settings.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "harnessHome"
+      ]
+    },
+    {
+      "file": "navigation-panes.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "whenTurnSettled"
+      ]
+    },
+    {
+      "file": "onboarding-deepseek-config.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx",
+        "harnessHome"
+      ]
+    },
+    {
+      "file": "onboarding-usable-provider.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "harnessHome"
+      ]
+    },
+    {
+      "file": "open-in-app-ssh.e2e.ts",
+      "category": "url-only",
+      "evidence": []
+    },
+    {
+      "file": "permission-policy-context.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx",
+        "whenTurnSettled"
+      ]
+    },
+    {
+      "file": "plan-control-row.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx"
+      ]
+    },
+    {
+      "file": "plan-review.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx",
+        "whenTurnSettled"
+      ]
+    },
+    {
+      "file": "plugin-config.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "harnessHome"
+      ]
+    },
+    {
+      "file": "present-svg.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx",
+        "whenTurnSettled"
+      ]
+    },
+    {
+      "file": "present.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx",
+        "whenTurnSettled"
+      ]
+    },
+    {
+      "file": "preview-boot.e2e.ts",
+      "category": "url-only",
+      "evidence": []
+    },
+    {
+      "file": "produced-file-mentions.e2e.ts",
+      "category": "url-only",
+      "evidence": []
+    },
+    {
+      "file": "produced-files.e2e.ts",
+      "category": "url-only",
+      "evidence": []
+    },
+    {
+      "file": "ptc-round.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx",
+        "whenTurnSettled"
+      ]
+    },
+    {
+      "file": "pwa-manifest.e2e.ts",
+      "category": "url-only",
+      "evidence": []
+    },
+    {
+      "file": "pwsh-terminal.e2e.ts",
+      "category": "url-only",
+      "evidence": []
+    },
+    {
+      "file": "question-composer.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx",
+        "whenTurnSettled"
+      ]
+    },
+    {
+      "file": "queue-actions.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx",
+        "whenTurnSettled"
+      ]
+    },
+    {
+      "file": "queue-image.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx",
+        "whenTurnSettled"
+      ]
+    },
+    {
+      "file": "rail-search-expand.e2e.ts",
+      "category": "url-only",
+      "evidence": []
+    },
+    {
+      "file": "reference-composer.e2e.ts",
+      "category": "url-only",
+      "evidence": []
+    },
+    {
+      "file": "remote-welcome.e2e.ts",
+      "category": "url-only",
+      "evidence": []
+    },
+    {
+      "file": "replay-round-trip.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx",
+        "whenTurnSettled"
+      ]
+    },
+    {
+      "file": "scaffold-hermetic.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx"
+      ]
+    },
+    {
+      "file": "schedule-after.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx",
+        "whenTurnSettled"
+      ]
+    },
+    {
+      "file": "search-card.expected.e2e.ts",
+      "category": "url-only",
+      "evidence": []
+    },
+    {
+      "file": "seeded-history.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx",
+        "whenTurnSettled",
+        "harnessHome"
+      ]
+    },
+    {
+      "file": "settings-chrome.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx",
+        "harnessHome"
+      ]
+    },
+    {
+      "file": "shipped-composition.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx"
+      ]
+    },
+    {
+      "file": "sidebar-right.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx"
+      ]
+    },
+    {
+      "file": "sidebar-scrollbar.e2e.ts",
+      "category": "url-only",
+      "evidence": []
+    },
+    {
+      "file": "sidebar-subagent-activity.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx"
+      ]
+    },
+    {
+      "file": "skill-invocation-policy.e2e.ts",
+      "category": "url-only",
+      "evidence": []
+    },
+    {
+      "file": "skill-tool-row.e2e.ts",
+      "category": "url-only",
+      "evidence": []
+    },
+    {
+      "file": "skill-user-invoke.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "whenTurnSettled"
+      ]
+    },
+    {
+      "file": "smoke-real.e2e.ts",
+      "category": "url-only",
+      "evidence": []
+    },
+    {
+      "file": "startup-auto-selection.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx"
+      ]
+    },
+    {
+      "file": "startup-rpc-budget.e2e.ts",
+      "category": "url-only",
+      "evidence": []
+    },
+    {
+      "file": "stats-paged-history.e2e.ts",
+      "category": "url-only",
+      "evidence": []
+    },
+    {
+      "file": "steering.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx",
+        "whenTurnSettled"
+      ]
+    },
+    {
+      "file": "streaming-fence-highlight.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx",
+        "whenTurnSettled"
+      ]
+    },
+    {
+      "file": "subagent-conversation.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx",
+        "whenTurnSettled"
+      ]
+    },
+    {
+      "file": "subagent-interrupt-ui.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx",
+        "whenTurnSettled"
+      ]
+    },
+    {
+      "file": "subagent-interrupt.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx",
+        "whenTurnSettled",
+        "hostFetch"
+      ]
+    },
+    {
+      "file": "submission-echo.e2e.ts",
+      "category": "url-only",
+      "evidence": []
+    },
+    {
+      "file": "support-timezone.e2e.ts",
+      "category": "url-only",
+      "evidence": []
+    },
+    {
+      "file": "todo-row.expected.e2e.ts",
+      "category": "url-only",
+      "evidence": []
+    },
+    {
+      "file": "trajectory-image-display.expected.e2e.ts",
+      "category": "url-only",
+      "evidence": []
+    },
+    {
+      "file": "trajectory-virtualization.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "whenTurnSettled"
+      ]
+    },
+    {
+      "file": "turn-tail-actions.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx",
+        "whenTurnSettled",
+        "harnessHome"
+      ]
+    },
+    {
+      "file": "vite-entry.e2e.ts",
+      "category": "url-only",
+      "evidence": []
+    },
+    {
+      "file": "web-search-round.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx",
+        "whenTurnSettled"
+      ]
+    },
+    {
+      "file": "workflow-run.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx"
+      ]
+    },
+    {
+      "file": "workspace-management.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx",
+        "persistenceRoot"
+      ]
+    },
+    {
+      "file": "workspace-new-session-folding.e2e.ts",
+      "category": "in-process-coupled",
+      "evidence": [
+        "scaffold.ctx"
+      ]
+    }
+  ]
+}
