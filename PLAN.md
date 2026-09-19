@@ -47,13 +47,17 @@ run: see *Known gaps* below.
   so the façade is currently dead code. Adopting it is the remaining M1 work and
   retires the same untyped-JSON class of bug the `Raw` effect used to cause.
 - [ ] cancellation: `AbortSignal` ↔ `CancellationToken` as machine inputs
-- [x] `conformance/wire` endpoint coverage on both hosts — 28 cells over 12
+- [x] `conformance/wire` endpoint coverage on both hosts — 34 cells over 16
   namespaces, and the control-host (`dsh`) run is done: both hosts are green,
   so the cells are now a parity check rather than a candidate-only smoke test.
-  Getting there fixed two harness defects and one candidate divergence (the
-  control's auth cookie was never sent; `settings/update` accepted namespaces
-  no plugin registers). One divergence is *recorded*, not resolved: an unknown
-  method is a bare 404 on the control and a typed envelope on the candidate.
+  The first genuine control run found **four candidate defects** that
+  candidate-only testing could not (the `goals/*` shapes, `session/page`
+  clamping an out-of-range cursor, `settings/update` bumping the revision on a
+  no-op, and three wrong arg shapes in the cells themselves) plus two harness
+  defects (the control's auth cookie was never sent; `directoryPicker/pick`
+  hangs the run on a native dialog). All are fixed; the divergences that remain
+  are *recorded* and asserted around rather than resolved — see
+  [docs/conformance.md](docs/conformance.md) for the table.
 
 ## M2 — Session log
 
@@ -70,10 +74,12 @@ run: see *Known gaps* below.
 - [ ] `conformance/e2e-replay` as a boot smoke test — 4 cells, **3/4 passing**.
   The failure is real and diagnosed; see the M5 bullet on the client-module
   pipeline. This is the honest ceiling until that pipeline exists.
-- [ ] Per-spec classification of the 98 upstream web specs — which can run
+- [x] Per-spec classification of the 98 upstream web specs — which can run
   against a URL, which need the in-process scaffold, which need the M5 pipeline.
-  Measured by `conformance/e2e-replay/spec-classification.mjs`; the URL-only
-  list is M5's e2e target.
+  Measured by `conformance/e2e-replay/spec-classification.mjs` (`just
+  e2e-classify`); the URL-only list is M5's e2e target. Result: 60
+  in-process-coupled, 35 URL-only, 3 needing `?fixture` mode, 0 blocked on an
+  unimplemented namespace.
 
 **Exit:** the e2e axis reports what it actually measures — a 4-cell boot smoke
 test with its one failure named, plus a measured classification of the upstream
