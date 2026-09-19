@@ -338,6 +338,10 @@ async fn main() -> Result<()> {
         machine: Box::new(crate::machines::events::EventsMachine::default()),
     });
     initial_router.handle(RouteIn::Mount {
+        id: MachineId::new("approval"),
+        machine: Box::new(crate::machines::approval::ApprovalMachine::new()),
+    });
+    initial_router.handle(RouteIn::Mount {
         id: MachineId::new("agentTeams"),
         machine: Box::new(crate::machines::agent_teams::AgentTeamsMachine::default()),
     });

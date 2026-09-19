@@ -23,9 +23,17 @@ impl PluginMachine for EventsMachine {
 
     fn handle(&mut self, ev: MachineIn) -> Vec<MachineOut> {
         if let MachineIn::ServicesReady { .. } = &ev {
-            // Subscribe to every forwarded catalog event minus waterfall
-            // modes (approval/* requires the $events/result round-trip —
-            // deferred to M4's approval machine).
+            // Subscribe to every forwarded catalog event **minus the waterfall
+            // modes**. Those are answered by the machine that owns them, not
+            // broadcast here: `approval/request` is claimed by the approval
+            // machine (see `approval.rs`), and this machine subscribing would
+            // put an unqualified listener in the chain whose silence reads as a
+            // delegate.
+            //
+            // `user-questions/request` is the other waterfall event and is still
+            // unanswered — no machine owns it, so a client's question reaches no
+            // answerer yet. It is deliberately *not* subscribed here, for the
+            // same reason.
             let catalog: &[&str] = &[
                 "agent-preset/selected",
                 "api-session/activity",

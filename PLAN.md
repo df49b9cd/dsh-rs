@@ -169,7 +169,14 @@ problems than a credential.
     `thinking: {block_index, kind, text}` object, not the `reasoning_content`
     string every fixture had assumed, so the decoder was silently dropping every
     reasoning token.
-- [ ] tool seam + approval machine (step 3)
+- [ ] tool seam + approval machine (step 3) — **the approval half has landed**:
+  `machines/approval.rs` answers the `approval/request` waterfall (mounted and
+  reachable through the real router, verified) and writes the
+  `approval/asked`/`approval/decided` audit pair, failing **closed** with
+  `unavailable` since this host composes no interactive answerer. What remains
+  is the *emitter*: upstream raises these from the tool executor, so until that
+  exists nothing dispatches the event and `session/prompt` answers a tool call
+  by opening a step with no results to send.
 - [ ] sandbox machines (Landlock/seccomp native) (step 4)
 
 ## M5 — Plugin interop

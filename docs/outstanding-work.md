@@ -10,7 +10,7 @@ parity question existed.
 > predicted — each was surfaced by extending wire coverage and running the
 > control, and each is fixed with a cell. Measured result: **45 wire cells green
 > on both hosts** (`./run-conformance.sh {dsh,vocoderd} wire`), 267 Rust tests
-> passing, codegen and coverage-report both idempotent.
+
 >
 > P2 step 2 (the LLM seam) landed after that and is verified **against a live
 > provider endpoint**, not only against recorded data: a `session/prompt` over
@@ -212,9 +212,24 @@ Suggested order, each step ending somewhere useful:
    `user/message → agent/inbox/spliced → turn/start → step/start →
    assistant/message → step/end → turn/end {completed}`, with real token counts
    and a stream record the replay provider can re-derive.
-3. **Tool seam + approval machine.** Unblocks the `$events/result` round-trip
-   deferred at `events.rs:28` and the `approval/*` waterfall, currently
-   subscribed by no machine.
+3. **Tool seam + approval machine — the approval half is DONE** (2026-09-19).
+   `machines/approval.rs` is mounted and answers the `approval/request`
+   waterfall; a test drives it through the **real router** (mount, dispatch,
+   verdict fold) rather than only calling the machine, because subscription and
+   chain folding are the router's job and a machine-level test cannot see them.
+   It writes the durable `approval/asked`/`approval/decided` pair and
+   **fails closed** with `unavailable`, which is the load-bearing behaviour: a
+   `never` policy means "do not ask", and mapping that to `allowed-once` would
+   turn it into a silent grant.
+
+   What remains is the **emitter**. Upstream raises these from the tool
+   executor, so until that exists nothing dispatches the event — which is why
+   the audit row queue has no consumer and the module says so rather than
+   inventing a synthetic ask. A machine that raised its own requests would fill
+   the log with questions no tool asked and turn a real gap into a green test.
+   The `events.rs` note is updated accordingly: the waterfall events are
+   answered by their owners, not broadcast, and `user-questions/request` is the
+   remaining unanswered one.
 4. **Sandbox machines** (Landlock/seccomp native). Largely independent of 1–3;
    can proceed in parallel if there is a second worker.
 

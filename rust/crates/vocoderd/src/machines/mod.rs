@@ -8,6 +8,7 @@ pub mod agent_inbox;
 pub mod agent_loop;
 pub mod agent_presets;
 pub mod agent_teams;
+pub mod approval;
 pub mod commands;
 pub mod credentials;
 pub mod directory_picker;
