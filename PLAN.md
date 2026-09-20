@@ -502,14 +502,15 @@ than it is:
   `dynamicCordisRunner/syncInspectManifest`) now agree, and
   `a_nested_missing_required_field_is_input_invalid_cell` plus
   `a_nested_extra_key_is_not_a_boundary_failure_cell` pin both halves.
-- **An envelope with no `args` field is a different error code on the
-  candidate** (found in the same 2026-09-20 sweep). A `payload` that carries no
-  `args` (or a non-object one) is `gateway/internal` on the control ("Remote
-  payload must contain exactly one plain-object args field") and
-  `gateway/arguments-invalid` on vocoderd, which reads a non-object `args` as a
-  missing required arg. Both refuse, in different codes; the invariant they
-  share is asserted by `an_absent_args_field_is_refused_by_both_hosts` and the
-  divergence is named in [docs/conformance.md](docs/conformance.md).
+- **An envelope with no `args` field now gets the same code on both hosts**
+  (closed 2026-09-20). The candidate reproduces the control's payload-shape
+  gate (`validate::payload_shape_ok`, applied in `main.rs` before the registry
+  lookup, as the control's `remoteRequest` precedes the descriptor):
+  `gateway/internal`, the control's verbatim message, on both hosts. The
+  sweep's cell pinned the divergence but missed its worse half — a **zero-arg**
+  endpoint (`session/modelCatalog`) *accepted* an absent or non-object `args`
+  where the control refuses unconditionally; the gate closes that too, and the
+  strengthened cell probes both endpoint shapes.
 - **`seccomp` is not implemented** (see M4 step 4), despite the plan item naming
   it. Upstream's Linux chain does not use seccomp either — it is `bwrap` then
   Landlock — so the vocabulary in this item was wrong, not merely incomplete.

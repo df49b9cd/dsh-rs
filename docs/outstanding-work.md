@@ -440,12 +440,17 @@ live hosts, the five endpoints now agree with the control
 `a_nested_missing_required_field_is_input_invalid_cell` +
 `a_nested_extra_key_is_not_a_boundary_failure_cell` pin both halves.
 
-One *different* divergence was found in the same sweep and is recorded rather
-than fixed: an envelope whose `payload` carries **no `args` field** (or a
-non-object one) is `gateway/internal` on the control ("must contain exactly one
-plain-object args field") and `gateway/arguments-invalid` on the candidate. Both
-refuse; the code differs by route. `an_absent_args_field_is_refused_by_both_hosts`
-asserts the shared invariant and the table in `docs/conformance.md` names both.
+One *different* divergence was found in the same sweep — an envelope whose
+`payload` carried **no `args` field** (or a non-object one) was `gateway/internal`
+on the control ("must contain exactly one plain-object args field") and
+`gateway/arguments-invalid` on the candidate. **That divergence is now closed**
+(2026-09-20): vocoderd reproduces the control's payload-shape gate verbatim
+(`validate::payload_shape_ok`, run in `main.rs` before the registry lookup, as
+`remoteRequest` precedes the descriptor), including the case that was worse than
+divergent — a zero-arg endpoint like `session/modelCatalog` used to *accept* an
+absent or non-object `args`, where the control refuses unconditionally.
+`an_absent_args_field_is_refused_by_both_hosts` now asserts the exact code and
+message on both hosts, against both a required-arg and a zero-arg endpoint.
 
 ## Suggested sequencing
 
@@ -462,5 +467,4 @@ asserts the shared invariant and the table in `docs/conformance.md` names both.
    ("does the 35-spec URL-only set justify the axis?") is answered by
    measurement: the set is empty. What remains for M5 is 3.3–3.5.
 
-Deferred deliberately, not forgotten: the absent-`args` divergence above, and
-`harness/fixtures/`.
+Deferred deliberately, not forgotten: `harness/fixtures/`.

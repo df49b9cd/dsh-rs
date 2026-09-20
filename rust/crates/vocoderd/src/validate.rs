@@ -10,9 +10,13 @@
 //! delivered.
 //!
 //! **Why here, and why this shape.** The control host validates at its own
-//! boundary and answers three distinct codes, which were read off the running
+//! boundary and answers four distinct codes, which were read off the running
 //! control rather than inferred from the schema:
 //!
+//! 0. `gateway/internal` — the `payload` is not exactly one plain-object
+//!    `args` field. This gate runs *before* the descriptor is resolved
+//!    (`remoteRequest` in the gateway), so it lives in `main.rs` as
+//!    [`payload_shape_ok`], not in [`check`].
 //! 1. `gateway/arguments-invalid` — the `args` object's *names* do not match
 //!    the descriptor (`missing "x"` / `unexpected "x"`).
 //! 2. `gateway/input-invalid` — an arg is present but its *value* fails the
@@ -45,6 +49,28 @@
 use serde_json::Value;
 use vocoder_spec_api::validate::endpoint;
 
+/// The verbatim message the control answers when an envelope's `payload`
+/// fails its shape gate (`remoteRequest` in `api/gateway/src/index.ts`, which
+/// throws a bare `Error` that `rpcFailure` reports as `gateway/internal`).
+pub const PAYLOAD_SHAPE_MESSAGE: &str =
+    "Remote payload must contain exactly one plain-object args field";
+
+/// The payload-shape gate the control applies in `remoteRequest`, *before*
+/// the descriptor is resolved: `payload` must be a plain object whose only
+/// key is `args`, itself a plain object. The control does not distinguish the
+/// six failing conditions (payload not an object, extra keys, `args` absent,
+/// `args` null, `args` not an object) — one `||` chain, one message — so this
+/// gate does not either.
+///
+/// Run before the registry lookup, as the control does: the shape of the
+/// envelope is refused even for a namespace this host does not serve.
+pub fn payload_shape_ok(payload: &serde_json::Value) -> bool {
+    let Some(obj) = payload.as_object() else {
+        return false;
+    };
+    obj.len() == 1 && obj.get("args").is_some_and(Value::is_object)
+}
+
 /// Why an argument list was refused, as the code plus the field to name.
 ///
 /// The two codes are the control's; keeping them distinct matters because a
@@ -71,60 +97,50 @@ pub struct Rejection {
 /// `gateway/bad-request`, and an unknown namespace is the registry's.
 pub fn check(namespace: &str, method: &str, args: &serde_json::Value) -> Option<Rejection> {
     let spec = endpoint(namespace, method)?;
-    let obj = args.as_object();
+    let Some(obj) = args.as_object() else {
+        // The payload-shape gate in `main.rs` (`payload_shape_ok`) refuses a
+        // non-object `args` before this module runs, so this is unreachable
+        // from the wire. A direct caller gets no opinion rather than a wrong
+        // one: shape is the gate's layer, not this one's.
+        return None;
+    };
 
     // Layer 1a: every required arg is present.
-    if let Some(obj) = obj {
-        for arg in spec.args.iter().filter(|a| a.required) {
-            if !obj.contains_key(arg.wire) {
-                return Some(Rejection {
-                    code: "gateway/arguments-invalid",
-                    endpoint: format!("{namespace}/{method}"),
-                    field: arg.wire.to_string(),
-                    kind: Some("missing"),
-                });
-            }
-        }
-        // Layer 1b: no arg the descriptor does not declare.
-        if let Some(extra) = obj
-            .keys()
-            .find(|k| !spec.args.iter().any(|a| a.wire == k.as_str()))
-        {
+    for arg in spec.args.iter().filter(|a| a.required) {
+        if !obj.contains_key(arg.wire) {
             return Some(Rejection {
                 code: "gateway/arguments-invalid",
                 endpoint: format!("{namespace}/{method}"),
-                field: extra.clone(),
-                kind: Some("unexpected"),
+                field: arg.wire.to_string(),
+                kind: Some("missing"),
             });
         }
-    } else if spec.args.iter().any(|a| a.required) {
-        // A non-object `args` cannot satisfy a descriptor that requires args.
-        // An endpoint with no args accepts anything here, which matches the
-        // control: it validates the shape of what it is given, and there is
-        // nothing to check.
-        let first = spec.args.iter().find(|a| a.required).unwrap();
+    }
+    // Layer 1b: no arg the descriptor does not declare.
+    if let Some(extra) = obj
+        .keys()
+        .find(|k| !spec.args.iter().any(|a| a.wire == k.as_str()))
+    {
         return Some(Rejection {
             code: "gateway/arguments-invalid",
             endpoint: format!("{namespace}/{method}"),
-            field: first.wire.to_string(),
-            kind: Some("missing"),
+            field: extra.clone(),
+            kind: Some("unexpected"),
         });
     }
 
     // Layer 2: each present arg's value satisfies its codec's schema.
-    if let Some(obj) = obj {
-        for arg in spec.args {
-            let Some(value) = obj.get(arg.wire) else {
-                continue;
-            };
-            if !satisfies_str(value, arg.schema) {
-                return Some(Rejection {
-                    code: "gateway/input-invalid",
-                    endpoint: format!("{namespace}/{method}"),
-                    field: arg.wire.to_string(),
-                    kind: None,
-                });
-            }
+    for arg in spec.args {
+        let Some(value) = obj.get(arg.wire) else {
+            continue;
+        };
+        if !satisfies_str(value, arg.schema) {
+            return Some(Rejection {
+                code: "gateway/input-invalid",
+                endpoint: format!("{namespace}/{method}"),
+                field: arg.wire.to_string(),
+                kind: None,
+            });
         }
     }
     None
@@ -320,6 +336,27 @@ mod tests {
         assert_eq!(r.code, "gateway/arguments-invalid");
         assert_eq!(r.field, "parentSessionId");
         assert_eq!(r.kind, Some("missing"));
+    }
+
+    /// The payload-shape gate: exactly one plain-object `args`, nothing else —
+    /// the control's `remoteRequest` conditions, and its single answer for all
+    /// of them. `check` never sees these; `main.rs` refuses them first.
+    #[test]
+    fn the_payload_shape_gate_refuses_what_the_control_refuses() {
+        for bad in [
+            json!(null),
+            json!([]),
+            json!({ "args": {}, "extra": true }),
+            json!({ "only": true }),
+            json!({ "args": null }),
+            json!({ "args": [] }),
+            json!({ "args": "not-an-object" }),
+        ] {
+            assert!(!payload_shape_ok(&bad), "{bad}");
+        }
+        // The valid shapes: present plain-object `args`, empty or not.
+        assert!(payload_shape_ok(&json!({ "args": {} })));
+        assert!(payload_shape_ok(&json!({ "args": { "x": 1 } })));
     }
 
     #[test]

@@ -812,6 +812,18 @@ async fn api_rpc(
         }
     };
 
+    // The payload-shape gate runs first, as the control's `remoteRequest`
+    // does: an envelope whose payload is not exactly one plain-object `args`
+    // field is `gateway/internal` with the control's verbatim message, for any
+    // namespace — including one this host does not serve.
+    if !crate::validate::payload_shape_ok(&req.payload) {
+        return respond_err(
+            req.rpc_id.clone(),
+            "gateway/internal",
+            crate::validate::PAYLOAD_SHAPE_MESSAGE.to_string(),
+        );
+    }
+
     // Resolve the owning namespace through the registry, then the machine.
     let namespace = req.method.split('/').next().unwrap_or_default().to_string();
     let method = req.method.split('/').nth(1).unwrap_or_default().to_string();
@@ -832,12 +844,9 @@ async fn api_rpc(
     // The dispatch boundary: check the args against the spec'd descriptor
     // *before* the machine sees them, which is where the control host does its
     // own checks and why it answers `arguments-invalid`/`input-invalid` rather
-    // than whatever the machine would have said about a malformed payload.
-    let args = req
-        .payload
-        .get("args")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
+    // than whatever the machine would have said about a malformed payload. The
+    // payload-shape gate above has already guaranteed `args` is an object.
+    let args = req.payload.get("args").cloned().expect("shape gate passed");
     if let Some(rejection) = crate::validate::check(&namespace, &method, &args) {
         return crate::validate::respond(req.rpc_id.clone(), &rejection);
     }

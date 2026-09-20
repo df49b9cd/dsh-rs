@@ -157,39 +157,66 @@ async fn malformed_envelope_yields_bad_request() {
     assert_eq!(v["result"]["error"]["code"], "gateway/bad-request", "{v}");
 }
 
-/// An envelope whose `payload` carries **no `args` field** is refused by both
-/// hosts, in *different codes*, which this cell records rather than papers over.
+/// An envelope whose `payload` is not exactly one plain-object `args` field is
+/// refused by both hosts **with the same code and message** — this divergence
+/// was closed on 2026-09-20, and this cell now pins the agreement.
 ///
-/// - **control (dsh)**: `gateway/internal` "Remote payload must contain exactly
-///   one plain-object args field" — its payload reader rejects the absent key
-///   before the descriptor is consulted.
-/// - **candidate (vocoderd)**: `gateway/arguments-invalid` — a non-object (or
-///   absent) `args` cannot satisfy a descriptor that requires args, so it reads
-///   as a *missing required arg*.
-///
-/// Both refuse; the code differs because each host reaches the judgement by a
-/// different route. The cell asserts the invariant both meet — a typed
-/// `gateway/*` failure, never a 5xx and never a silent success — so a candidate
-/// that started accepting an args-less envelope would fail here.
+/// Both hosts apply the shape gate before the descriptor is consulted
+/// (the control's `remoteRequest`; the candidate's `payload_shape_ok`), so the
+/// answer is the same for every endpoint — including one with no declared args
+/// (`session/modelCatalog`, probed below), which the candidate once accepted.
 #[tokio::test]
 async fn an_absent_args_field_is_refused_by_both_hosts() {
-    for payload in [json!({}), json!({ "args": null }), json!({ "args": "not-an-object" })] {
-        let (status, v) = post_raw(
-            "subagents/list",
+    let shapes = [
+        json!({}),
+        json!({ "args": null }),
+        json!({ "args": "not-an-object" }),
+        json!({ "args": [] }),
+        json!({ "args": {}, "extra": true }),
+    ];
+    // Both a required-arg endpoint and a zero-arg endpoint: the gate runs
+    // before the descriptor, so the answer must not depend on either.
+    for method in ["subagents/list", "session/modelCatalog"] {
+        for payload in &shapes {
+            let (status, v) = post_raw(
+                method,
+                &json!({
+                    "type": "client-request",
+                    "rpcId": format!("cell-{}", uuid()),
+                    "method": method,
+                    "payload": payload,
+                }),
+            )
+            .await;
+            assert!(status < 500, "never a server fault ({status}): {v}");
+            assert_eq!(v["type"], "server-response", "{method} {payload}: {v}");
+            assert_eq!(v["result"]["ok"], false, "{method} {payload}: {v}");
+            assert_eq!(
+                v["result"]["error"]["code"], "gateway/internal",
+                "{method} {payload}: {v}"
+            );
+            assert_eq!(
+                v["result"]["error"]["message"],
+                "Remote payload must contain exactly one plain-object args field",
+                "{method} {payload}: {v}"
+            );
+        }
+        // The valid shape still passes the gate on both hosts (what the
+        // endpoint does with it is not this cell's business).
+        let (_, v) = post_raw(
+            method,
             &json!({
                 "type": "client-request",
                 "rpcId": format!("cell-{}", uuid()),
-                "method": "subagents/list",
-                "payload": payload,
+                "method": method,
+                "payload": { "args": {} },
             }),
         )
         .await;
-        assert!(status < 500, "never a server fault ({status}): {v}");
-        assert_eq!(v["result"]["ok"], false, "payload {payload}: {v}");
         let code = v["result"]["error"]["code"].as_str().unwrap_or_default();
         assert!(
-            code.starts_with("gateway/"),
-            "payload {payload}: expected a gateway/* refusal, got {code}: {v}"
+            v["result"]["ok"] == true || code != "gateway/internal",
+            "{method} with a well-shaped payload must pass the shape gate: {v}"
         );
     }
 }
