@@ -182,6 +182,7 @@ impl AppState {
             let result = crate::driver::realize_with_kills(
                 request,
                 &mut |bytes| {
+                    tracing::debug!("chunk: {} bytes", bytes.len());
                     during.extend(self.deliver(to, MachineIn::EffectChunk { id, bytes }));
                 },
                 Some(&self.children),
@@ -986,6 +987,7 @@ pub(crate) fn run_agent_turn(
     request_id: &str,
     content: serde_json::Value,
 ) {
+    tracing::info!(session = session_id, request = request_id, "agent turn starting");
     let payload = serde_json::json!({
         "method": "run",
         "args": {

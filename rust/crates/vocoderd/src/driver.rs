@@ -1229,16 +1229,12 @@ fn fetch_json(
         .map_err(|e| format!("read response body: {e}"))
 }
 
-/// Byte size of one read from a streaming body.
-///
-/// The body is read in fixed slices rather than with `read_to_end` so each
-/// slice can be handed to the sink the moment it lands. The size is a
-/// throughput/latency knob and nothing more: correctness never depends on where
-/// a read boundary falls, because the sink accepts an arbitrary byte boundary
-/// and the SSE decoder downstream is incremental over bytes.
-const STREAM_READ_CHUNK: usize = 8 * 1024;
+/// The sink's flush anchor, not a correctness boundary: a harness's `data` can
+/// split mid-line, which is exactly why this reader uses `read_line` — the
+/// decoder already knows what a frame looks like and does not need raw slices
+/// on its input side.
 
-/// POST a JSON body and read the response incrementally, handing each slice to
+/// POST a JSON body and read the response incrementally, handing each line to
 /// `sink` as it arrives. Returns `(status, whole_body)`.
 ///
 /// The body is accumulated as well as streamed, because both consumers need it:
@@ -1255,29 +1251,25 @@ fn fetch_streaming(
     body: &str,
     sink: &mut dyn FnMut(Vec<u8>),
 ) -> Result<(u16, String), String> {
-    use std::io::Read;
+    use std::io::BufRead;
     let response = post(url, headers, body)?;
     let status = response.status().as_u16();
-    let mut reader = response.into_body().into_reader();
-    let mut buf = vec![0u8; STREAM_READ_CHUNK];
-    let mut all: Vec<u8> = Vec::new();
+    let mut reader = std::io::BufReader::new(response.into_body().into_reader());
+    let mut all = String::new();
+    let mut line = String::new();
     loop {
-        match reader.read(&mut buf) {
-            // EOF.
+        line.clear();
+        match reader.read_line(&mut line) {
             Ok(0) => break,
-            Ok(n) => {
-                let slice = &buf[..n];
-                sink(slice.to_vec());
-                all.extend_from_slice(slice);
+            Ok(_) => {
+                let line = std::mem::take(&mut line);
+                all.push_str(&line);
+                sink(line.into_bytes());
             }
             Err(e) => return Err(format!("read response body: {e}")),
         }
     }
-    // Lossy on purpose, and deliberately so: a provider that emits invalid
-    // UTF-8 mid-stream should cost the caller that character, not the whole
-    // turn. The buffered path is lossy too (ureq's `Body::read_to_string`), so
-    // the two agree on the malformed case rather than diverging on it.
-    Ok((status, String::from_utf8_lossy(&all).into_owned()))
+    Ok((status, all))
 }
 
 /// Build and send one POST, shared by the buffered and streaming reads so the

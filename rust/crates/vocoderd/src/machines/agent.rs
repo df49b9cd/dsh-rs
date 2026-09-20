@@ -1297,6 +1297,7 @@ impl AgentMachine {
             }),
         )];
         if state.pending_calls.is_some() {
+            tracing::debug!("settle: has pending calls");
             self.op = Some(Op::Tools { state });
             // The calls are captured; the executor is created and driven on the
             // same re-entry that put the op in place.
@@ -1304,6 +1305,7 @@ impl AgentMachine {
             end_frames.extend(resumed);
             return end_frames;
         }
+        tracing::debug!("settle: no pending calls");
         let outs = state
             .fsm
             .step_reply(outcome, has_calls && !interrupted, false);
