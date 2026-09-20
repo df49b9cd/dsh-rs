@@ -501,6 +501,18 @@ than it is:
   covered by `provider.rs`'s per-dialect tests, but "a real provider accepts this
   `tools` array and this `tool-result` item" is not something fixtures can
   confirm. `live_stream.rs` has the same property and for the same reason.
+  **Attempted 2026-09-20 against the local awd relay** (`AWD_API_KEY` on
+  `:4000/v1`, `claude-haiku-4-5`, all three env vars set): the key works against
+  the relay (a direct `curl` streams fine), and the wire half of the probe
+  passes — `session/prompt` returns `accepted: true` and the `user/message`
+  row lands. The *turn* never settles: `agent turn starting` is logged, and no
+  `step/start` / `assistant/message` ever follows, so the follow stream's
+  snapshot shows only the prompt. The provider call is being made but its
+  chunks never complete the effect — the pump holds the dispatch lock across
+  the stream, so if the read stalls mid-stream the rest of the answer never
+  arrives and the loop sits in `pending`. Reproduces reliably; next step is to
+  instrument `fetch_streaming` (or the effect's chunk delivery) rather than
+  blame the relay.
 - **The `edit` version guard is now real, not a reduction** (landed 2026-09-20).
   `fs-observation-policy`'s contract is reproduced end to end: the executor
   records the session's observations from each resolving `Stat` (present at a
