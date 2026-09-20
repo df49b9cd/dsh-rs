@@ -190,6 +190,14 @@ pub enum EffectResult {
         /// inferable from the text.
         truncated: bool,
         timed_out: bool,
+        /// The child was killed because the *turn* was cancelled, not because
+        /// its own deadline fired — upstream's `TOOL_ABORTED` class, distinct
+        /// from a timeout so the model treats it as "stopped by the user".
+        aborted: bool,
+        /// Where the untruncated stream was written, when an overflow happened
+        /// and the caller asked for one (upstream's `spillPath`). `None` for a
+        /// run that fit the bound, or one whose spill could not be written.
+        spill_path: Option<String>,
     },
     /// A [`RealizeRequest::ProbeProgram`] settled.
     Probe { found: bool },
@@ -528,7 +536,20 @@ pub enum RealizeRequest {
         timeout_ms: Option<u64>,
         /// Truncate each of stdout and stderr to this many bytes.
         stdout_max_bytes: Option<usize>,
+        /// When output exceeds `stdout_max_bytes`, write the untruncated stream
+        /// here (upstream's `spill: { maxBytes }`): the answered text keeps the
+        /// tail and `ProcessDone.spill_path` names the file. The directory is
+        /// created private (`0o700`); `None` means the overflow is simply
+        /// dropped, which is what the truncation suffix reports as
+        /// `(unavailable)`.
+        spill_dir: Option<String>,
         stdin: Option<String>,
+        /// A session id the run is bound to, when one exists. A turn cancel for
+        /// that session kills the child (SIGTERM, then SIGKILL after the grace)
+        /// and the settled answer arrives with `aborted: true` — the driver
+        /// registers the child under this id for the duration of the run so the
+        /// cancel can reach it without waiting out the pump's serialization.
+        kill_key: Option<String>,
     },
     /// Probe whether a program can be executed at all.
     ///

@@ -988,6 +988,11 @@ pub enum Answer {
         stderr: String,
         truncated: bool,
         timed_out: bool,
+        /// The turn was cancelled and the child was killed for it, distinct
+        /// from its own deadline firing.
+        aborted: bool,
+        /// Where the untruncated stream spilled, when it overflowed.
+        spill_path: Option<String>,
     },
     /// The effect failed, with the message the driver rendered.
     Failed(String),

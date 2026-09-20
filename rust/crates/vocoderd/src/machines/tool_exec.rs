@@ -692,7 +692,9 @@ impl Executor {
                         stderr,
                         truncated,
                         timed_out,
-                    }) => (exit_code, signal, stdout, stderr, truncated, timed_out),
+                        aborted,
+                        spill_path,
+                    }) => (exit_code, signal, stdout, stderr, truncated, timed_out, aborted, spill_path),
                     // A spawn failure is not a command that failed — no command
                     // ran. It is the runner being unusable, the same class as a
                     // missing backend, and it carries the same structured error.
@@ -713,7 +715,8 @@ impl Executor {
                             .finish_call(Outcome::denied("the command gave an unexpected answer"));
                     }
                 };
-                let (exit_code, signal, stdout, stderr, truncated, timed_out) = done;
+                let (exit_code, signal, stdout, stderr, truncated, timed_out, aborted, spill_path) =
+                    done;
                 // Runner failure outranks denial: if the sandbox never started,
                 // nothing was denied, and the model must not read it as its
                 // command's fault. Exit-gated and signature-matched, so a plain
@@ -743,10 +746,12 @@ impl Executor {
                     exit_code,
                     signal,
                     timed_out,
+                    aborted,
                     timeout_ms: request.timeout_ms,
                     stdout,
                     stderr,
                     truncated,
+                    spill_path,
                     denied,
                     mode,
                     enforcement,
@@ -2121,6 +2126,8 @@ mod tests {
                 stderr: String::new(),
                 truncated: false,
                 timed_out: false,
+                aborted: false,
+                spill_path: None,
             }),
         );
         assert_eq!(row_types(&outs), vec!["tool/result"]);
@@ -2152,6 +2159,8 @@ mod tests {
                 stderr: "touch: cannot touch '/etc/x': Read-only file system\n".into(),
                 truncated: false,
                 timed_out: false,
+                aborted: false,
+                spill_path: None,
             }),
         );
         let text = text_of(&outs, 0);
@@ -2187,6 +2196,8 @@ mod tests {
                 stderr: "bwrap: Creating new namespace failed\n".into(),
                 truncated: false,
                 timed_out: false,
+                aborted: false,
+                spill_path: None,
             }),
         );
         let text = text_of(&outs, 0);

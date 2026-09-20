@@ -22,13 +22,12 @@
 //!   have no `job_output`/`job_kill` to collect it. The schema omits the field
 //!   and the description takes upstream's own disabled-deployment sentence, so
 //!   every string the model reads is still upstream's.
-//! - **Output is bounded by a byte cap, not spilled to a file.** Upstream keeps
-//!   a tail in memory and spills the whole stream to disk when it overflows,
-//!   reporting the path; this host has no spill backend, so the truncation
-//!   suffix is not emitted (there is no path to name) and the byte bound is
-//!   applied by the driver.
-//! - **No stdin and no per-call abort.** The spawn passes no stdin, and a turn
-//!   cancel does not kill a running child — the effects are synchronous.
+//! - **No stdin parameter, by upstream's design and not as a gap.** The
+//!   model-facing bash tool does not expose stdin (`shell/src/types.ts`: "a
+//!   model that needs stdin uses shell syntax"); the plumbing exists for
+//!   in-process plugins and the `ProcessExec` effect carries it.
+//! - **No per-call abort.** A turn cancel does not kill a running child — the
+//!   effects are synchronous, and the dispatcher holds its lock across them.
 //!
 //! None of these change the *shape* of a result: the envelope, the markers, and
 //! the error classification are upstream's.
@@ -76,8 +75,13 @@ impl Default for SandboxContext {
 pub const BASH_DEFAULT_TIMEOUT_MS: u64 = 120_000;
 pub const BASH_MAX_TIMEOUT_MS: u64 = 600_000;
 
-/// The per-stream in-memory output cap (`maxOutputBytes`).
+/// The per-stream in-memory output cap (`maxOutputBytes`). The tail is kept and
+/// the whole stream spills to disk past the bound (upstream's
+/// `maxOutputBytes` + `maxSpillBytes` pair); the answered text reads the tail
+/// and names the spill path.
 pub const BASH_STDOUT_MAX_BYTES: usize = 64_000;
+/// The spill file's cap (`bash-local`'s `maxSpillBytes`).
+pub const BASH_MAX_SPILL_BYTES: usize = 64 * 1024 * 1024;
 
 /// The environment overrides `bash-local` layers over the scrubbed parent
 /// environment (`ENV_OVERRIDES`). A command's output is parsed by a model, not a
@@ -195,12 +199,22 @@ pub struct BashRun {
     /// The killing signal, when one terminated the child.
     pub signal: Option<i32>,
     pub timed_out: bool,
+    /// The turn was cancelled and the child was killed for it. Upstream renders
+    /// this to a `TOOL_ABORTED`-classed error ("The command was aborted"),
+    /// distinct from the timeout so the model reads the stop as the user's
+    /// rather than the clock's.
+    pub aborted: bool,
     pub timeout_ms: u64,
     pub stdout: String,
     pub stderr: String,
     /// Whether the driver dropped output at the byte bound. Renders the
     /// truncation notice, which is how a model learns a stream was cut.
     pub truncated: bool,
+    /// Where the untruncated stream spilled, when it did. `None` for a run that
+    /// fit the bound, or one whose spill could not be written (the directory
+    /// was not creatable) — which is what makes the suffix's `(unavailable)`
+    /// branch still possible.
+    pub spill_path: Option<String>,
     /// Whether the selected runner's dialect recognizes this stderr as a
     /// confinement refusal.
     pub denied: bool,
@@ -233,14 +247,17 @@ pub struct BashRun {
 pub fn bash_outcome(run: &BashRun, escalation_available: bool) -> Outcome {
     let mut body = run.stdout.clone();
     if run.truncated {
-        // Upstream appends `[output truncated; full output: <spillPath>]`; this
-        // host has no spill backend, so the path slot reports `(unavailable)` —
-        // upstream's own token for a spill that did not produce a file. Saying
-        // nothing would let a model read a cut-off stream as a complete one.
+        // Upstream appends `[output truncated; full output: <spillPath>]` when
+        // a spill wrote, and `(unavailable)` for the no-spill tail the shell
+        // kept (`render.ts`). Some host must have written the path for a model
+        // to recover the untruncated stream; a spill the disk refused reports
+        // the same `--(unavailable)` it always has.
         if !body.is_empty() && !body.ends_with('\n') {
             body.push('\n');
         }
-        body.push_str("[output truncated; full output: (unavailable)]");
+        body.push_str("[output truncated; full output: ");
+        body.push_str(run.spill_path.as_deref().unwrap_or("(unavailable)"));
+        body.push(']');
     }
     if !run.stderr.is_empty() {
         if !body.is_empty() && !body.ends_with('\n') {
@@ -261,7 +278,13 @@ pub fn bash_outcome(run: &BashRun, escalation_available: bool) -> Outcome {
         }
     }
     // A command may trap SIGTERM and exit 0 after the timeout fired; the
-    // interruption is still a fact, so `timed_out` reports independently.
+    // interruption is still a fact, so `timed_out` reports independently. A
+    // turn cancel is the same fact under the user's name, and upstream's
+    // wording for it is the AbortError message — the one marker that is *not*
+    // a status.
+    if run.aborted {
+        markers.push("[aborted by the user]".to_string());
+    }
     if run.timed_out {
         markers.push(format!("[timed out after {}ms]", run.timeout_ms));
     }
@@ -354,10 +377,12 @@ mod tests {
             exit_code,
             signal: None,
             timed_out: false,
+            aborted: false,
             timeout_ms: BASH_DEFAULT_TIMEOUT_MS,
             stdout: stdout.to_string(),
             stderr: stderr.to_string(),
             truncated: false,
+            spill_path: None,
             denied: false,
             mode: Mode::WorkspaceWrite,
             enforcement: Enforcement::Full,

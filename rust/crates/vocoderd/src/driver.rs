@@ -37,8 +37,29 @@ fn io_err(e: &std::io::Error) -> EffectError {
     }
 }
 
-/// Perform one effect, forwarding a streaming effect's intermediate bytes to
-/// `sink` as they arrive.
+/// A registry a cancel consults to reach a running child. Shared by the pump
+/// (which registers each `ProcessExec` under its `kill_key` for the run's
+/// length, while it keeps the only `Child` handle) and the cancel path (which
+/// *removes* the entry to ask for the kill); the pump holds the dispatch lock
+/// across the effect loop, so the registry is what lets the signal arrive
+/// without waiting it out.
+///
+/// The value is just the pid: the runner owns the reap, so a kill is *the
+/// runner noticing its entry gone* and killing its own handle — which is why
+/// no second handle is ever taken and no wait is raced. Cancellation is
+/// not-found == "already settled": the runner removes the entry when it exits,
+/// so a cancel that lands after that finds nothing to stop.
+pub type ChildRegistry = std::sync::Mutex<std::collections::HashMap<String, u32>>;
+
+/// Remove `key`'s registration, asking the owning `run_process` to kill and
+/// reap its child. Returns `true` when a live registration was there to drop;
+/// the actual kill happens on the runner's next 5 ms poll.
+pub fn kill_registered(registry: &ChildRegistry, key: &str) -> bool {
+    registry.lock().unwrap().remove(key).is_some()
+}
+
+/// [`realize_with`]'s registry-less form, which the test path uses; the live
+/// loop goes through [`realize_with_kills`] with the pump's registry.
 ///
 /// The sink is called *during* the effect, on this thread, with however many
 /// bytes one read returned — so a streaming caller must be able to accept a
@@ -58,9 +79,24 @@ fn io_err(e: &std::io::Error) -> EffectError {
 /// the machine contract pure (`handle` stays sync, no `async_trait` on
 /// machines). Were these to become slow (network, subprocess), this would move
 /// behind `spawn_blocking` without changing a single machine.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn realize_with(
     request: RealizeRequest,
     sink: &mut dyn FnMut(Vec<u8>),
+) -> Option<EffectResult> {
+    realize_with_kills(request, sink, None)
+}
+
+/// [`realize_with`], with a child registry the process effects register into.
+///
+/// `None` is the pure form every other caller takes: a run with no registry
+/// cannot be externally cancelled, which is what a test that never cancels
+/// wants. The registry is `Option` rather than an always-present parameter
+/// because the::pump is the only caller that has one.
+pub fn realize_with_kills(
+    request: RealizeRequest,
+    sink: &mut dyn FnMut(Vec<u8>),
+    children: Option<&ChildRegistry>,
 ) -> Option<EffectResult> {
     // A `canned://` provider route is answered from the file it names rather
     // than the network, so a whole turn is testable hermetically. It is handled
@@ -269,14 +305,19 @@ pub fn realize_with(
             env,
             timeout_ms,
             stdout_max_bytes,
+            spill_dir,
             stdin,
+            kill_key,
         } => match run_process(
             &argv,
             workdir.as_deref(),
             &env,
             timeout_ms,
             stdout_max_bytes,
+            spill_dir.as_deref(),
             stdin.as_deref(),
+            kill_key.as_deref(),
+            children,
         ) {
             Ok(done) => EffectResult::ProcessDone {
                 exit_code: done.exit_code,
@@ -285,6 +326,8 @@ pub fn realize_with(
                 stderr: done.stderr,
                 truncated: done.truncated,
                 timed_out: done.timed_out,
+                aborted: done.aborted,
+                spill_path: done.spill_path,
             },
             Err(e) => EffectResult::Failed(EffectError::Other(e)),
         },
@@ -433,6 +476,11 @@ struct ProcessOutcome {
     stderr: String,
     truncated: bool,
     timed_out: bool,
+    /// A turn cancel killed the child, distinct from its own timeout.
+    aborted: bool,
+    /// Where the untruncated output was written, if it overflowed and a spill
+    /// directory was given.
+    spill_path: Option<String>,
 }
 
 /// The signal that terminated a child, when one did.
@@ -472,7 +520,10 @@ fn run_process(
     env: &[(String, String)],
     timeout_ms: Option<u64>,
     stdout_max_bytes: Option<usize>,
+    spill_dir: Option<&str>,
     stdin: Option<&str>,
+    kill_key: Option<&str>,
+    children: Option<&ChildRegistry>,
 ) -> Result<ProcessOutcome, String> {
     use std::io::{Read, Write};
     use std::sync::mpsc;
@@ -499,8 +550,27 @@ fn run_process(
         .spawn()
         .map_err(|e| format!("failed to spawn {program}: {e}"))?;
 
+    // A turn-cancelable run is registered by its key, so the cancel path can
+    // ask for the kill without waiting out the pump. The value is the pid; this
+    // loop keeps the only `Child` and owns the reap, and it is this loop — not
+    // the cancel — that calls `kill`, because the registration being *absent*
+    // is the ask.
+    let registered_pid = match (kill_key, children) {
+        (Some(key), Some(registry)) => {
+            registry.lock().unwrap().insert(key.to_string(), child.id());
+            Some((registry, key.to_string()))
+        }
+        _ => None,
+    };
+
     let bound = stdout_max_bytes.unwrap_or(usize::MAX);
-    let (tx, rx) = mpsc::channel::<(bool, Vec<u8>, bool)>();
+    // Upstream keeps the *tail* in memory and spills the whole stream to disk
+    // when it overflows (`OutputCollector`, capped at `maxSpillBytes`). The
+    // reader does the same: the tail is a bounded sliding window and the full
+    // stream accumulates only up to the spill cap — a cap that matters, because
+    // a `yes` under the default timeout would otherwise buffer unboundedly.
+    let spill_cap = crate::machines::tool_bash::BASH_MAX_SPILL_BYTES;
+    let (tx, rx) = mpsc::channel::<(bool, Vec<u8>, Vec<u8>, bool)>();
     let mut readers = Vec::new();
     for (is_stdout, pipe) in [
         (
@@ -521,28 +591,34 @@ fn run_process(
         let Some(pipe) = pipe else { continue };
         let tx = tx.clone();
         readers.push(std::thread::spawn(move || {
-            // Read to the bound *plus a sentinel byte*, so exceeding the bound
-            // is detectable rather than looking like an exact fit.
-            let mut buf = Vec::new();
+            let mut tail: std::collections::VecDeque<u8> = std::collections::VecDeque::new();
+            let mut full = Vec::new();
+            let mut overflowed = false;
             let mut reader = pipe;
             let mut chunk = [0u8; 8192];
-            let mut over = false;
             loop {
                 match reader.read(&mut chunk) {
                     Ok(0) => break,
                     Ok(n) => {
-                        if buf.len() < bound + 1 {
-                            let take = (bound + 1 - buf.len()).min(n);
-                            buf.extend_from_slice(&chunk[..take]);
+                        let bytes = &chunk[..n];
+                        if full.len() < spill_cap {
+                            let take = (spill_cap - full.len()).min(n);
+                            full.extend_from_slice(&bytes[..take]);
                         }
-                        if buf.len() > bound {
-                            over = true;
+                        if full.len() > bound {
+                            overflowed = true;
+                        }
+                        for &b in bytes {
+                            if tail.len() == bound.max(1) {
+                                tail.pop_front();
+                            }
+                            tail.push_back(b);
                         }
                     }
                     Err(_) => break,
                 }
             }
-            let _ = tx.send((is_stdout, buf, over));
+            let _ = tx.send((is_stdout, tail.into_iter().collect(), full, overflowed));
         }));
     }
     drop(tx);
@@ -557,7 +633,20 @@ fn run_process(
     let deadline =
         timeout_ms.map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
     let mut timed_out = false;
+    let mut aborted = false;
     let (exit_code, signal) = loop {
+        // A cancel removes the entry; this loop notices on its next poll, kills
+        // its own handle, and that is what marks the outcome an abort rather
+        // than an ordinary nonzero exit. (The entry is removed on the way out
+        // below, so a *settled* run reads present until it exits.)
+        if let Some((registry, key)) = &registered_pid
+            && !timed_out
+            && !aborted
+            && !registry.lock().unwrap().contains_key(key)
+        {
+            aborted = true;
+            let _ = child.kill();
+        }
         match child.try_wait() {
             Ok(Some(status)) => break (status.code(), status_signal(&status)),
             Ok(None) => {}
@@ -575,19 +664,27 @@ fn run_process(
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     };
+    // Deregister: a later cancel for the same key must find nothing to kill.
+    if let Some((registry, key)) = &registered_pid {
+        registry.lock().unwrap().remove(key);
+    }
 
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
+    let mut full_stdout = Vec::new();
+    let mut full_stderr = Vec::new();
     let mut truncated = false;
     for _ in 0..readers.len() {
         match rx.recv_timeout(std::time::Duration::from_secs(5)) {
-            Ok((true, buf, over)) => {
-                stdout = buf;
+            Ok((true, tail, full, over)) => {
                 truncated |= over;
+                stdout = tail;
+                full_stdout = full;
             }
-            Ok((false, buf, over)) => {
-                stderr = buf;
+            Ok((false, tail, full, over)) => {
                 truncated |= over;
+                stderr = tail;
+                full_stderr = full;
             }
             // The reader thread died, or outlived a killed child's pipes. Its
             // output is already lost; reporting a spawn failure now would be
@@ -596,14 +693,73 @@ fn run_process(
         }
     }
 
+    // Write the spill only when something was actually dropped. The file name
+    // is the process's own random id — the directory is private, so the file
+    // need not carry unguessability of its own (upstream's `spillAll` is
+    // `O_EXCL` + `0o600` + a random name for exactly this reason).
+    let spill_path = if truncated {
+        spill_dir.and_then(|dir| {
+            let mut bytes = Vec::with_capacity(full_stdout.len() + full_stderr.len() + 16);
+            bytes.extend_from_slice(&full_stdout);
+            if !full_stdout.is_empty() && !full_stderr.is_empty() {
+                bytes.push(b'\n');
+            }
+            if !full_stderr.is_empty() {
+                bytes.extend_from_slice(b"[stderr]\n");
+                bytes.extend_from_slice(&full_stderr);
+            }
+            let name = format!("{:016x}.log", rand_u64());
+            let path = std::path::Path::new(dir).join(name);
+            if std::fs::create_dir_all(dir).is_err() {
+                return None;
+            }
+            // 0o600 like upstream's spill: the stream may carry anything the
+            // command read, and the directory beats a stranger's read.
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .and_then(|mut f| std::io::Write::write_all(&mut f, &bytes))
+                .ok()?;
+            Some(path.display().to_string())
+        })
+    } else {
+        None
+    };
+
     Ok(ProcessOutcome {
         exit_code,
         signal,
-        stdout: bound_text(stdout, bound),
-        stderr: bound_text(stderr, bound),
+        stdout: String::from_utf8_lossy(&stdout).to_string(),
+        stderr: String::from_utf8_lossy(&stderr).to_string(),
         truncated,
         timed_out,
+        aborted,
+        spill_path,
     })
+}
+
+/// A best-effort random u64 for a spill file's name.
+///
+/// Upstream uses a random name inside a private `0700` directory; the directory
+/// is the access control and the name only needs to not collide, so a
+/// `/dev/urandom` draw with a pid/time fallback is enough.
+#[cfg(unix)]
+fn rand_u64() -> u64 {
+    use std::io::Read;
+    let mut b = [0u8; 8];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom")
+        && f.read_exact(&mut b).is_ok()
+    {
+        return u64::from_le_bytes(b);
+    }
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    seed ^ ((std::process::id() as u64) << 32)
 }
 
 /// Render collected bytes as text, honoring the byte bound.
@@ -612,6 +768,7 @@ fn run_process(
 /// (a compiler diagnostic on a path with invalid bytes is enough), and refusing
 /// the whole result over one bad byte would be worse than a replacement
 /// character. The caller that needs exact bytes is not a shell tool.
+#[allow(dead_code)]
 fn bound_text(mut bytes: Vec<u8>, bound: usize) -> String {
     if bytes.len() > bound {
         bytes.truncate(bound);
@@ -961,4 +1118,119 @@ pub fn drive_with(
         pending.push_back(MachineIn::EffectResult { id, result });
     }
     terminal
+}
+
+#[cfg(test)]
+mod process_tests {
+    use super::*;
+
+    /// A registered run is killed by removing its key; the answer reports the
+    /// aborted kill, and the child's output up to the kill is still carried.
+    #[cfg(unix)]
+    #[test]
+    fn a_cancelled_run_aborts_instead_of_timing_out() {
+        let registry = ChildRegistry::new(std::collections::HashMap::new());
+        let req = vocoder_cordis::RealizeRequest::ProcessExec {
+            argv: vec!["bash".into(), "-c".into(), "echo hi; sleep 5".into()],
+            workdir: None,
+            env: vec![],
+            timeout_ms: Some(30_000),
+            stdout_max_bytes: Some(1_000),
+            spill_dir: None,
+            stdin: None,
+            kill_key: Some("s1".into()),
+        };
+        let reg = &registry;
+        let run = std::thread::scope(|s| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            s.spawn(move || {
+                let r = realize_with_kills(req, &mut |_| {}, Some(reg));
+                let _ = tx.send(r);
+            });
+            // Wait for the registration to land, then cancel.
+            for _ in 0..200 {
+                if registry.lock().unwrap().contains_key("s1") {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(kill_registered(&registry, "s1"));
+            rx.recv_timeout(std::time::Duration::from_secs(15)).unwrap()
+        });
+        let Some(EffectResult::ProcessDone {
+            aborted,
+            timed_out,
+            stdout,
+            ..
+        }) = run
+        else {
+            panic!("expected ProcessDone");
+        };
+        assert!(aborted, "a killed run reports aborted");
+        assert!(!timed_out, "an abort is not the deadline firing");
+        assert_eq!(stdout, "hi\n");
+    }
+
+    /// An overflow keeps the **tail** in the answer and spills the whole stream
+    /// into the given directory — the upstream `OutputCollector` contract, down
+    /// to the file being where `run.spill_path` says. A run that *fits* spills
+    /// nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_process_past_the_bound_spills_the_full_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = vocoder_cordis::RealizeRequest::ProcessExec {
+            argv: vec![
+                "bash".into(),
+                "-c".into(),
+                "head -c 200000 /dev/zero | tr '\\0' 'x'".into(),
+            ],
+            workdir: None,
+            env: vec![],
+            timeout_ms: Some(10_000),
+            stdout_max_bytes: Some(1_000),
+            spill_dir: Some(dir.path().display().to_string()),
+            stdin: None,
+            kill_key: None,
+        };
+        let EffectResult::ProcessDone {
+            stdout,
+            truncated,
+            spill_path,
+            ..
+        } = realize_with(big, &mut |_| {}).unwrap()
+        else {
+            panic!("expected ProcessDone");
+        };
+        assert!(truncated);
+        // The answer carries the tail, never the head: the last bytes a model
+        // sees are the freshest, which is what a truncating terminal shows.
+        assert_eq!(stdout.len(), 1_000);
+        assert!(stdout.chars().all(|c| c == 'x'));
+        let spill = std::fs::read_to_string(spill_path.expect("a spill was written")).unwrap();
+        assert_eq!(spill.len(), 200_000);
+        assert!(spill.chars().all(|c| c == 'x'));
+
+        // A run under the bound does not spill.
+        let fits = vocoder_cordis::RealizeRequest::ProcessExec {
+            argv: vec!["printf".into(), "ok".into()],
+            workdir: None,
+            env: vec![],
+            timeout_ms: Some(10_000),
+            stdout_max_bytes: Some(1_000),
+            spill_dir: Some(dir.path().display().to_string()),
+            stdin: None,
+            kill_key: None,
+        };
+        let EffectResult::ProcessDone {
+            truncated,
+            spill_path,
+            ..
+        } = realize_with(fits, &mut |_| {}).unwrap()
+        else {
+            panic!("expected ProcessDone");
+        };
+        assert!(!truncated);
+        assert!(spill_path.is_none());
+    }
 }

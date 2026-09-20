@@ -84,6 +84,11 @@ struct AppState {
     streams: Mutex<std::collections::HashMap<String, StreamRoute>>,
     /// Stable host facts for the $events ready frame.
     home: String,
+    /// Session id → running `bash` child's pid, for a turn cancel directed at
+    /// a child the pump is blocked on (the dispatch lock is held). The pump
+    /// registers each keyed `ProcessExec` here for its run's length; the cancel
+    /// `/api` handler asks here without the lock.
+    children: crate::driver::ChildRegistry,
     /// Serializes whole effect loops. A machine holds one suspended operation
     /// at a time, so two pumps interleaving between an effect request and its
     /// answer would cross their suspensions and deliver an answer to the wrong
@@ -167,9 +172,13 @@ impl AppState {
             // Outputs the chunk deliveries produced, collected because the sink
             // runs inside `realize_with` and cannot hand them back.
             let mut during: Vec<RouteOut> = Vec::new();
-            let result = crate::driver::realize_with(request, &mut |bytes| {
-                during.extend(self.deliver(to, MachineIn::EffectChunk { id, bytes }));
-            })
+            let result = crate::driver::realize_with_kills(
+                request,
+                &mut |bytes| {
+                    during.extend(self.deliver(to, MachineIn::EffectChunk { id, bytes }));
+                },
+                Some(&self.children),
+            )
             .unwrap_or(vocoder_cordis::EffectResult::Done);
             sort_outs(during, &mut terminal, &mut todo);
             pending.push_back(MachineIn::EffectResult { id, result });
@@ -525,6 +534,7 @@ async fn main() -> Result<()> {
         connections: Mutex::new(std::collections::HashMap::new()),
         streams: Mutex::new(std::collections::HashMap::new()),
         home: args.home.display().to_string(),
+        children: crate::driver::ChildRegistry::new(std::collections::HashMap::new()),
         dispatch: Mutex::new(()),
     });
 
@@ -933,6 +943,12 @@ async fn api_rpc(
         let state = state.clone();
         let session_id = session_id.to_string();
         tokio::task::spawn_blocking(move || {
+            // A running `bash` child for this session is killed first, without
+            // waiting out the pump: the FSM latch then settles the step the
+            // same way the child's dead-pipe answer would, and the outcome
+            // records `aborted` rather than the timeout it would otherwise sit
+            // behind.
+            crate::driver::kill_registered(&state.children, &session_id);
             let _ = state.pump(
                 &MachineId::new("agent"),
                 MachineIn::Event {

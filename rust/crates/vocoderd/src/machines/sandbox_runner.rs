@@ -901,7 +901,9 @@ mod tests {
                 env: vec![("PATH".to_string(), "/usr/bin:/bin".to_string())],
                 timeout_ms: Some(30_000),
                 stdout_max_bytes: Some(64 * 1024),
+                spill_dir: None,
                 stdin: None,
+            kill_key: None,
             },
             &mut |_| {},
         );
@@ -1114,7 +1116,9 @@ mod tests {
                 env: vec![],
                 timeout_ms: Some(5_000),
                 stdout_max_bytes: None,
+                spill_dir: None,
                 stdin: None,
+            kill_key: None,
             },
             &mut |_| {},
         );

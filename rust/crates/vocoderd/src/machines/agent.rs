@@ -1317,6 +1317,8 @@ impl AgentMachine {
                 stderr,
                 truncated,
                 timed_out,
+                aborted,
+                spill_path,
             } => Ok(Answer::Process {
                 exit_code,
                 signal,
@@ -1324,6 +1326,8 @@ impl AgentMachine {
                 stderr,
                 truncated,
                 timed_out,
+                aborted,
+                spill_path,
             }),
             // A missing target is its own answer rather than a failure, because
             // the tools branch on it: a `write` creates, a `read` refuses, and
@@ -1485,6 +1489,12 @@ impl AgentMachine {
     /// Issue the effect a tool call needs.
     fn realize_tool(&mut self, effect: &super::tool_exec::Effect) -> Vec<MachineOut> {
         use super::tool_exec::Effect;
+        // The effect names the session running it, so `session/cancel` can
+        // reach a live `bash` child without waiting out the pump.
+        let kill_session = match &self.op {
+            Some(Op::Tools { state }) => Some(state.session.clone()),
+            _ => None,
+        };
         let request = match effect {
             Effect::Stat { path } => RealizeRequest::Stat { path: path.clone() },
             Effect::Read { path } => RealizeRequest::ReadText { path: path.clone() },
@@ -1512,7 +1522,11 @@ impl AgentMachine {
                 env: env.clone(),
                 timeout_ms: Some(*timeout_ms),
                 stdout_max_bytes: Some(super::tool_bash::BASH_STDOUT_MAX_BYTES),
+                spill_dir: Some(format!("{}/.spill", self.root.display())),
                 stdin: None,
+                // Bound to the session: a `session/cancel` for it kills the
+                // child (see `driver::kill_registered`).
+                kill_key: kill_session,
             },
         };
         let id = self.cache.next_effect(&mut self.pending, &mut self.effects);
@@ -1670,11 +1684,14 @@ impl AgentMachine {
         }
         // A cancel is addressed to one session; a turn for a *different* session
         // is not the one being cancelled, and latching it would abort an
-        // unrelated conversation.
+        // unrelated conversation. `Op::Tools` is in flight too: the child was
+        // registered under the session's kill key, and its death settles the
+        // running step back through the FSM the same way a settled model call
+        // does, so the latch is the same.
         let holds_turn = match &self.op {
-            Some(Op::Call { state, .. }) | Some(Op::Settle { state, .. }) => {
-                state.session == session
-            }
+            Some(Op::Call { state, .. })
+            | Some(Op::Settle { state, .. })
+            | Some(Op::Tools { state }) => state.session == session,
             _ => false,
         };
         if !holds_turn {
@@ -1684,12 +1701,13 @@ impl AgentMachine {
         }
         // Latch first, then let the FSM say what the cancel owes. The order
         // matters: `cancel` reads the latch it sets, so a step that is open
-        // returns nothing and the closer arrives with the reply.
+        // returns nothing and the closer arrives with the reply. A `Tools` op
+        // latches the same way; the child's death is the reply that settles it.
         let outs = {
             let fsm = match self.op.as_mut() {
-                Some(Op::Call { state, .. }) | Some(Op::Settle { state, .. }) => {
-                    Some(&mut state.fsm)
-                }
+                Some(Op::Call { state, .. })
+                | Some(Op::Settle { state, .. })
+                | Some(Op::Tools { state }) => Some(&mut state.fsm),
                 _ => None,
             };
             match fsm {
