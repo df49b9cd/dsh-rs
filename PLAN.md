@@ -124,11 +124,21 @@ run: see *Known gaps* below.
 
 ## M2 — Session log
 
-- Pure codecs: `session.vN.jsonl` framing, zstd, adjacent migrations
-- Generation selection + exclusive successor publication as a machine
-- Interop: Rust reads all `snapshots/` generations; JS reads Rust-written successors
+- [x] Pure codecs: `session.vN.jsonl` framing, zstd, adjacent migrations —
+  `vocoder-session` (`lib.rs`): filename parse/compose, header read, generation
+  encode/decode/write, and the composed migration chain from
+  `spec/session-log/migrations.json`.
+- [x] Generation selection + exclusive successor publication as a machine —
+  `write_generation_is_atomic_and_immutable` and `highest_generation_wins`;
+  `session.rs`'s `publish_generation` is the caller.
+- [x] Interop: Rust reads all `snapshots/` generations; JS reads Rust-written
+  successors — 7 tests in `vocoder-session/tests/interop.rs`
+  (`reads_headers_of_every_committed_generation`,
+  `reads_full_generations_and_projections`), plus
+  `harness/probe/interop-vocoder-sessions.ts` for the JS→Rust direction.
 
-**Exit:** replays + interop cells green; conformance matrix = wire + session.
+**Exit:** met — replays + interop cells green (7/7 in
+`vocoder-session/tests/interop.rs`); conformance matrix = wire + session.
 
 ## M3 — Business parity
 
@@ -244,7 +254,7 @@ which, since it landed, leaves the axis's wiring as the remaining work.
     skipped a seq. Verified by `conformance/wire/tests/live_stream.rs` against a
     live gateway — 151 frames, deltas summing to the model's exact output, all
     six rows announced gap-free.
-- [ ] tool seam + approval machine (step 3) — **both halves have landed.**
+- [x] tool seam + approval machine (step 3) — **both halves have landed.**
   `machines/approval.rs` answers the `approval/request` waterfall (mounted and
   reachable through the real router, verified) and **mints the audit id**,
   failing **closed** with `unavailable`; `machines/tool_exec.rs` is the emitter,
