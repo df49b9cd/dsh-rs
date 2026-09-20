@@ -33,7 +33,8 @@ directly: it does not import dsh code. Each endpoint in the spec is a cell:
 Spec coverage report (`just coverage-report`) lists every spec endpoint and
 which cells pass per host, so drift shows as table changes.
 
-**Both hosts are green** (34 cells, 16 namespaces). The control run needs the
+**Both hosts are green** (53 cells across the 18 live namespaces, measured
+2026-09-20). The control run needs the
 auth cookie: the `dsh` host gates all of `/api` behind browser auth, so
 `CONFORMANCE_COOKIE_FILE` must point at the cookie `harness/runners/run.sh`
 mints, and a cell that omits it sees an HTML redirect rather than an envelope.
