@@ -167,9 +167,10 @@ shrinks release-over-release", inherited from the intent to replay upstream's
 reasons now established:
 
 1. The replay needs the **client-module pipeline** (M5) — **since landed**: the
-   shell now boots against vocoderd, so this reason no longer holds. What
-   remains from it is the wiring of the 35 URL-only specs onto the axis, which
-   is M5 work rather than a missing pipeline.
+   shell now boots against vocoderd. What remains from it is the wiring of the
+   35 URL-only specs onto the axis — which, measured 2026-09-20, turns out to
+   be an empty set: none of the 35 is driven over a URL without also needing the
+   in-process scaffold or the jsdom/fixture RPC. See the M5 entry below.
 2. `launchWebScaffold` is not an HTTP adapter: it boots the real Cordis Loader
    *in-process* (`dsh/apps/web/tests/scaffold.ts`) and hands each test the live
    `Context`. 60 of the 98 upstream web specs consume that host-side surface
@@ -390,8 +391,9 @@ which, since it landed, leaves the axis's wiring as the remaining work.
     namespace (an empty registry, answering `[]`/`null`, is the control's own
     answer before a dynamic plugin is defined). Coverage moved 74/87 → 86/87.
   - **What this does not do.** The e2e axis still runs four hand-written cells,
-    not the 35 URL-only upstream specs; wiring those is the remaining M5 work.
-    The 60 in-process specs stay unreachable by any adapter (see M3).
+    not the 35 URL-only upstream specs. Wiring those was the remaining M5 work;
+    **measured 2026-09-20, there is no such set to wire** — see the M5 entry
+    below. The 60 in-process specs stay unreachable by any adapter (see M3).
   - **Reduced, and it was measured not assumed:** entry order is emitted
     sorted-then-topologically (upstream's exact order comes from a 971-line
     two-layer config merge and is not boot-observable — `bootClient` creates
@@ -415,6 +417,22 @@ which, since it landed, leaves the axis's wiring as the remaining work.
     so each name is written atomically with the same bytes, names, digest, and
     byte count. The raw binary route (`POST /api/session/uploadFileBinary`) is a
     separate surface this host does not serve.
+- [x] **The URL-only target measured to zero** (2026-09-20).
+  `spec-classification.mjs` now splits the 35 `url-only` specs by what they
+  actually need, and the split settles M5's open question: **none is replayable
+  against a live URL.** 23 still call `launchWebScaffold` (or its helpers
+  `seedSession`/`compareOrRefreshGolden`/`assertFixtureInventory`/
+  `captureStableAria`) and read back `authenticatedUrl`/`workspaceCwd` — the
+  boot is in-process and the URL is one only that process serves. Of the rest,
+  7 run under jsdom against the built bundles with the fixture RPC, 4 spawn
+  their own host or a dev server, 2 read `dist/` as files, and the last never
+  navigates at all. The `url-only` label meant only "no *visible* host
+  coupling"; it was a floor and a ceiling at once, and the ceiling was 0.
+  - The classifier reports the split now (and each row carries a
+    `notUrlDriven` list beside its matched tokens), so the next reader gets the
+    measurement instead of the misleading number — the correction this repo has
+    had to make before (`docs/outstanding-work.md`'s "reading the code and the
+    spec found nothing; running found it").
 - [ ] Optional JS-compat island (rquickjs) scoped to `Out::SpawnScope` subtrees
 
 ## Known gaps
@@ -439,12 +457,14 @@ than it is:
   has no such endpoint. Covered by unit tests in `machines/agent_teams.rs`.
 - **The generated `traits.rs` façade is still unused** (see M1) — now a choice
   rather than a gap, since the validator covers the untyped-extraction class.
-- **e2e-replay does not replay upstream specs** (see M3). Its four cells are now
-  all green on both hosts, but they are hand-written, not the upstream suite.
-  One obstacle remains reachable and one does not: the in-process
-  `launchWebScaffold` that 60 of the 98 specs depend on (no adapter reaches it),
-  and the wiring of the 35 URL-only specs onto the axis — the `__ModuleLoader__`
-  pipeline that also blocked this is now landed (M5).
+- **e2e-replay does not replay upstream specs** (see M3, M5). Its four cells
+  are all green on both hosts, but they are hand-written, not the upstream
+  suite. Neither obstacle is reachable by an adapter, now that both are
+  measured: the in-process `launchWebScaffold` that 60 of the 98 specs depend on
+  directly, and the "35 URL-only" specs, which turn out to need the same scaffold
+  infrastructure even when they never touch `ctx` — measured 2026-09-20, **0 of
+  the 35 drives a URL without it**, so there is no set to wire. The
+  `__ModuleLoader__` pipeline that was the other blocker is landed (M5).
 - **Composition traces are hand-authored**, not recorded from JS (see M5).
 - **`session-replay` has no suite directory**; its tests live in
   `rust/crates/vocoder-session/tests/interop.rs`.

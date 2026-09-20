@@ -361,11 +361,22 @@ key-based explanation was backwards and is corrected in-repo):
   surface — 49 `scaffold.ctx`, 33 `whenTurnSettled()`, 12
   `harnessHome`/`persistenceRoot`, 3 `hostFetch`. For those the test *is* the
   host; no adapter makes them replayable, only a fork would.
-- **The module pipeline** (3.1) blocks the remaining 35 URL-only specs.
+- **The module pipeline** (3.1) was said to block the remaining 35 URL-only
+  specs.
 
-Open question worth deciding rather than drifting on: does the 35-spec URL-only
-set justify 3.1, given 60 specs are unreachable either way? If the answer is no,
-3.1 should be justified by the GUI being broken for users, not by the e2e axis.
+**The open question is now answered by measurement (2026-09-20): there is no
+35-spec URL-only set.** `spec-classification.mjs` splits those 35 by what they
+actually need, and none drives a URL without also needing in-process
+infrastructure: 23 call `launchWebScaffold` (or `seedSession`/
+`compareOrRefreshGolden`/`assertFixtureInventory`/`captureStableAria`) and read
+back `authenticatedUrl`/`workspaceCwd`; 7 run under jsdom against the built
+bundles with the fixture RPC; 4 spawn their own host or a dev server; 2 read
+`dist/` as files; 1 never navigates at all. The `url-only` label meant only "no
+*visible* host coupling" — a floor and a ceiling at once — and the ceiling
+against a live URL is **0**, not 35. So 3.1 stands justified (or not) by the GUI
+being broken for users, exactly as this section warned, and not by the e2e axis.
+The classifier now reports the split so the misleading single number is not
+re-derived.
 
 ### 3.3 `Out::SpawnScope` — scoped compositions
 
@@ -447,8 +458,9 @@ asserts the shared invariant and the table in `docs/conformance.md` names both.
    work, batched into one pass.
 4. **P2** — the agent core. **All four steps are now DONE** (steps 1–3 landed
    2026-09-19, step 4 on 2026-09-20 with `bash` as the runner's consumer).
-5. **P3** — M5. 3.1 (the client-module pipeline) landed; 3.2 (wiring the 35
-   URL-only specs onto the e2e axis) is the open question to decide first.
+5. **P3** — M5. 3.1 (the client-module pipeline) landed; 3.2's open question
+   ("does the 35-spec URL-only set justify the axis?") is answered by
+   measurement: the set is empty. What remains for M5 is 3.3–3.5.
 
 Deferred deliberately, not forgotten: the absent-`args` divergence above, and
 `harness/fixtures/`.

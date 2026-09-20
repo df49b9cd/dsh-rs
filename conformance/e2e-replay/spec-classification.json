@@ -1,7 +1,7 @@
 {
   "generatedFrom": "conformance/e2e-replay/spec-classification.mjs",
   "specFileCount": 98,
-  "unimplementedEndpointCount": 28,
+  "unimplementedEndpointCount": 0,
   "counts": {
     "url-only": 35,
     "needs-fixture-mode": 3,
@@ -12,7 +12,13 @@
     {
       "file": "access-confirmation.e2e.ts",
       "category": "url-only",
-      "evidence": []
+      "evidence": [
+        "launchWebScaffold",
+        "compareOrRefreshGolden",
+        "assertFixtureInventory",
+        "captureStableAria"
+      ],
+      "notUrlDriven": []
     },
     {
       "file": "agent-preset-authoring.e2e.ts",
@@ -54,7 +60,15 @@
     {
       "file": "bash-abort-row.e2e.ts",
       "category": "url-only",
-      "evidence": []
+      "evidence": [
+        "launchWebScaffold",
+        "seedSession",
+        "compareOrRefreshGolden",
+        "assertFixtureInventory",
+        "captureStableAria",
+        "fixtureUserPrompts"
+      ],
+      "notUrlDriven": []
     },
     {
       "file": "built-boot.expected.e2e.ts",
@@ -90,27 +104,54 @@
     {
       "file": "clickable-links-gallery.e2e.ts",
       "category": "url-only",
-      "evidence": []
+      "evidence": [
+        "launchWebScaffold",
+        "seedSession",
+        "compareOrRefreshGolden",
+        "assertFixtureInventory",
+        "captureStableAria"
+      ],
+      "notUrlDriven": []
     },
     {
       "file": "command-image-envelope.expected.e2e.ts",
       "category": "url-only",
-      "evidence": []
+      "evidence": [],
+      "notUrlDriven": [
+        "jsdom",
+        "assembled-boot (fixture RPC)"
+      ]
     },
     {
       "file": "composer-draft-scroll.e2e.ts",
       "category": "url-only",
-      "evidence": []
+      "evidence": [
+        "launchWebScaffold",
+        "compareOrRefreshGolden",
+        "assertFixtureInventory"
+      ],
+      "notUrlDriven": []
     },
     {
       "file": "composer-placeholder.e2e.ts",
       "category": "url-only",
-      "evidence": []
+      "evidence": [
+        "launchWebScaffold",
+        "compareOrRefreshGolden",
+        "assertFixtureInventory"
+      ],
+      "notUrlDriven": []
     },
     {
       "file": "composer-tab-geometry.e2e.ts",
       "category": "url-only",
-      "evidence": []
+      "evidence": [
+        "launchWebScaffold",
+        "seedSession",
+        "compareOrRefreshGolden",
+        "assertFixtureInventory"
+      ],
+      "notUrlDriven": []
     },
     {
       "file": "cordis-tool-round.e2e.ts",
@@ -205,12 +246,19 @@
     {
       "file": "hmr-live.e2e.ts",
       "category": "url-only",
-      "evidence": []
+      "evidence": [],
+      "notUrlDriven": [
+        "spawns a process"
+      ]
     },
     {
       "file": "home-path-tilde.expected.e2e.ts",
       "category": "url-only",
-      "evidence": []
+      "evidence": [],
+      "notUrlDriven": [
+        "jsdom",
+        "assembled-boot (fixture RPC)"
+      ]
     },
     {
       "file": "image-display.expected.e2e.ts",
@@ -238,7 +286,14 @@
     {
       "file": "markdown-cjk-strong.e2e.ts",
       "category": "url-only",
-      "evidence": []
+      "evidence": [
+        "launchWebScaffold",
+        "seedSession",
+        "compareOrRefreshGolden",
+        "assertFixtureInventory",
+        "captureStableAria"
+      ],
+      "notUrlDriven": []
     },
     {
       "file": "markdown-images.e2e.ts",
@@ -250,22 +305,46 @@
     {
       "file": "markdown-inline-code-links.e2e.ts",
       "category": "url-only",
-      "evidence": []
+      "evidence": [
+        "launchWebScaffold",
+        "seedSession",
+        "compareOrRefreshGolden",
+        "assertFixtureInventory",
+        "captureStableAria"
+      ],
+      "notUrlDriven": []
     },
     {
       "file": "markdown-wide-table.e2e.ts",
       "category": "url-only",
-      "evidence": []
+      "evidence": [
+        "launchWebScaffold",
+        "seedSession",
+        "compareOrRefreshGolden",
+        "assertFixtureInventory"
+      ],
+      "notUrlDriven": []
     },
     {
       "file": "math-rendering.e2e.ts",
       "category": "url-only",
-      "evidence": []
+      "evidence": [
+        "launchWebScaffold",
+        "seedSession",
+        "compareOrRefreshGolden",
+        "assertFixtureInventory",
+        "captureStableAria"
+      ],
+      "notUrlDriven": []
     },
     {
       "file": "max-tokens-notice.expected.e2e.ts",
       "category": "url-only",
-      "evidence": []
+      "evidence": [],
+      "notUrlDriven": [
+        "jsdom",
+        "assembled-boot (fixture RPC)"
+      ]
     },
     {
       "file": "message-actions.e2e.ts",
@@ -320,7 +399,14 @@
     {
       "file": "open-in-app-ssh.e2e.ts",
       "category": "url-only",
-      "evidence": []
+      "evidence": [
+        "launchWebScaffold",
+        "seedSession",
+        "compareOrRefreshGolden",
+        "assertFixtureInventory",
+        "captureStableAria"
+      ],
+      "notUrlDriven": []
     },
     {
       "file": "permission-policy-context.e2e.ts",
@@ -371,17 +457,31 @@
     {
       "file": "preview-boot.e2e.ts",
       "category": "url-only",
-      "evidence": []
+      "evidence": [
+        "compareOrRefreshGolden",
+        "captureStableAria"
+      ],
+      "notUrlDriven": [
+        "reads served dist"
+      ]
     },
     {
       "file": "produced-file-mentions.e2e.ts",
       "category": "url-only",
-      "evidence": []
+      "evidence": [
+        "launchWebScaffold",
+        "seedSession"
+      ],
+      "notUrlDriven": []
     },
     {
       "file": "produced-files.e2e.ts",
       "category": "url-only",
-      "evidence": []
+      "evidence": [
+        "launchWebScaffold",
+        "seedSession"
+      ],
+      "notUrlDriven": []
     },
     {
       "file": "ptc-round.e2e.ts",
@@ -394,12 +494,25 @@
     {
       "file": "pwa-manifest.e2e.ts",
       "category": "url-only",
-      "evidence": []
+      "evidence": [],
+      "notUrlDriven": [
+        "reads served dist"
+      ]
     },
     {
       "file": "pwsh-terminal.e2e.ts",
       "category": "url-only",
-      "evidence": []
+      "evidence": [
+        "launchWebScaffold",
+        "seedSession",
+        "compareOrRefreshGolden",
+        "assertFixtureInventory",
+        "captureStableAria",
+        "fixtureUserPrompts"
+      ],
+      "notUrlDriven": [
+        "spawns a process"
+      ]
     },
     {
       "file": "question-composer.e2e.ts",
@@ -428,17 +541,30 @@
     {
       "file": "rail-search-expand.e2e.ts",
       "category": "url-only",
-      "evidence": []
+      "evidence": [
+        "launchWebScaffold"
+      ],
+      "notUrlDriven": []
     },
     {
       "file": "reference-composer.e2e.ts",
       "category": "url-only",
-      "evidence": []
+      "evidence": [
+        "launchWebScaffold",
+        "seedSession",
+        "compareOrRefreshGolden",
+        "assertFixtureInventory",
+        "captureStableAria"
+      ],
+      "notUrlDriven": []
     },
     {
       "file": "remote-welcome.e2e.ts",
       "category": "url-only",
-      "evidence": []
+      "evidence": [
+        "launchWebScaffold"
+      ],
+      "notUrlDriven": []
     },
     {
       "file": "replay-round-trip.e2e.ts",
@@ -466,7 +592,11 @@
     {
       "file": "search-card.expected.e2e.ts",
       "category": "url-only",
-      "evidence": []
+      "evidence": [],
+      "notUrlDriven": [
+        "jsdom",
+        "assembled-boot (fixture RPC)"
+      ]
     },
     {
       "file": "seeded-history.e2e.ts",
@@ -502,7 +632,13 @@
     {
       "file": "sidebar-scrollbar.e2e.ts",
       "category": "url-only",
-      "evidence": []
+      "evidence": [
+        "launchWebScaffold",
+        "seedSession",
+        "compareOrRefreshGolden",
+        "assertFixtureInventory"
+      ],
+      "notUrlDriven": []
     },
     {
       "file": "sidebar-subagent-activity.e2e.ts",
@@ -514,12 +650,26 @@
     {
       "file": "skill-invocation-policy.e2e.ts",
       "category": "url-only",
-      "evidence": []
+      "evidence": [
+        "launchWebScaffold",
+        "compareOrRefreshGolden",
+        "assertFixtureInventory",
+        "captureStableAria"
+      ],
+      "notUrlDriven": []
     },
     {
       "file": "skill-tool-row.e2e.ts",
       "category": "url-only",
-      "evidence": []
+      "evidence": [
+        "launchWebScaffold",
+        "seedSession",
+        "compareOrRefreshGolden",
+        "assertFixtureInventory",
+        "captureStableAria",
+        "fixtureUserPrompts"
+      ],
+      "notUrlDriven": []
     },
     {
       "file": "skill-user-invoke.e2e.ts",
@@ -531,7 +681,10 @@
     {
       "file": "smoke-real.e2e.ts",
       "category": "url-only",
-      "evidence": []
+      "evidence": [],
+      "notUrlDriven": [
+        "spawns a process"
+      ]
     },
     {
       "file": "startup-auto-selection.e2e.ts",
@@ -543,12 +696,22 @@
     {
       "file": "startup-rpc-budget.e2e.ts",
       "category": "url-only",
-      "evidence": []
+      "evidence": [
+        "launchWebScaffold"
+      ],
+      "notUrlDriven": []
     },
     {
       "file": "stats-paged-history.e2e.ts",
       "category": "url-only",
-      "evidence": []
+      "evidence": [
+        "launchWebScaffold",
+        "seedSession",
+        "compareOrRefreshGolden",
+        "assertFixtureInventory",
+        "captureStableAria"
+      ],
+      "notUrlDriven": []
     },
     {
       "file": "steering.e2e.ts",
@@ -594,22 +757,35 @@
     {
       "file": "submission-echo.e2e.ts",
       "category": "url-only",
-      "evidence": []
+      "evidence": [],
+      "notUrlDriven": [
+        "jsdom",
+        "assembled-boot (fixture RPC)"
+      ]
     },
     {
       "file": "support-timezone.e2e.ts",
       "category": "url-only",
-      "evidence": []
+      "evidence": [],
+      "notUrlDriven": []
     },
     {
       "file": "todo-row.expected.e2e.ts",
       "category": "url-only",
-      "evidence": []
+      "evidence": [],
+      "notUrlDriven": [
+        "jsdom",
+        "assembled-boot (fixture RPC)"
+      ]
     },
     {
       "file": "trajectory-image-display.expected.e2e.ts",
       "category": "url-only",
-      "evidence": []
+      "evidence": [],
+      "notUrlDriven": [
+        "jsdom",
+        "assembled-boot (fixture RPC)"
+      ]
     },
     {
       "file": "trajectory-virtualization.e2e.ts",
@@ -630,7 +806,10 @@
     {
       "file": "vite-entry.e2e.ts",
       "category": "url-only",
-      "evidence": []
+      "evidence": [],
+      "notUrlDriven": [
+        "spawns a process"
+      ]
     },
     {
       "file": "web-search-round.e2e.ts",

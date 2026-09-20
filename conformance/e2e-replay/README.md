@@ -40,6 +40,37 @@ before it could run against vocoderd. Counts sum to 98:
 The committed per-spec rows are in `spec-classification.json`; each carries the
 tokens it matched, so a classification can be audited rather than trusted.
 
+**Measured 2026-09-20: `url-only` overcounts badly, and no upstream spec is
+replayable against a live URL.** The label means only "no *visible* host
+coupling" — it does not mean a browser pointed at vocoderd would run the spec.
+Splitting the 35 by what they actually need (these buckets overlap; two specs
+both call the scaffold *and* run under jsdom):
+
+| Sub-class | Count | What it still needs |
+|---|---|---|
+| calls `launchWebScaffold` (or its helpers) | 23 | the in-process boot that produces the URL, `seedSession`, golden comparison |
+| jsdom + fixture RPC (`installAssembledBootEnv`) | 7 | the built client bundles with the fixture Connection |
+| spawns a process | 4 | its own `dsh web` (or a dev server) — `smoke-real`, `hmr-live`, `vite-entry`, `pwsh-terminal` |
+| reads the served `dist/` as files | 2 | `pwa-manifest`, `preview-boot` |
+| neither, and never navigates | 1 | `support-timezone` — asserts browser timezone isolation, opens no host |
+| **drove a URL and nothing else** | **0** | — |
+
+The `url-only` specs still use scaffold *infrastructure* even when they never
+touch `ctx`: 23 call `launchWebScaffold` and read back `authenticatedUrl` /
+`baseUrl` / `workspaceCwd`; 18 use `compareOrRefreshGolden`, 17
+`assertFixtureInventory`, 15 `seedSession`, 13 `captureStableAria`. Those are
+not a URL a live host can hand over — the scaffold boots the host *in-process*
+and the URL is one only its own process serves. The 13 not driven over a URL at
+all run under jsdom against the built bundles with the fixture RPC, spawn their
+own host, or read `dist/` as files; the last one (`support-timezone`) never
+navigates at all.
+
+So M5's open question — "does the 35-spec URL-only set justify wiring the axis?"
+— has a measured answer: **there is no such set.** The axis's ceiling against a
+live URL is 0 upstream specs, not 35. The classifier now reports this split
+(`just e2e-classify`) rather than the misleading single number, and each row
+carries a `notUrlDriven` list alongside its matched tokens.
+
 **The three specs a previous draft named as this axis's target do not qualify.**
 It proposed replaying `goal-bar`, `settings-chrome`, and `workspace-management`
 "because they use only unary + stream RPCs and the namespaces vocoderd already
