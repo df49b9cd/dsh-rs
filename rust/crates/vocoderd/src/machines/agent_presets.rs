@@ -595,6 +595,7 @@ impl AgentPresetsMachine {
                 RealizeRequest::WriteText {
                     path: target,
                     contents: text,
+                    expect: vocoder_cordis::WriteExpect::Any,
                 },
             )]),
             // Nothing to publish: remove the copied file so the copy shows its

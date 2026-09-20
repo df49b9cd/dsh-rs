@@ -265,6 +265,7 @@ impl SettingsMachine {
             RealizeRequest::WriteText {
                 path: self.file.to_string_lossy().to_string(),
                 contents: serde_json::to_string_pretty(&body).unwrap(),
+                expect: vocoder_cordis::WriteExpect::Any,
             },
         )]
     }

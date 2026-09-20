@@ -630,6 +630,7 @@ impl CredentialsMachine {
             RealizeRequest::WriteText {
                 path: self.path.clone(),
                 contents: next,
+                expect: vocoder_cordis::WriteExpect::Any,
             },
         )]
     }

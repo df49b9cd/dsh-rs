@@ -479,11 +479,16 @@ than it is:
   covered by `provider.rs`'s per-dialect tests, but "a real provider accepts this
   `tools` array and this `tool-result` item" is not something fixtures can
   confirm. `live_stream.rs` has the same property and for the same reason.
-- **`edit` has no version guard** (see M4 step 3). Upstream's
-  `fs-observation-policy` requires a prior read and pins a version CAS basis;
-  this host keeps no per-session observation state, so a read-modify-write race
-  can lose an update. Sound today only because the executor is serial and the
-  model is the sole writer.
+- **The `edit` version guard is now real, not a reduction** (landed 2026-09-20).
+  `fs-observation-policy`'s contract is reproduced end to end: the executor
+  records the session's observations from each resolving `Stat` (present at a
+  version, or absent), refuses an unobserved edit or overwrite with the
+  policy's exact wording, and carries the observed version into
+  `WriteText.expect`. The driver re-stats under the write's rename and refuses
+  a changed basis with `fs/stale-version` — the CAS half the in-machine check
+  cannot see across the read→write gap. The recorded `snapshots/session/
+  fs-policy-reject` / `fs-edit` / `fs-delete-recreate` shapes are reproduced in
+  `tool_exec`'s tests.
 - **The confinement fence and the kernel boundary are now joined for `bash`**
   (see M4 steps 3–4). `read`/`write`/`edit` still move no bytes a kernel filter
   would govern — they execute no code — and the containment fence remains

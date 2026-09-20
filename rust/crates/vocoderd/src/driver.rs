@@ -122,8 +122,45 @@ pub fn realize_with(
             Ok(bytes) => EffectResult::Bytes(bytes),
             Err(e) => EffectResult::Failed(io_err(&e)),
         },
-        RealizeRequest::WriteText { path, contents } => {
-            match write_atomically(std::path::Path::new(&path), contents.as_bytes()) {
+        RealizeRequest::WriteText {
+            path,
+            contents,
+            expect,
+        } => {
+            let path = std::path::Path::new(&path);
+            // The guard is a re-check, not a trust: the version the machine
+            // observed was taken by its own `Stat` effect, and between that and
+            // this rename the world could change. Re-stat here and refuse a
+            // mismatch *before* writing, mirroring the provider-side check in
+            // upstream's `fs-local` (which holds a per-target lock; the write
+            // itself is already temp+rename atomic).
+            match &expect {
+                vocoder_cordis::WriteExpect::Any => {}
+                vocoder_cordis::WriteExpect::Absent => {
+                    if path.try_exists().unwrap_or(false) {
+                        return Some(EffectResult::Failed(EffectError::Exists));
+                    }
+                }
+                vocoder_cordis::WriteExpect::Version(v) => {
+                    let current = std::fs::metadata(path).ok().map(|m| version_token(&m));
+                    match current {
+                        Some(c) if &c == v => {}
+                        Some(_) => {
+                            return Some(EffectResult::Failed(EffectError::Other(format!(
+                                "fs/stale-version: file changed since it was read\nrename {}",
+                                path.display()
+                            ))))
+                        }
+                        None => {
+                            return Some(EffectResult::Failed(EffectError::Other(format!(
+                                "fs/stale-version: file no longer exists\nrename {}",
+                                path.display()
+                            ))))
+                        }
+                    }
+                }
+            }
+            match write_atomically(path, contents.as_bytes()) {
                 Ok(()) => EffectResult::Done,
                 Err(e) => EffectResult::Failed(io_err(&e)),
             }

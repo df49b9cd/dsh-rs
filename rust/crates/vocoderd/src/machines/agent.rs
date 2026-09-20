@@ -1298,8 +1298,15 @@ impl AgentMachine {
             EffectResult::Text(text) => Ok(Answer::Text(text)),
             EffectResult::Done => Ok(Answer::Done),
             EffectResult::Stat {
-                canonical, is_dir, ..
-            } => Ok(Answer::Stat { canonical, is_dir }),
+                canonical,
+                is_dir,
+                version,
+                ..
+            } => Ok(Answer::Stat {
+                canonical,
+                is_dir,
+                version: Some(version),
+            }),
             // A confined command settled. Every field is carried to the
             // renderer: the exit code and the signal are distinct (a signal
             // death has no code), and `truncated` is not inferable from text.
@@ -1481,9 +1488,14 @@ impl AgentMachine {
         let request = match effect {
             Effect::Stat { path } => RealizeRequest::Stat { path: path.clone() },
             Effect::Read { path } => RealizeRequest::ReadText { path: path.clone() },
-            Effect::Write { path, contents } => RealizeRequest::WriteText {
+            Effect::Write {
+                path,
+                contents,
+                expect,
+            } => RealizeRequest::WriteText {
                 path: path.clone(),
                 contents: contents.clone(),
+                expect: expect.clone(),
             },
             // The argv arrives already wrapped by the sandbox machine, so this is
             // a plain spawn. No stdin is passed, matching the tool layer's

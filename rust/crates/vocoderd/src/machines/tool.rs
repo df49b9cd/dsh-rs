@@ -22,13 +22,14 @@
 //!   and enforces the window and byte caps while scanning, so peak memory is the
 //!   file size rather than unbounded — the same guarantee for every file a
 //!   model can realistically ask for, without a second effect path.
-//! - **No version guard on edit.** Upstream's `fs-observation-policy` requires a
-//!   prior read of the file in this session and pins a version CAS basis. That
-//!   state is per-session and this host keeps none, so an edit reads the file
-//!   and writes it back with no compare-and-swap. **This is a real weakening**
-//!   and it is the one thing here a reviewer should not have to infer: two tools
-//!   editing one file concurrently can lose an update. It is sound today because
-//!   the model is the only writer and the executor is strictly serial.
+//! - **The version guard is real, not implied.** Upstream's
+//!   `fs-observation-policy` requires a prior read of the file in this session
+//!   and pins a version CAS basis. The executor reproduces it end to end —
+//!   observation is recorded on every resolving `Stat`, the write carries the
+//!   observed version into `RealizeRequest::WriteText.expect`, and the driver
+//!   re-stats under the write before the rename — with the policy's own
+//!   refusals (`cannot modify "…": file has not been read`, `cannot edit "…":
+//!   file changed since it was read`).
 //! - **No `\r\n` normalization.** Upstream's wider fs layer normalizes the diff
 //!   basis. This host strips a trailing `\r` per line for display, exactly as
 //!   `buildWindow` does, and leaves the bytes how it found them.
@@ -960,13 +961,19 @@ pub enum Answer {
     Text(String),
     /// A write succeeded.
     Done,
-    /// A `Stat` resolved the target: its canonical path and whether it is a
-    /// directory.
+    /// A `Stat` resolved the target: its canonical path, whether it is a
+    /// directory, and the driver's version token.
     ///
     /// Carried rather than reduced to a bool because the *canonical* path is the
     /// whole point of the effect for the fence: containment is judged against it,
-    /// not against the joined string (see [`super::sandbox`]).
-    Stat { canonical: String, is_dir: bool },
+    /// not against the joined string (see [`super::sandbox`]). `version` is the
+    /// observation basis the write guard compares against; `None` for a
+    /// directory, whose bytes have no version.
+    Stat {
+        canonical: String,
+        is_dir: bool,
+        version: Option<String>,
+    },
     /// The target does not exist. Distinct from [`Self::Failed`] because the
     /// tools branch on it: a `write` creates, a `read` refuses.
     NotFound,

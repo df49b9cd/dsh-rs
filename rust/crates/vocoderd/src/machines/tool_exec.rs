@@ -37,16 +37,21 @@
 //! at a time**. That is a deliberate reduction: correct for this tool set, and
 //! wrong for a set with an exclusive member.
 //!
-//! ## Read-modify-write, and the guard it does not have
+//! ## Read-modify-write, and the guard it carries
 //!
-//! `edit` is a read followed by a write, because the filesystem effect
-//! vocabulary has no compare-and-swap and a machine may not read for itself.
-//! Upstream holds a per-target lock across the same window and pins a version
-//! CAS basis through `fs-observation-policy`; this host does neither, so two
-//! concurrent editors of one file could lose an update. See
-//! [`super::tool`]'s module doc — it is stated there as the real weakening it is,
-//! and it is sound here only because the executor is serial and the model is the
-//! sole writer.
+//! `edit` is a read followed by a write, and the guard that makes it safe is
+//! the same one upstream's `fs-observation-policy` enforces: the session must
+//! have *observed* the target (a read, or a prior mutation's `fs/observed`
+//! emit), and the write carries the observed version as its compare basis. The
+//! executor records observations from every resolving `Stat` (present, or
+//! absent for a create), refuses an unobserved edit or overwrite before any
+//! filesystem effect beyond the stat, and — because the pipeline is serial —
+//! the outstanding race narrows to the two process-level effects: the driver
+//! re-stats under the write itself and refuses a changed version with
+//! `fs/stale-version`. What it does not give is the *cross-process* guarantee
+//! upstream's `fs-local` per-target lock gives against two hosts; this host's
+//! own writes are serialized by the pump's global lock, so the guard is closed
+//! here.
 
 use serde_json::{Value, json};
 
@@ -91,8 +96,16 @@ pub enum Effect {
     Stat { path: String },
     /// Read a file's text.
     Read { path: String },
-    /// Write a file's text.
-    Write { path: String, contents: String },
+    /// Write a file's text, guarded by the observation the tool is acting on
+    /// (`WriteExpect::Version` for `edit` and for a guarded overwrite,
+    /// `Absent` for a guarded create; `Any` only where the corpus shows no
+    /// guard — the diff-read's rewrite does not exist, so every write the
+    /// executor issues carries a guard).
+    Write {
+        path: String,
+        contents: String,
+        expect: vocoder_cordis::WriteExpect,
+    },
     /// Run a model-authored command whose argv is **already wrapped** by
     /// [`super::sandbox_runner::confine`]. The whole [`ConfinedArgv`] travels
     /// rather than just the argv, because classifying what the run produces
@@ -147,6 +160,9 @@ enum Stage {
         fence: Fence,
         acting: Acting,
         canonical: String,
+        /// The path as the model spelled it, for messages that name the
+        /// target (`display_path` is applied on top of this).
+        raw: String,
     },
     /// A write is out.
     Writing {
@@ -189,6 +205,18 @@ enum Render {
     },
 }
 
+/// What a `write`/`edit` is allowed to assume about its target: the
+/// observation this session recorded for the path, from the `Stat` that
+/// resolved it. Upstream mints the same pair in `fs-observation-policy`'s
+/// `writeIntent` (`createIfAbsent` / `replaceIfVersion`).
+#[derive(Debug, Clone, PartialEq)]
+enum Observation {
+    /// The path was read (or written) and was present at this version token.
+    Present(String),
+    /// The path was read and found absent, which authorizes a guarded create.
+    Absent,
+}
+
 /// The executor's state for one step.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Executor {
@@ -205,6 +233,13 @@ pub struct Executor {
     call_seq: Option<u64>,
     /// Rows the executor owes the log, in order.
     owed: Vec<Value>,
+    /// What this session has observed of each canonical path, keyed by the
+    /// canonical path itself. The `Stat` that resolves a target records it
+    /// (present-at-version or absent); a write or edit reads it back as the
+    /// write's guard, exactly as upstream's `fs-observation-policy` records
+    /// `fs/observed` and answers a stale or never-read target with
+    /// `FS_STALE_VERSION` / `FS_NOT_OBSERVED`.
+    observed: std::collections::BTreeMap<String, Observation>,
     /// The last outcome, so the agent can feed the FSM once the queue drains.
     done: bool,
 }
@@ -398,7 +433,11 @@ impl Executor {
                 },
                 Effect::Stat { .. },
             ) => match answer {
-                Ok(Answer::Stat { canonical, is_dir }) => {
+                Ok(Answer::Stat {
+                    canonical,
+                    is_dir,
+                    version,
+                }) => {
                     if is_dir {
                         return self.finish_call(Outcome::denied(format!(
                             "cannot read \"{}\": not a regular file",
@@ -418,7 +457,55 @@ impl Executor {
                         },
                         other => other,
                     };
-                    self.act(&call, args, fence, acting, canonical)
+                    // The observation gate runs *before* any read: an edit of a
+                    // file this session never observed is refused here, which
+                    // is upstream's `fs-observation-policy` `editIntent` — the
+                    // read the pipeline is about to do is the edit's own
+                    // left-hand side, not the authorizing observation. The
+                    // version the map holds must first *agree* with the stat
+                    // just taken: a stale entry is a refusal, not a basis.
+                    if let Acting::Edit { .. } = &acting {
+                        match self.observed.get(&canonical) {
+                            Some(Observation::Present(v)) if Some(v) == version.as_ref() => {}
+                            Some(_) => {
+                                return self.finish_call(Outcome::denied(format!(
+                                    "cannot edit \"{}\": file changed since it was read — re-read the file, then retry",
+                                    display_path(&fence.root, &path)
+                                )));
+                            }
+                            None => {
+                                return self.finish_call(Outcome::denied(format!(
+                                    "cannot modify \"{}\": file has not been read — read the file, then retry",
+                                    display_path(&fence.root, &path)
+                                )));
+                            }
+                        }
+                    }
+                    // A `write` over a file the session never observed is the
+                    // same refusal in the policy's `writeIntent` words
+                    // (`createIfAbsent` over an occupied target is
+                    // `FS_NOT_OBSERVED`): the overwrite was never authorized.
+                    // A stale observation is caught by the write's guard, not
+                    // here — the write's intent is what the CAS compares.
+                    if let Acting::Write { .. } = &acting
+                        && !self.observed.contains_key(&canonical)
+                    {
+                        return self.finish_call(Outcome::denied(format!(
+                            "cannot overwrite existing \"{}\": file has not been read — read the file, then retry",
+                            display_path(&fence.root, &path)
+                        )));
+                    }
+                    // The resolving `Stat` records the fresh observation — the
+                    // pipeline's own stat is a world-read of the target, which
+                    // is what `fs-local`'s stat-on-observe does.
+                    self.observed.insert(
+                        canonical.clone(),
+                        match version {
+                            Some(v) => Observation::Present(v),
+                            None => Observation::Absent,
+                        },
+                    );
+                    self.act(&call, args, fence, acting, canonical, path.clone())
                 }
                 // A missing target is not an error for `write`: it is a create.
                 // It *is* one for `read` and `edit`, and each says so its own
@@ -438,6 +525,7 @@ impl Executor {
                                 existed: false,
                             },
                             canonical,
+                            path.clone(),
                         )
                     }
                     Acting::Read { .. } => self.finish_call(Outcome::denied(format!(
@@ -460,6 +548,7 @@ impl Executor {
                     fence,
                     acting,
                     canonical,
+                    raw: _,
                 },
                 Effect::Read { .. },
             ) => {
@@ -470,7 +559,21 @@ impl Executor {
                 };
                 match acting {
                     Acting::Read { window } => self.finish_call(read_outcome(&window, &text)),
-                    Acting::Edit { request } => match apply_edit(&text, &request) {
+                    Acting::Edit { request } => {
+                        // The edit's guard is the recorded observation, taken
+                        // before the text is touched: upstream checks the CAS
+                        // basis *before* literal matching (`fs-local`'s
+                        // `editText`), so a stale file reports "changed since
+                        // it was read", not "old_string was not found".
+                        let expect = match self.observed.get(&canonical) {
+                            Some(Observation::Present(v)) => {
+                                vocoder_cordis::WriteExpect::Version(v.clone())
+                            }
+                            // Unreachable: the Stat arm refuses an unobserved
+                            // or absent target before this read is issued.
+                            _ => vocoder_cordis::WriteExpect::Any,
+                        };
+                        match apply_edit(&text, &request) {
                         Ok(edited) => {
                             self.stage = Some(Stage::Writing {
                                 call,
@@ -486,11 +589,27 @@ impl Executor {
                             vec![ExecutorOut::Effect(Effect::Write {
                                 path: canonical,
                                 contents: edited.after,
+                                expect,
                             })]
                         }
                         Err(message) => self.finish_call(Outcome::denied(message)),
-                    },
+                        }
+                    }
                     Acting::Write { contents, existed } => {
+                        // The overwrite's observation was already required at
+                        // the Stat arm (an unobserved existing target was
+                        // refused there); the guard here carries the recorded
+                        // version as the write's compare basis, so a file that
+                        // changed between the stat and this write is refused
+                        // "changed since it was read" rather than silently
+                        // overwritten.
+                        let expect = match self.observed.get(&canonical) {
+                            Some(Observation::Present(v)) => {
+                                vocoder_cordis::WriteExpect::Version(v.clone())
+                            }
+                            Some(Observation::Absent) => vocoder_cordis::WriteExpect::Absent,
+                            None => vocoder_cordis::WriteExpect::Any,
+                        };
                         self.stage = Some(Stage::Writing {
                             call,
                             _args: args,
@@ -504,6 +623,7 @@ impl Executor {
                         vec![ExecutorOut::Effect(Effect::Write {
                             path: canonical,
                             contents,
+                            expect,
                         })]
                     }
                 }
@@ -762,6 +882,7 @@ impl Executor {
         fence: Fence,
         acting: Acting,
         canonical: String,
+        raw: String,
     ) -> Vec<ExecutorOut> {
         match &acting {
             // A read of the target, then the window is rendered from it. An edit
@@ -773,6 +894,7 @@ impl Executor {
                     fence,
                     acting,
                     canonical: canonical.clone(),
+                    raw,
                 });
                 vec![ExecutorOut::Effect(Effect::Read { path: canonical })]
             }
@@ -783,12 +905,15 @@ impl Executor {
             // what makes its hunk a pure insertion.
             Acting::Write { contents, existed } => {
                 if *existed {
+                    // The unobserved-overwrite refusal fired at the Stat arm,
+                    // so the map is known to hold this path by now.
                     self.stage = Some(Stage::Reading {
                         call: call.clone(),
                         args,
                         fence,
                         acting,
                         canonical: canonical.clone(),
+                        raw,
                     });
                     return vec![ExecutorOut::Effect(Effect::Read { path: canonical })];
                 }
@@ -802,9 +927,14 @@ impl Executor {
                         before: None,
                     },
                 });
+                // A create is guarded by the recorded absence; an unobserved
+                // absent path is guarded the same way (`Absent` fails only if
+                // the path turned out to exist, at which point the guard fires
+                // — which is exactly `createIfAbsent`'s contract).
                 vec![ExecutorOut::Effect(Effect::Write {
                     path: canonical,
                     contents: contents.clone(),
+                    expect: vocoder_cordis::WriteExpect::Absent,
                 })]
             }
         }
@@ -992,6 +1122,7 @@ mod tests {
             Ok(Answer::Stat {
                 canonical: "/w/a.txt".into(),
                 is_dir: false,
+            version: Some("v1".into()),
             }),
         );
         assert_eq!(
@@ -1053,6 +1184,7 @@ mod tests {
             Ok(Answer::Stat {
                 canonical: "/w/d".into(),
                 is_dir: true,
+            version: Some("v1".into()),
             }),
         );
         assert!(
@@ -1089,7 +1221,8 @@ mod tests {
             effects(&outs),
             vec![Effect::Write {
                 path: "/w/new.txt".into(),
-                contents: "hi".into()
+                contents: "hi".into(),
+            expect: vocoder_cordis::WriteExpect::Absent,
             }]
         );
 
@@ -1097,6 +1230,7 @@ mod tests {
             &Effect::Write {
                 path: "/w/new.txt".into(),
                 contents: "hi".into(),
+            expect: vocoder_cordis::WriteExpect::Absent,
             },
             Ok(Answer::Done),
         );
@@ -1113,19 +1247,40 @@ mod tests {
 
     /// A write over an existing file reports `update` and diffs against what was
     /// there — which is why the target's text is read even though the write does
-    /// not need it.
+    /// not need it. The target is read *by the session* first, as upstream's
+    /// `fs-write-overwrite` pins: the overwrite is authorized by that read.
     #[test]
     fn a_write_updates_when_the_target_exists() {
         let mut e = Executor::new(
-            vec![call(
-                "write",
-                json!({ "file_path": "a.txt", "content": "new" }),
-            )],
+            vec![
+                call("read", json!({ "file_path": "a.txt" })),
+                call("write", json!({ "file_path": "a.txt", "content": "new" })),
+            ],
             1,
             1,
         );
         e.begin("/w", &fence(), &sandbox());
         e.observe_row("tool/call", 1);
+        e.on_effect(
+            &Effect::Stat {
+                path: "/w/a.txt".into(),
+            },
+            Ok(Answer::Stat {
+                canonical: "/w/a.txt".into(),
+                is_dir: false,
+                version: Some("v1".into()),
+            }),
+        );
+        e.on_effect(
+            &Effect::Read {
+                path: "/w/a.txt".into(),
+            },
+            Ok(Answer::Text("old\r\n".into())),
+        );
+        // The write call now runs: its own stat, then the diff-read, then the
+        // guarded write.
+        e.begin("/w", &fence(), &sandbox());
+        e.observe_row("tool/call", 2);
         let outs = e.on_effect(
             &Effect::Stat {
                 path: "/w/a.txt".into(),
@@ -1133,10 +1288,9 @@ mod tests {
             Ok(Answer::Stat {
                 canonical: "/w/a.txt".into(),
                 is_dir: false,
+                version: Some("v1".into()),
             }),
         );
-        // The write goes first; the read is only for the diff, so it happens
-        // before the write is issued.
         assert!(matches!(effects(&outs)[0], Effect::Read { .. }));
         let outs = e.on_effect(
             &Effect::Read {
@@ -1149,6 +1303,7 @@ mod tests {
             &Effect::Write {
                 path: "/w/a.txt".into(),
                 contents: "new".into(),
+                expect: vocoder_cordis::WriteExpect::Version("v1".into()),
             },
             Ok(Answer::Done),
         );
@@ -1162,14 +1317,19 @@ mod tests {
         assert_eq!(r[0]["meta"]["diffs"][0]["oldText"], "old");
     }
 
-    /// An edit reads, applies, and writes — and reports the replacement kind.
+    /// An edit of a file the session first **read** — the compliant order the
+    /// corpus pins (`fs-edit`): the read's `Stat` records the observation, and
+    /// the edit then applies and writes with that version as its guard.
     #[test]
     fn an_edit_reads_applies_and_writes() {
         let mut e = Executor::new(
-            vec![call(
-                "edit",
-                json!({ "file_path": "a.txt", "old_string": "x", "new_string": "y" }),
-            )],
+            vec![
+                call("read", json!({ "file_path": "a.txt" })),
+                call(
+                    "edit",
+                    json!({ "file_path": "a.txt", "old_string": "x", "new_string": "y" }),
+                ),
+            ],
             1,
             1,
         );
@@ -1182,6 +1342,30 @@ mod tests {
             Ok(Answer::Stat {
                 canonical: "/w/a.txt".into(),
                 is_dir: false,
+                version: Some("v1".into()),
+            }),
+        );
+        assert!(matches!(effects(&outs)[0], Effect::Read { .. }));
+        let _outs = e.on_effect(
+            &Effect::Read {
+                path: "/w/a.txt".into(),
+            },
+            Ok(Answer::Text("x y\n".into())),
+        );
+        // The read is done; the edit is still queued, and running it left the
+        // `read` call's result as the executor's owed row.
+        assert!(!e.finished(), "the edit must still be queued");
+        let outs = e.begin("/w", &fence(), &sandbox());
+        assert!(!rows(&outs).is_empty(), "the read's result row is owed");
+        e.observe_row("tool/call", 2);
+        let outs = e.on_effect(
+            &Effect::Stat {
+                path: "/w/a.txt".into(),
+            },
+            Ok(Answer::Stat {
+                canonical: "/w/a.txt".into(),
+                is_dir: false,
+                version: Some("v1".into()),
             }),
         );
         assert!(matches!(effects(&outs)[0], Effect::Read { .. }));
@@ -1196,13 +1380,15 @@ mod tests {
             effects(&outs),
             vec![Effect::Write {
                 path: "/w/a.txt".into(),
-                contents: "y y\n".into()
+                contents: "y y\n".into(),
+                expect: vocoder_cordis::WriteExpect::Version("v1".into()),
             }]
         );
         let outs = e.on_effect(
             &Effect::Write {
                 path: "/w/a.txt".into(),
                 contents: "y y\n".into(),
+                expect: vocoder_cordis::WriteExpect::Version("v1".into()),
             },
             Ok(Answer::Done),
         );
@@ -1213,14 +1399,60 @@ mod tests {
         );
     }
 
-    /// An edit whose `old_string` is absent is refused without writing.
+    /// An edit of a file the session never read is refused before any
+    /// filesystem effect beyond the resolving `Stat` — upstream's
+    /// `fs-policy-reject` case, verbatim. The observation check fires *before*
+    /// the read the pipeline would have issued, because that read is the
+    /// edit's left-hand side, not an authorizing observation.
     #[test]
-    fn an_edit_that_cannot_match_does_not_write() {
+    fn an_edit_without_a_prior_read_is_refused() {
         let mut e = Executor::new(
             vec![call(
                 "edit",
-                json!({ "file_path": "a.txt", "old_string": "zzz", "new_string": "y" }),
+                json!({ "file_path": "settings.txt", "old_string": "a", "new_string": "b" }),
             )],
+            1,
+            1,
+        );
+        e.begin("/w", &fence(), &sandbox());
+        e.observe_row("tool/call", 1);
+        let outs = e.on_effect(
+            &Effect::Stat {
+                path: "/w/settings.txt".into(),
+            },
+            Ok(Answer::Stat {
+                canonical: "/w/settings.txt".into(),
+                is_dir: false,
+                version: Some("v1".into()),
+            }),
+        );
+        assert!(
+            effects(&outs).is_empty(),
+            "an unobserved edit must never reach a read or a write: {:?}",
+            effects(&outs)
+        );
+        assert_eq!(
+            data(&outs, 0)["message"]["content"][0]["content"][0]["text"]
+                .as_str()
+                .unwrap(),
+            "Error: cannot modify \"/w/settings.txt\": file has not been read — read the file, then retry"
+        );
+        assert!(e.finished());
+    }
+
+    /// An edit whose `old_string` is absent is refused without writing — after
+    /// the observing read, so the policy is satisfied and `apply_edit` owns
+    /// the refusal.
+    #[test]
+    fn an_edit_that_cannot_match_does_not_write() {
+        let mut e = Executor::new(
+            vec![
+                call("read", json!({ "file_path": "a.txt" })),
+                call(
+                    "edit",
+                    json!({ "file_path": "a.txt", "old_string": "zzz", "new_string": "y" }),
+                ),
+            ],
             1,
             1,
         );
@@ -1233,6 +1465,25 @@ mod tests {
             Ok(Answer::Stat {
                 canonical: "/w/a.txt".into(),
                 is_dir: false,
+                version: Some("v1".into()),
+            }),
+        );
+        e.on_effect(
+            &Effect::Read {
+                path: "/w/a.txt".into(),
+            },
+            Ok(Answer::Text("x y\n".into())),
+        );
+        e.begin("/w", &fence(), &sandbox());
+        e.observe_row("tool/call", 2);
+        e.on_effect(
+            &Effect::Stat {
+                path: "/w/a.txt".into(),
+            },
+            Ok(Answer::Stat {
+                canonical: "/w/a.txt".into(),
+                is_dir: false,
+                version: Some("v1".into()),
             }),
         );
         let outs = e.on_effect(
@@ -1253,6 +1504,218 @@ mod tests {
                 .contains("was not found")
         );
         assert!(e.finished());
+    }
+
+    /// The read-then-edit pipeline against a file that **changed** between the
+    /// observation and the write: the write guard refuses with the stale
+    /// wording, which is the CAS half of the policy the pipeline cannot see at
+    /// the `Stat` (the edit's own re-read happened after the world moved).
+    #[test]
+    fn an_edit_on_a_stale_observation_is_refused_at_the_write() {
+        let mut e = Executor::new(
+            vec![
+                call("read", json!({ "file_path": "a.txt" })),
+                call(
+                    "edit",
+                    json!({ "file_path": "a.txt", "old_string": "x", "new_string": "y" }),
+                ),
+            ],
+            1,
+            1,
+        );
+        e.begin("/w", &fence(), &sandbox());
+        e.observe_row("tool/call", 1);
+        e.on_effect(
+            &Effect::Stat {
+                path: "/w/a.txt".into(),
+            },
+            Ok(Answer::Stat {
+                canonical: "/w/a.txt".into(),
+                is_dir: false,
+                version: Some("v1".into()),
+            }),
+        );
+        e.on_effect(
+            &Effect::Read {
+                path: "/w/a.txt".into(),
+            },
+            Ok(Answer::Text("x y\n".into())),
+        );
+        e.begin("/w", &fence(), &sandbox());
+        e.observe_row("tool/call", 2);
+        e.on_effect(
+            &Effect::Stat {
+                path: "/w/a.txt".into(),
+            },
+            Ok(Answer::Stat {
+                canonical: "/w/a.txt".into(),
+                is_dir: false,
+                version: Some("v1".into()),
+            }),
+        );
+        let outs = e.on_effect(
+            &Effect::Read {
+                path: "/w/a.txt".into(),
+            },
+            Ok(Answer::Text("x y\n".into())),
+        );
+        // The write was issued against v1; the answer says the world moved —
+        // which is what `fs/stale-version` from the driver encodes.
+        let write = effects(&outs);
+        assert_eq!(write.len(), 1);
+        let outs = e.on_effect(
+            &write[0],
+            Ok(Answer::Failed(
+                "fs/stale-version: file changed since it was read\nrename /w/a.txt".into(),
+            )),
+        );
+        assert!(
+            data(&outs, 0)["message"]["content"][0]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("stale-version")
+        );
+        assert!(e.finished());
+    }
+
+    /// A `write` over a file the session never read is refused before any
+    /// write is issued — upstream's `createIfAbsent`-over-occupied ⇒
+    /// `FS_NOT_OBSERVED`, normalized to the not-observed wording.
+    #[test]
+    fn a_write_over_an_unread_file_is_refused() {
+        let mut e = Executor::new(
+            vec![call(
+                "write",
+                json!({ "file_path": "a.txt", "content": "new" }),
+            )],
+            1,
+            1,
+        );
+        e.begin("/w", &fence(), &sandbox());
+        e.observe_row("tool/call", 1);
+        let outs = e.on_effect(
+            &Effect::Stat {
+                path: "/w/a.txt".into(),
+            },
+            Ok(Answer::Stat {
+                canonical: "/w/a.txt".into(),
+                is_dir: false,
+                version: Some("v1".into()),
+            }),
+        );
+        assert!(
+            effects(&outs).is_empty(),
+            "an unobserved overwrite must not reach the filesystem: {:?}",
+            effects(&outs)
+        );
+        assert!(
+            data(&outs, 0)["message"]["content"][0]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("file has not been read — read the file, then retry")
+        );
+        assert!(e.finished());
+    }
+
+    /// A `write` over a file the session **read** proceeds, guarded by the
+    /// observed version (the `fs-write-overwrite` order: read, then write).
+    #[test]
+    fn a_write_after_a_read_is_guarded_by_the_observed_version() {
+        let mut e = Executor::new(
+            vec![
+                call("read", json!({ "file_path": "a.txt" })),
+                call("write", json!({ "file_path": "a.txt", "content": "new" })),
+            ],
+            1,
+            1,
+        );
+        e.begin("/w", &fence(), &sandbox());
+        e.observe_row("tool/call", 1);
+        e.on_effect(
+            &Effect::Stat {
+                path: "/w/a.txt".into(),
+            },
+            Ok(Answer::Stat {
+                canonical: "/w/a.txt".into(),
+                is_dir: false,
+                version: Some("v1".into()),
+            }),
+        );
+        e.on_effect(
+            &Effect::Read {
+                path: "/w/a.txt".into(),
+            },
+            Ok(Answer::Text("old\n".into())),
+        );
+        e.begin("/w", &fence(), &sandbox());
+        e.observe_row("tool/call", 2);
+        let outs = e.on_effect(
+            &Effect::Stat {
+                path: "/w/a.txt".into(),
+            },
+            Ok(Answer::Stat {
+                canonical: "/w/a.txt".into(),
+                is_dir: false,
+                version: Some("v1".into()),
+            }),
+        );
+        // The write's diff-read fires, then the write itself.
+        assert!(matches!(effects(&outs)[0], Effect::Read { .. }));
+        let outs = e.on_effect(
+            &Effect::Read {
+                path: "/w/a.txt".into(),
+            },
+            Ok(Answer::Text("old\n".into())),
+        );
+        assert_eq!(
+            effects(&outs),
+            vec![Effect::Write {
+                path: "/w/a.txt".into(),
+                contents: "new".into(),
+                expect: vocoder_cordis::WriteExpect::Version("v1".into()),
+            }]
+        );
+    }
+
+    /// The `fs-delete-recreate` shape: read (present), a shell `rm`, read
+    /// (absent), then write — the create is guarded by the recorded absence.
+    #[test]
+    fn a_write_after_observing_absence_is_a_guarded_create() {
+        let mut e = Executor::new(
+            vec![
+                call("read", json!({ "file_path": "a.txt" })),
+                call("write", json!({ "file_path": "a.txt", "content": "back" })),
+            ],
+            1,
+            1,
+        );
+        e.begin("/w", &fence(), &sandbox());
+        e.observe_row("tool/call", 1);
+        // The first read finds the file *absent* (the model already removed
+        // it in the world, as `fs-delete-recreate` does through bash before
+        // re-reading) — recording `Absent` is what authorizes the create.
+        e.on_effect(
+            &Effect::Stat {
+                path: "/w/a.txt".into(),
+            },
+            Ok(Answer::NotFound),
+        );
+        e.begin("/w", &fence(), &sandbox());
+        e.observe_row("tool/call", 2);
+        let outs = e.on_effect(
+            &Effect::Stat {
+                path: "/w/a.txt".into(),
+            },
+            Ok(Answer::NotFound),
+        );
+        assert_eq!(
+            effects(&outs),
+            vec![Effect::Write {
+                path: "/w/a.txt".into(),
+                contents: "back".into(),
+                expect: vocoder_cordis::WriteExpect::Absent,
+            }]
+        );
     }
 
     /// The fence denies a mutation outside the workspace, and the denial names
@@ -1276,6 +1739,7 @@ mod tests {
             Ok(Answer::Stat {
                 canonical: "/etc/passwd".into(),
                 is_dir: false,
+            version: Some("v1".into()),
             }),
         );
         assert!(effects(&outs).is_empty(), "a denied write must not run");
@@ -1552,6 +2016,7 @@ mod tests {
             Ok(Answer::Stat {
                 canonical: "/w/a.txt".into(),
                 is_dir: false,
+            version: Some("v1".into()),
             }),
         );
         let outs = e.on_effect(

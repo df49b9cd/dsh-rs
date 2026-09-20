@@ -76,6 +76,22 @@ impl EffectId {
     }
 }
 
+/// What a [`RealizeRequest::WriteText`] requires of the target's current
+/// state, checked by the driver with the version it re-reads immediately
+/// before the rename. Mirrors upstream's `fs/write-intent` decisions
+/// (`createIfAbsent` / `replaceIfVersion`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum WriteExpect {
+    /// No guard: write unconditionally.
+    #[default]
+    Any,
+    /// The path must not exist yet (`createIfAbsent`).
+    Absent,
+    /// The path must currently be at this version token (`replaceIfVersion`),
+    /// as produced by a prior [`RealizeRequest::Stat`].
+    Version(String),
+}
+
 /// Why an effect failed. Distinguishing "absent" from "broken" is load-bearing:
 /// settings treats a missing file as "default document" but a malformed one as
 /// an error, and workspace maps a missing path to `workspace/invalid-path`
@@ -357,7 +373,18 @@ pub enum RealizeRequest {
     },
     /// Write a file as UTF-8 text, creating parent directories. Atomic
     /// (temp + rename) — session generations rely on this.
-    WriteText { path: String, contents: String },
+    ///
+    /// `expect` is the observation-policy guard: `Any` is unconditional;
+    /// `Absent` refuses (`EffectError::Exists`) when the path is occupied;
+    /// `Version(v)` refuses (`EffectError::Other("fs/stale-version: …")`) when
+    /// the current version differs from `v`. The check runs under the driver's
+    /// write serialization, immediately before the rename, so the version a
+    /// machine observed is the version the write replaces.
+    WriteText {
+        path: String,
+        contents: String,
+        expect: WriteExpect,
+    },
     /// Write raw bytes, creating parent directories. Atomic, like [`WriteText`].
     ///
     /// Session generations are zstd frames, so they are not valid UTF-8 and
