@@ -201,6 +201,34 @@ pub enum EffectResult {
     },
     /// A [`RealizeRequest::ProbeProgram`] settled.
     Probe { found: bool },
+    /// A [`RealizeRequest::ProcessStart`] settled: the child is running and its
+    /// pid is the handle `ProcessRead`/`ProcessKill` name. The pid outlives the
+    /// request on purpose: a background job *is* a process left running, which
+    /// is what makes the buffer table the driver-side owner.
+    ProcessStarted { pid: u32 },
+    /// A [`RealizeRequest::ProcessRead`] answered: the output since the last
+    /// read, and the settle state. `running` rather than a bare `done` so one
+    /// variant answers both a live poll and a settled one — upstream's
+    /// `JobRead` (`text` + post-read snapshot) has the same shape.
+    ProcessChunk {
+        /// The child is still running. When true, every `done` field carries
+        /// `None`/`false` — an in-flight child reports no exit code, and
+        /// claiming one would be the same lie the `ProcessDone` docs name.
+        running: bool,
+        /// stdout appended since the last read, already capped per the start's
+        /// `stdout_max_bytes`.
+        stdout_delta: String,
+        /// stderr appended since the last read, under the same cap.
+        stderr_delta: String,
+        /// The settle record, once the child has finished: the exit code (None
+        /// on a signal death, as in `ProcessDone`), the signal when one killed
+        /// it, whether the in-memory cap dropped output past the bound, and
+        /// where — if anywhere — the untruncated stream spilled.
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+        truncated: bool,
+        spill_path: Option<String>,
+    },
     /// The effect failed.
     Failed(EffectError),
 }
@@ -564,6 +592,47 @@ pub enum RealizeRequest {
     /// exists to decide. Callers that need execution-grade evidence run the
     /// runner for real and classify its output.
     ProbeProgram { program: String },
+    /// Start a process without waiting for it — the detached half of
+    /// [`Self::ProcessExec`], and what a background `bash` job maps to.
+    ///
+    /// Same confinement contract as `ProcessExec` and for the same reason: the
+    /// argv arrives already wrapped, so the driver never decides *whether* to
+    /// confine. Differences are the ones a background run forces: no timeout
+    /// (upstream's `run_in_background` schema says none applies), no stdin, and
+    /// the answer is the pid rather than the settle record — the settle is what
+    /// [`Self::ProcessRead`]'s fields report later.
+    ///
+    /// The driver keeps the child, the reader threads and a capped per-pid
+    /// buffer in a process-wide table; a `kill_key` registration works exactly
+    /// as for `ProcessExec`, which is what makes a `session/cancel` reach a
+    /// background child outliving the effect call that started it.
+    ProcessStart {
+        argv: Vec<String>,
+        workdir: Option<String>,
+        env: Vec<(String, String)>,
+        /// Same per-stream cap `ProcessExec` takes — a background `yes` is
+        /// still cap-bound, and the tail the buffer keeps is what
+        /// `ProcessRead` drains.
+        stdout_max_bytes: Option<usize>,
+        /// The directory overflow spills into, as in `ProcessExec`.
+        spill_dir: Option<String>,
+        /// A session id the run is bound to; a cancel for it kills the child.
+        kill_key: Option<String>,
+    },
+    /// Drain one started process's output since the last read, and report
+    /// whether it has settled.
+    ///
+    /// Deliberately **non-blocking**: the driver's effect loop is synchronous,
+    /// so a blocking read would suspend the whole pump waiting for a child it
+    /// cannot move while it waits. Upstream's `jobs.wait` has no analogue here;
+    /// the machine-level reduction is documented on the tool (`job_output`'s
+    /// `wait: true` answers immediately rather than blocking).
+    ProcessRead { pid: u32 },
+    /// Kill a started process and reap it. A `ProcessRead` after the kill
+    /// reports the settle with the signal that did it, so a final poll still
+    /// collects the child — matching upstream, where `jobs.kill` returns
+    /// immediately and the next read shows the `killed` status.
+    ProcessKill { pid: u32 },
 }
 
 // ---------------------------------------------------------------------------

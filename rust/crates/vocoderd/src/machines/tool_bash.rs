@@ -17,17 +17,29 @@
 //!
 //! ## What is reduced here, and each is stated rather than hidden
 //!
-//! - **`run_in_background` is not offered.** Upstream registers it with
-//!   `ctx.jobs`, a service this host does not compose; a background call would
-//!   have no `job_output`/`job_kill` to collect it. The schema omits the field
-//!   and the description takes upstream's own disabled-deployment sentence, so
-//!   every string the model reads is still upstream's.
+//! - **The completion notice is not delivered into the session.** Upstream's
+//!   `tool-jobs` plugin listens on `jobs.onJobDone` and *injects a user-role
+//!   message* when a job settles (`owner.inject`, or `followup` to wake an
+//!   idle one, under a bounded wake budget). This host has no delivery channel
+//!   for that: the assistant stream is owned by the turn's own pump, and a
+//!   settle that reached the client without a `session/event` row would be a
+//!   message the replay cannot see. A model that wants the completion asks
+//!   with `job_output`, which is also the contract the tool's own prose names
+//!   ("read its output with `job_output`"). The reduction is the absence of
+//!   the notice, not its shape: no invented event type enters the log.
+//! - **A background write is not a node of pump-object state.** Upstream's
+//!   `jobs-local` is a *service*; this host's jobs table is a field on the
+//!   agent machine, keyed by session, because the router offers no
+//!   machine-to-machine call and the agent owns the catalog that mints jobs.
 //! - **No stdin parameter, by upstream's design and not as a gap.** The
 //!   model-facing bash tool does not expose stdin (`shell/src/types.ts`: "a
 //!   model that needs stdin uses shell syntax"); the plumbing exists for
 //!   in-process plugins and the `ProcessExec` effect carries it.
-//! - **No per-call abort.** A turn cancel does not kill a running child — the
-//!   effects are synchronous, and the dispatcher holds its lock across them.
+//! - **No per-call abort for a foreground run.** A turn cancel does not kill a
+//!   *foreground* child (the effects are synchronous, and the dispatcher holds
+//!   its lock across them). A background one is registered under the session's
+//!   kill key, so a cancel *does* reach it — which is the upstream asymmetry
+//!   verbatim: background work is what survives long enough to want one.
 //!
 //! None of these change the *shape* of a result: the envelope, the markers, and
 //! the error classification are upstream's.
@@ -100,13 +112,130 @@ pub const ENV_OVERRIDES: &[(&str, &str)] = &[
 /// home is a boot fact and the session id is machine state.
 pub const DSH_SHELL: &str = "1";
 
-/// The refusal a background request produces.
-///
-/// Upstream's own sentence for a deployment with `enableRunInBackground: false`.
-/// Copied so a model that learned the wording elsewhere recognizes it, and
-/// because the field is genuinely absent rather than broken.
+/// The refusal a background request produces on a deployment with
+/// `enableRunInBackground: false` — upstream's own sentence, retained so the
+/// drifts a future reduction reintroduces have a wording to return to. Not
+/// currently issued: the host composes a jobs registry, so a background call
+/// is honored rather than refused.
+#[allow(dead_code)]
 pub const BACKGROUND_UNAVAILABLE: &str =
     "run_in_background is not available; long-running commands must finish within the timeout";
+
+/// The acknowledgment a started background job answers with — upstream's
+/// background output-union render (`index.ts`'s `render` over
+/// `{kind: 'background'}`), verbatim: the model-facing text is the sentence,
+/// and the job id is how the next three tools' parameters make sense.
+pub fn started_background(job_id: &str) -> String {
+    format!("started background job {job_id}")
+}
+
+/// What a background job's *start* outcome looks like once settled — the same
+/// `processOutcome` vocabulary `tool-bash`'s background adapter uses: a kill
+/// stays `killed` with its signal as detail, an exit reports its code, and a
+/// shell that never ran reports no code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobStatus {
+    /// The child is still running.
+    Running,
+    /// Settled on its own: an exit code (None on a signal-less death),
+    /// reported rather than failed, exactly like the foreground path.
+    Completed { exit_code: Option<i32> },
+    /// Stopped by a kill — `job_kill`, or a session cancel that reached the
+    /// child through its registration.
+    Killed { signal: Option<i32> },
+}
+
+/// The `[status: ...]` marker upstream's `statusLine` renders.
+///
+/// Carried verbatim: a model that has learned the vocabulary sees the same
+/// text for a still-running job and one that finished, and the distinction is
+/// the basis for `job_output`'s "read what is new, then notice the settle"
+/// rhythm.
+pub fn status_line(status: &JobStatus, detail: Option<&str>) -> String {
+    let status = match status {
+        JobStatus::Running => "running",
+        JobStatus::Completed { .. } => "completed",
+        JobStatus::Killed { .. } => "killed",
+    };
+    match detail {
+        Some(detail) if !detail.is_empty() => format!("[status: {status}, {detail}]"),
+        _ => format!("[status: {status}]"),
+    }
+}
+
+/// The detail a settled job's marker carries — `exit code: N` for a
+/// completed run, `signal: S` for a killed one, both `background.ts`'s own
+/// spellings.
+pub fn settle_detail(status: &JobStatus) -> Option<String> {
+    match status {
+        JobStatus::Completed { exit_code } => {
+            Some(format!("exit code: {}", exit_code.unwrap_or(0)))
+        }
+        JobStatus::Killed { signal } => {
+            Some(match signal {
+                Some(sig) => format!("signal: {}", signal_name(*sig)),
+                None => "killed before exit".to_string(),
+            })
+        }
+        JobStatus::Running => None,
+    }
+}
+
+/// The full `job_output` body: any new output, then the status marker.
+///
+/// `output.render` in upstream's `tool-jobs`: `(no new output)` for an empty
+/// delta, the text as-is otherwise, the marker after a forced final newline.
+pub fn job_output_outcome(delta: &str, status: &JobStatus) -> Outcome {
+    let detail = settle_detail(status);
+    let body = if delta.is_empty() { "(no new output)" } else { delta };
+    let separator = if body.ends_with('\n') { "" } else { "\n" };
+    Outcome::text(format!("{body}{separator}{}", status_line(status, detail.as_deref())))
+}
+
+/// The `job_list` render — `(no background jobs)` for an empty table, one
+/// `id [kind] status — label` line per job.
+pub fn job_list_outcome(jobs: &[(String, JobStatus, String)]) -> Outcome {
+    if jobs.is_empty() {
+        return Outcome::text("(no background jobs)");
+    }
+    let lines: Vec<String> = jobs
+        .iter()
+        .map(|(id, status, label)| {
+            let word = match status {
+                JobStatus::Running => "running",
+                JobStatus::Completed { .. } => "completed",
+                JobStatus::Killed { .. } => "killed",
+            };
+            format!("{id} [bash] {word} — {label}")
+        })
+        .collect();
+    Outcome::text(lines.join("\n"))
+}
+
+/// The `job_kill` render: `requested cancellation of job <id>` for live
+/// work, `job <id> had already finished <status>` for a job the kill reached
+/// too late.
+pub fn job_kill_outcome(job_id: &str, already: Option<JobStatus>) -> Outcome {
+    match already {
+        Some(status) => Outcome::text(format!(
+            "job {job_id} had already finished {}",
+            status_line(&status, settle_detail(&status).as_deref())
+        )),
+        None => Outcome::text(format!("requested cancellation of job {job_id}")),
+    }
+}
+
+/// The refusal a job control produces for an id the session does not own —
+/// `jobs-local`'s own wording for the two cases, verbatim: unknown ids and
+/// cross-session reads are one class because the fence is the point, not the
+/// distinguishing.
+pub fn unknown_job(job_id: &str, foreign: bool) -> Outcome {
+    if foreign {
+        Outcome::denied(format!("job {job_id} belongs to another session"))
+    } else {
+        Outcome::denied(format!("unknown job {job_id}"))
+    }
+}
 
 /// A parsed, validated `bash` call, ready to be confined and run.
 #[derive(Debug, Clone, PartialEq)]
@@ -115,12 +244,18 @@ pub struct BashRequest {
     pub command: String,
     /// The working directory, resolved. Always absolute by this point.
     pub workdir: String,
-    /// The foreground timeout in milliseconds, clamped to the cap.
+    /// The foreground timeout in milliseconds, clamped to the cap. Unused on a
+    /// background call: upstream's schema says no timeout applies to one, and
+    /// the detached effect carries none.
     pub timeout_ms: u64,
-    /// Whether the call asked to run in the background. Always `false` today —
-    /// the field is unadvertised — but parsed so an undeclared key is refused
-    /// rather than silently ignored.
+    /// Whether the call asked to run in the background. Parsed and honored:
+    /// the schema now advertises the field, and the executor routes it to the
+    /// detached effect rather than the blocking one.
     pub background: bool,
+    /// The description the model wrote — display metadata for the UI on a
+    /// foreground call, and the background job's *label* on a background one
+    /// (upstream's `jobs.start({label})` is what `job_list` renders).
+    pub description: String,
 }
 
 /// Parse and validate a `bash` call's arguments.
@@ -149,6 +284,7 @@ pub fn bash_request(args: &Arguments, root: &str) -> Result<BashRequest, String>
         Some(d) if !d.trim().is_empty() => {}
         _ => return Err("invalid description: expected a non-empty string".to_string()),
     }
+    let description = string_arg(obj, "description").unwrap_or_default();
     let timeout_ms = match obj.get("timeoutMs") {
         None | Some(Value::Null) => BASH_DEFAULT_TIMEOUT_MS,
         Some(Value::Number(n)) => {
@@ -176,6 +312,7 @@ pub fn bash_request(args: &Arguments, root: &str) -> Result<BashRequest, String>
         workdir,
         timeout_ms,
         background,
+        description,
     })
 }
 

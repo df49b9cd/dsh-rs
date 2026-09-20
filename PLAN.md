@@ -314,15 +314,29 @@ which, since it landed, leaves the axis's wiring as the remaining work.
     reported in the sandbox's own denial vocabulary.
   - **What is reduced, and each is stated rather than hidden.** `seccomp` is not
     implemented and upstream's Linux chain does not use it either (`bwrap` then
-    Landlock); `run_in_background` is not offered (no jobs service to collect it,
-    so the field is absent and the description takes upstream's own
-    disabled-deployment sentence); output is bounded by a byte cap with no spill
-    file, so the truncation suffix reports `(unavailable)` rather than a path;
-    and a turn cancel does not kill a running child, because the effects are
-    synchronous. The `bash` schema deliberately does **not** set
-    `additionalProperties: false` (upstream's does not either), which is why the
-    executor refuses an unadvertised `run_in_background` at runtime rather than
-    relying on the schema.
+    Landlock). The `bash` schema deliberately does **not** set
+    `additionalProperties: false` (upstream's does not either), so value rules
+    the schema cannot name are enforced at the executor rather than left to a
+    validator.
+  - **`run_in_background` is landed** (2026-09-20). The jobs seam is realized
+    as upstream imagines it: `bash` with the field issues a *detached* process
+    effect (`ProcessStart`, answered with a pid) and the model reads with
+    `job_output`, lists with `job_list`, stops with `job_kill` — the three
+    `tool-jobs` surfaces with their schemas and renderings verbatim. The
+    executor's strict serial order is exactly why the detached effect exists:
+    a background call answers in the same step that issued it, the driver
+    holds the child in a driver-side table the `ProcessRead`/`ProcessKill`
+    pair drains, and the kill registration is the same one a `session/cancel`
+    rides, so a cancelled session truly stops its jobs. The stated reductions:
+    the completion **notice is not delivered into the session** (upstream's
+    `onJobDone` injects a user message; this host has no channel for that, so
+    a model learns of a settle by reading — which is also what the tool's own
+    prose names), the jobs registry lives *on* the agent machine rather than
+    as a cordis service (the router offers no machine-to-machine call), and
+    `job_output`'s `wait: true` answers immediately (the driver's synchronous
+    effect loop has nothing to block on; upstream's timed-out wait returns
+    `[status: running]`, which is what an immediate read of a running job
+    already reports).
   - **Two new effects carry what a machine cannot do.** `ProcessExec` takes an
     argv that is *already wrapped*, so the driver never decides whether to
     confine; `ProbeProgram` answers usability as data. The first is where the
@@ -440,17 +454,21 @@ which, since it landed, leaves the axis's wiring as the remaining work.
 Honest state of the claims above, so the plan does not read as further along
 than it is:
 
-- **The `dsh` control-host run for `wire` and `e2e-replay` is done and is one
-  command each** (see M0/M1). The e2e half needed the Playwright client to
-  carry the auth cookie (`e2e-client.mjs` reads `$CONFORMANCE_COOKIE_FILE`;
-  without it the control's index is a 401 and two of the four cells could not
-  have passed — the previously recorded "4/4 on the control" had been
-  measured with an ad-hoc client, not the committed one). Re-measured
-  2026-09-20 on the committed path: 4/4 on both hosts. `composition-replay`
-  remains candidate-only, so its parity half is still unmeasured.
-  `session-replay` is not an axis with two hosts: its assertions are pure
-  file-level interop (each side reads what the other wrote), so there is no
-  control comparison to make.
+- **The `dsh` control-host run for `wire`, `e2e-replay`, and
+  `composition-replay` is done and is one command each** (see M0/M1). The e2e
+  half needed the Playwright client to carry the auth cookie
+  (`e2e-client.mjs` reads `$CONFORMANCE_COOKIE_FILE`; without it the control's
+  index is a 401 and three of the four cells could not have passed — the
+  previously recorded "4/4 on the control" had been measured with an ad-hoc
+  client, not the committed one). Re-measured 2026-09-20 on the committed
+  path: 4/4 on both hosts. `composition-replay`'s control half is
+  `conformance/composition-replay/replay-against-host.mjs`, which replays the
+  same traces over the live wire (unary over HTTP, streams over WS) and
+  reports per-row results; running it on both hosts is the first time the two
+  halves were measured against each other — **15/15 rows agree**
+  (2026-09-20). `session-replay` is not an axis with two hosts: its assertions
+  are pure file-level interop (each side reads what the other wrote), so there
+  is no control comparison to make.
 - **`M1`'s cancellation item is folded into M4** rather than dropped: a turn
   FSM with no cancel input cannot express upstream's streaming-cancellation
   contract, so it is a prerequisite for the first agent-loop step, not
@@ -470,7 +488,11 @@ than it is:
   infrastructure even when they never touch `ctx` — measured 2026-09-20, **0 of
   the 35 drives a URL without it**, so there is no set to wire. The
   `__ModuleLoader__` pipeline that was the other blocker is landed (M5).
-- **Composition traces are hand-authored**, not recorded from JS (see M5).
+- **Composition traces are hand-authored**, not recorded from JS (see M5) —
+  but they now run against *both* hosts, so their assertions are the parity
+  check, not a candidate-only rehearsal. What remains unmeasured by them is
+  per-profile capture (web/headless/sdk/acp emit different traces upstream);
+  recording is still M5.
 - **`session-replay` has no suite directory**; its tests live in
   `rust/crates/vocoder-session/tests/interop.rs`.
 
@@ -528,11 +550,13 @@ than it is:
   vocabulary the rest of the sandbox speaks, and nothing in the corpus asks for
   one.
 - **`bash` is the only code executor, and it is reduced** (see M4 step 4). Its
-  argv is confined and its output is bounded, but `run_in_background` is not
-  offered (no jobs service), output does not spill to a file (the truncation
-  suffix names `(unavailable)` rather than a path), there is no stdin, and a
-  turn cancel does not kill a running child. The Windows ACL rung and the
-  Landlock launcher are written but unexercised on this Linux host.
+  argv is confined and its output is bounded and spilled, `run_in_background`
+  is offered through a session-scoped jobs table (the completion *notice* is
+  the stated reduction — a settle reaches the model by its own `job_output`,
+  not by an injected message), there is no stdin, and a turn cancel does not
+  stop a *foreground* child (background ones are stopped, through the same
+  kill-key registration). The Windows ACL rung and the Landlock launcher are
+  written but unexercised on this Linux host.
 
 ## Spec parity gate (CI)
 

@@ -1,7 +1,7 @@
-{"kind":"in","event":"vocoder/session/call","payload":{"method":"create","args":{"request":{"cwd":"/tmp/composition-replay","sessionId":"comp-1"}}},"expect":{"result":"ok"}}
-{"kind":"in","event":"vocoder/session/call","payload":{"method":"prompt","args":{"request":{"sessionId":"comp-1","requestId":"r1","content":[{"type":"text","text":"hello"}]}}},"expect":{"result":"ok"}}
-{"kind":"in","event":"vocoder/session/call","payload":{"method":"prompt","args":{"request":{"sessionId":"comp-1","requestId":"r1","content":[{"type":"text","text":"hello"}]}}},"expect":{"result":"ok"}}
-{"kind":"in","event":"vocoder/session/call","payload":{"method":"rename","args":{"request":{"sessionId":"comp-1","title":"  Replay  Session "}}},"expect":{"result":"ok"}}
-{"kind":"in","event":"vocoder/session/call","payload":{"method":"rename","args":{"request":{"sessionId":"comp-1","title":"  "}}},"expect":{"result":"err","code":"session/title-invalid"}}
-{"kind":"in","event":"vocoder/session/call","payload":{"method":"cancel","args":{"request":{"sessionId":"comp-1"}}},"expect":{"result":"ok"}}
+{"kind":"in","event":"vocoder/session/call","payload":{"method":"create","args":{"request":{"cwd":"$CWD","sessionId":"$SID"}}},"expect":{"result":"ok"}}
+{"kind":"in","event":"vocoder/session/call","payload":{"method":"prompt","args":{"request":{"sessionId":"$SID","requestId":"r1","mode":"queue","content":[{"type":"text","text":"hello"}]}}},"expect":{"result":"ok"}}
+{"kind":"in","event":"vocoder/session/call","payload":{"method":"prompt","args":{"request":{"sessionId":"$SID","requestId":"$R2","mode":"queue","content":[{"type":"text","text":"hello again"}]}}},"expect":{"result":"ok"}}
+{"kind":"in","event":"vocoder/session/call","payload":{"method":"rename","args":{"request":{"sessionId":"$SID","title":"  Replay  Session "}}},"expect":{"result":"ok"}}
+{"kind":"in","event":"vocoder/session/call","payload":{"method":"rename","args":{"request":{"sessionId":"$SID","title":"  "}}},"expect":{"result":"err","code":"session/title-invalid"}}
+{"kind":"in","event":"vocoder/session/call","payload":{"method":"cancel","args":{"request":{"sessionId":"$SID"}}},"expect":{"result":"ok"}}
 {"kind":"in","event":"vocoder/session/call","payload":{"method":"follow","args":{"request":{"address":{"kind":"session","sessionId":"comp-missing"}}}},"expect":{"result":"err","code":"session/not-found"}}

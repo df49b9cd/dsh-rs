@@ -364,6 +364,10 @@ impl FsCache {
             // file read, and pretending otherwise would replay a command with
             // stale output.
             EffectResult::ProcessDone { .. } | EffectResult::Probe { .. } => false,
+            // A detached process's lifecycle answers are likewise not cache
+            // material: a background read is a delta, and caching it would
+            // freeze "what the job printed" at its first poll.
+            EffectResult::ProcessStarted { .. } | EffectResult::ProcessChunk { .. } => false,
             // A failure is remembered against whatever was in flight, so the
             // re-run treats it as absent rather than re-requesting forever.
             EffectResult::Failed(e) => match self.in_flight.take() {

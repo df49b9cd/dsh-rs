@@ -86,9 +86,16 @@ struct AppState {
     home: String,
     /// Session id → running `bash` child's pid, for a turn cancel directed at
     /// a child the pump is blocked on (the dispatch lock is held). The pump
-    /// registers each keyed `ProcessExec` here for its run's length; the cancel
-    /// `/api` handler asks here without the lock.
+    /// registers each keyed `ProcessExec`/`ProcessStart` here for its run's
+    /// length; the cancel `/api` handler asks here without the lock. Shared
+    /// behind an `Arc` because a detached child's waiter thread outlives the
+    /// call that started it.
     children: crate::driver::ChildRegistry,
+    /// pid → unread output and settle state of a detached (`background: true`)
+    /// child. The jobs the model starts through `bash` report out of this
+    /// table: `job_output` reads a delta, `job_kill` asks through the same
+    /// kill-key registration as a cancel.
+    detached: std::sync::Arc<crate::driver::DetachedState>,
     /// Serializes whole effect loops. A machine holds one suspended operation
     /// at a time, so two pumps interleaving between an effect request and its
     /// answer would cross their suspensions and deliver an answer to the wrong
@@ -178,6 +185,7 @@ impl AppState {
                     during.extend(self.deliver(to, MachineIn::EffectChunk { id, bytes }));
                 },
                 Some(&self.children),
+                Some(&self.detached),
             )
             .unwrap_or(vocoder_cordis::EffectResult::Done);
             sort_outs(during, &mut terminal, &mut todo);
@@ -534,7 +542,8 @@ async fn main() -> Result<()> {
         connections: Mutex::new(std::collections::HashMap::new()),
         streams: Mutex::new(std::collections::HashMap::new()),
         home: args.home.display().to_string(),
-        children: crate::driver::ChildRegistry::new(std::collections::HashMap::new()),
+        children: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        detached: crate::driver::DetachedState::new(),
         dispatch: Mutex::new(()),
     });
 

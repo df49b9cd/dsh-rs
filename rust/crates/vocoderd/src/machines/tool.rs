@@ -218,10 +218,11 @@ pub fn catalog() -> Vec<ToolSpec> {
             input_schema: json!({
                 "type": "object",
                 // Unlike the fs tools, this schema does NOT set
-                // `additionalProperties: false`, mirroring upstream: undeclared
-                // keys are allowed through, which is exactly why the executor
-                // refuses an unadvertised `run_in_background` rather than relying
-                // on the schema to reject it.
+                // `additionalProperties: false`: upstream's own leaves extra
+                // keys alone, so the value rules the schema cannot express
+                // (the non-empty `command`/`description`, the positive
+                // `timeoutMs`) are the executor's to enforce rather than the
+                // validator's.
                 "properties": {
                     "command": { "type": "string", "description": "The bash command to execute." },
                     "description": {
@@ -230,12 +231,10 @@ pub fn catalog() -> Vec<ToolSpec> {
                     },
                     "timeoutMs": { "type": "number", "description": "Timeout in milliseconds. The executor applies its configured default and cap, and kills the command on expiry." },
                     "workdir": { "type": "string", "description": "Working directory for this command. Defaults to the session workspace; a relative path is resolved against it." },
-                    // `run_in_background` is deliberately absent: this host has
-                    // no jobs service, so there is no `job_output` to collect a
-                    // background call. The description takes upstream's own
-                    // disabled-deployment sentence and the field is not offered —
-                    // offering it and refusing the call would teach the model the
-                    // tool exists and is broken.
+                    // Verbatim from `tool-bash`'s `schemaFields` at
+                    // `enableRunInBackground: true`: this host now composes a
+                    // jobs registry, so the field is offered and honored.
+                    "run_in_background": { "type": "boolean", "description": "Run in the background and return a job id immediately (collect with job_output, stop with job_kill). No timeout applies." },
                     "sandbox_permissions": {
                         "type": "string",
                         "enum": escalation_targets(),
@@ -249,22 +248,61 @@ pub fn catalog() -> Vec<ToolSpec> {
                 "required": ["command", "description"],
             }),
         },
+        // `tool-jobs`'s three controls, verbatim schemas and descriptions. The
+        // jobs registry exists (`AgentMachine::jobs`), so these are honest
+        // entries rather than taught-then-broken names.
+        ToolSpec {
+            name: "job_output",
+            description: "Read a background job. Stream jobs return only output since the previous read; final-output jobs return their result after settlement. Every response ends with `[status: ...]`. Reads are non-blocking unless `wait: true`, which waits up to the configured cap.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "job_id": { "type": "string", "description": "Job id returned by the tool that started the background work." },
+                    "wait": { "type": "boolean", "description": "Block until the job reaches a terminal status or the timeout expires. A timed-out wait returns [status: running] and leaves the job alive." },
+                    "timeout_ms": { "type": "number", "description": "Max wait in milliseconds (only meaningful with wait: true). Defaults to the configured wait timeout; capped by the configured maximum." },
+                },
+                "required": ["job_id"],
+            }),
+        },
+        ToolSpec {
+            name: "job_list",
+            description: "List your background jobs (running and finished) with their ids, kinds, and statuses.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {},
+            }),
+        },
+        ToolSpec {
+            name: "job_kill",
+            description: "Request cancellation of a running background job by job id. Returns immediately; the job settles as killed once its work actually stops.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "job_id": { "type": "string", "description": "Job id returned by the tool that started the background work." },
+                    "reason": { "type": "string", "description": "Optional short reason, recorded in the log and forwarded to the job." },
+                },
+                "required": ["job_id"],
+            }),
+        },
     ]
 }
 
 /// The `bash` tool's description, upstream's `bashDescription` verbatim at
-/// `enableRunInBackground: false` with escalation advertised.
+/// `enableRunInBackground: true` with escalation advertised.
 ///
 /// Copied rather than paraphrased because it is prompt text a model acts on: it
 /// teaches the fresh-shell contract, the exit marker, the sandbox denial marker,
-/// and — load-bearing for the escalation ladder — the sanctioned one-shot retry.
-/// A paraphrase would change what the model does on a denial without changing
-/// anything a test could see, which is exactly the kind of drift the corpus
-/// exists to prevent.
+/// the `run_in_background` → `job_output`/`job_kill` pairing, and — load-bearing
+/// for the escalation ladder — the sanctioned one-shot retry. A paraphrase would
+/// change what the model does on a denial without changing anything a test could
+/// see, which is exactly the kind of drift the corpus exists to prevent.
 ///
-/// The disabled-background sentence (`Background execution is not available…`)
-/// and the escalation paragraph are both upstream's own `bashDescription`
-/// branches — this host composes the `enableRunInBackground: false` variant with
+/// The enabled-background sentence ("Set `run_in_background: true`…") and the
+/// escalation paragraph are both upstream's own `bashDescription` branches — this
+/// host composes the `enableRunInBackground: true` variant with
 /// `escalationModes.length > 0`.
 pub const BASH_DESCRIPTION: &str = concat!(
     "Execute a bash command (`bash -c`) and return its stdout/stderr. ",
@@ -274,7 +312,7 @@ pub const BASH_DESCRIPTION: &str = concat!(
     "Commands may run under a file sandbox; a blocked file operation is reported as ",
     "`[sandbox: file access denied under <mode> mode]` — a policy denial, not a bug in the command; do not retry another way. ",
     "Long output is truncated to its tail; the full output is saved to a file whose path is reported when available. ",
-    "Background execution is not available; long-running commands must finish within the timeout. ",
+    "Set `run_in_background: true` for long-running commands: the call returns a job id immediately; read its output with `job_output` and stop it with `job_kill`. ",
     "Attempting a command the sandbox may deny is safe and expected: run it and read the ",
     "marker rather than assuming the denial. When a command is denied and a wider mode would let it ",
     "succeed, escalate immediately in the same turn — the one sanctioned exception to a denial: retry ",
@@ -996,6 +1034,20 @@ pub enum Answer {
     },
     /// The effect failed, with the message the driver rendered.
     Failed(String),
+    /// A `ProcessStart` answered: the child is running and its pid is the
+    /// handle a later `ProcessRead`/`ProcessKill` names.
+    ProcessStarted { pid: u32 },
+    /// A `ProcessRead` answered: the unread output deltas, and the settle
+    /// state when the child has finished.
+    ProcessChunk {
+        running: bool,
+        stdout_delta: String,
+        stderr_delta: String,
+        /// Settle facts, all absent while `running`.
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+        aborted: bool,
+    },
 }
 
 /// The renderer for an effect that failed at the driver.
@@ -1671,9 +1723,17 @@ mod tests {
     #[test]
     fn the_catalog_is_small_and_executable() {
         let names: Vec<&str> = catalog().iter().map(|t| t.name).collect();
-        assert_eq!(names, vec!["read", "write", "edit", "bash"]);
+        assert_eq!(
+            names,
+            vec!["read", "write", "edit", "bash", "job_output", "job_list", "job_kill"]
+        );
         for spec in catalog() {
             assert_eq!(spec.input_schema["type"], "object");
+        }
+        // `job_list` has no properties; every other spec advertises at least
+        // one — the catalog test's non-empty assertion is what makes a tool's
+        // schema real rather than a shell.
+        for spec in catalog().iter().filter(|t| t.name != "job_list") {
             assert!(
                 spec.input_schema["properties"]
                     .as_object()
@@ -1773,5 +1833,11 @@ mod tests {
         assert!(is_mutating("edit"));
         assert!(!is_mutating("read"));
         assert!(!is_mutating("bash"));
+        // The job controls touch no workspace bytes: a kill stops a process,
+        // which is upstream's own treatment (tool-jobs registers no
+        // `tools/pre-execute` escalation path).
+        for name in ["job_output", "job_list", "job_kill"] {
+            assert!(!is_mutating(name), "{name} must not ask");
+        }
     }
 }

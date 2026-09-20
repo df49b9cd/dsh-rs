@@ -118,6 +118,23 @@ pub enum Effect {
         env: Vec<(String, String)>,
         timeout_ms: u64,
     },
+    /// Start a backgrounded command whose argv is already wrapped. The same
+    /// fields as `Exec` minus the timeout — upstream's `run_in_background`
+    /// schema says none applies — because the driver answers a pid rather
+    /// than a settle, and the settle arrives later through `ExecRead`.
+    ExecDetached {
+        confined: super::sandbox_runner::ConfinedArgv,
+        workdir: String,
+        env: Vec<(String, String)>,
+    },
+    /// Drain a background child's unread output and report its settle state.
+    /// What `job_output` maps to: non-blocking by construction because the
+    /// driver is synchronous, so a `wait: true` reduction answers immediately
+    /// rather than suspending the pump.
+    ExecRead { pid: u32 },
+    /// Ask for a background child's kill. `job_kill`'s effect; the actual
+    /// settle the tool then reports is read back through `ExecRead`.
+    ExecKill { pid: u32 },
 }
 
 /// Which tool a pipeline is running, once the target is resolved.
@@ -176,6 +193,22 @@ enum Stage {
         /// The write's own renderer inputs.
         render: Render,
     },
+    /// A background call's detached start is out: the pid is what lands the
+    /// job into the table, and the effect's answer carries it.
+    StartingDetached {
+        /// The command/description pair, for the job's label on the answer.
+        request: super::tool_bash::BashRequest,
+    },
+    /// A detached read is out, draining the unread output for a `job_output`.
+    ReadingJob {
+        /// The job id the call is reading — the answer lands against it, so
+        /// the table update and the outcome render must both name it.
+        job: String,
+    },
+    /// A detached kill is out.
+    KillingJob {
+        job: String,
+    },
     /// A confined command is out. Carries everything the result renderer needs,
     /// because classification and rendering both happen on the answer and
     /// nothing else survives the wait. The call itself is not carried: the
@@ -215,6 +248,87 @@ enum Observation {
     Present(String),
     /// The path was read and found absent, which authorizes a guarded create.
     Absent,
+}
+
+/// One session's job table: pid-keyed so a `ProcessRead`'s pid needs no
+/// indirection, carrying the display identity the `job_list`/`job_output`
+/// renderers report.
+///
+/// Upstream's shape is `jobs-local`'s per-owner registry; the table lives on
+/// the executor's *owning machine* rather than in a service because the router
+/// gives no machine-to-machine call — and the agent owns the catalog that
+/// mints job ids, so it is the only owner the table can answer honestly for.
+/// The model-facing id (`bash-N`, the registry's `<kind>-N` shape) is what the
+/// tools name; the pid is what the driver names, and this table is the map
+/// between them.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Jobs {
+    /// Next sequence per session's own numbering: ids are predictable on
+    /// purpose (`jobs-local`'s docs: "Ids are predictable, so authorization —
+    /// not secrecy — is the boundary"), so the sequence needs no salt.
+    next: u64,
+    /// In start order, which is also registration order — what `job_list`
+    /// reports.
+    rows: Vec<JobRow>,
+}
+
+/// One job, as the table records it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobRow {
+    /// The model-facing id, `bash-N` over the session's own sequence.
+    pub name: String,
+    /// The pid the driver answered at start, so the read/kill effects can be
+    /// issued against it.
+    pub pid: u32,
+    /// The description the model passed, which upstream uses as the job's
+    /// label — `job_list` renders it.
+    pub label: String,
+    /// The settled state once a read has observed it; `None` while running.
+    /// Cached here rather than re-derived per call so a second `job_output`
+    /// of a finished job answers the same settle, upstream's idempotent read.
+    pub status: super::tool_bash::JobStatus,
+}
+
+impl Jobs {
+    /// Start a job: assign its id, record it, and render the acknowledgment
+    /// the model reads — upstream's `started background job <id>`.
+    ///
+    /// The pid comes from the driver's `ProcessStarted` answer, which is why
+    /// this runs on the effect's answer rather than at the ask: the start is
+    /// not recorded until the host has a handle.
+    pub fn record(&mut self, pid: u32, label: String) -> String {
+        self.next += 1;
+        let name = format!("bash-{}", self.next);
+        self.rows.push(JobRow {
+            name: name.clone(),
+            pid,
+            label,
+            status: super::tool_bash::JobStatus::Running,
+        });
+        name
+    }
+
+    /// Look a job up by the name the model knows it by.
+    ///
+    /// `None` is the refusal's raw fact; the wording is the tool's.
+    pub fn find(&self, name: &str) -> Option<&JobRow> {
+        self.rows.iter().find(|r| r.name == name)
+    }
+
+    /// Mark a job from a settle the read just observed.
+    pub fn settle(&mut self, name: &str, status: super::tool_bash::JobStatus) {
+        if let Some(row) = self.rows.iter_mut().find(|r| r.name == name) {
+            row.status = status;
+        }
+    }
+
+    /// The list `job_list` renders, in registration order.
+    pub fn list(&self) -> Vec<(String, super::tool_bash::JobStatus, String)> {
+        self.rows
+            .iter()
+            .map(|r| (r.name.clone(), r.status.clone(), r.label.clone()))
+            .collect()
+    }
 }
 
 /// The executor's state for one step.
@@ -278,6 +392,7 @@ impl Executor {
         root: &str,
         fence: &Fence,
         sandbox: &super::tool_bash::SandboxContext,
+        jobs: &Jobs,
     ) -> Vec<ExecutorOut> {
         if self.stage.is_some() {
             return Vec::new();
@@ -304,7 +419,7 @@ impl Executor {
                 outs
             }
             Gate::Allow => {
-                let outs = self.start(&call, args, fence.clone(), root, sandbox);
+                let outs = self.start(&call, args, fence.clone(), root, sandbox, jobs);
                 let mut rows = vec![self.call_row(&call)];
                 rows.extend(outs);
                 rows
@@ -346,6 +461,7 @@ impl Executor {
         verdict: &Value,
         root: &str,
         sandbox: &super::tool_bash::SandboxContext,
+        jobs: &Jobs,
     ) -> Vec<ExecutorOut> {
         let Some(Stage::Asking {
             call, args, fence, ..
@@ -392,7 +508,7 @@ impl Executor {
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             let widened = super::tool::escalated_fence(&fence, requested);
-            outs.extend(self.start(&call, args, widened, root, sandbox));
+            outs.extend(self.start(&call, args, widened, root, sandbox, jobs));
         } else {
             // Bash words an escalation refusal its own way (`this command to
             // "<mode>"`); the filesystem family says `tool "<name>"`. The corpus
@@ -417,6 +533,7 @@ impl Executor {
         &mut self,
         effect: &Effect,
         answer: Result<Answer, String>,
+        jobs: &mut Jobs,
     ) -> Vec<ExecutorOut> {
         let Some(stage) = self.stage.take() else {
             return Vec::new();
@@ -673,6 +790,90 @@ impl Executor {
                 Ok(Answer::Failed(m)) => self.finish_call(Outcome::denied(m)),
                 _ => self.finish_call(Outcome::denied("the write did not land")),
             },
+            // The detached start answered with the pid: the job lands in the
+            // table under its minted id (the upstream registry's `<kind>-N`
+            // shape, predictable on purpose — `jobs-local`'s docs note that
+            // ids are predictable and the fence is authorization, not
+            // secrecy), and the call closes on the acknowledgment upstream's
+            // `render` produces for the `{kind: 'background'}` result.
+            (
+                Stage::StartingDetached { request },
+                Effect::ExecDetached { .. },
+            ) => {
+                match answer {
+                    Ok(Answer::ProcessStarted { pid }) => {
+                        let id = jobs.record(pid, request.description.clone());
+                        self.finish_call(Outcome::text(super::tool_bash::started_background(&id)))
+                    }
+                    // A spawn failure on the background path is the same
+                    // runner-unusable class as a foreground one's: no job
+                    // minted (upstream's contract — a throwing starter leaves
+                    // nothing registered — so a failed start has no id to
+                    // leak).
+                    Ok(Answer::Failed(m)) => self.finish_call(Outcome::denied(m)),
+                    _ => self.finish_call(Outcome::denied("the command gave an unexpected answer")),
+                }
+            }
+            // The read drained: update the job's observed status, then render
+            // the delta plus the status marker, in `tool-jobs`'s own shape.
+            (
+                Stage::ReadingJob { job },
+                Effect::ExecRead { .. },
+            ) => {
+                match answer {
+                    Ok(Answer::ProcessChunk {
+                        running,
+                        stdout_delta,
+                        stderr_delta,
+                        exit_code,
+                        signal,
+                        aborted,
+                    }) => {
+                        let status = if running {
+                            super::tool_bash::JobStatus::Running
+                        } else if aborted || signal.is_some() {
+                            // `processOutcome`'s kill branch, verbatim: a kill
+                            // stays killed, signaled when one is known.
+                            super::tool_bash::JobStatus::Killed { signal }
+                        } else {
+                            super::tool_bash::JobStatus::Completed { exit_code }
+                        };
+                        jobs.settle(&job, status.clone());
+                        let mut delta = stdout_delta;
+                        if !stderr_delta.is_empty() {
+                            if !delta.is_empty() && !delta.ends_with('\n') {
+                                delta.push('\n');
+                            }
+                            delta.push_str("[stderr]\n");
+                            delta.push_str(&stderr_delta);
+                        }
+                        self.finish_call(super::tool_bash::job_output_outcome(&delta, &status))
+                    }
+                    Ok(Answer::Failed(_m)) => {
+                        // The driver answered "no such pid": the child is gone
+                        // and its table entry was the name the machine knew it
+                        // by, so refuse with the job-level wording a foreign
+                        // id would have drawn at the gate.
+                        self.finish_call(super::tool_bash::unknown_job(&job, false))
+                    }
+                    _ => self.finish_call(Outcome::denied("the job gave an unexpected answer")),
+                }
+            }
+            // The kill's own ask is answered: the job still has to settle,
+            // which upstream words as *requested* rather than *done* — the
+            // `job_kill` render is `requested cancellation of job <id>`.
+            (
+                Stage::KillingJob { job },
+                Effect::ExecKill { .. },
+            ) => match answer {
+                Ok(Answer::Done) => {
+                    self.finish_call(super::tool_bash::job_kill_outcome(&job, None))
+                }
+                Ok(Answer::Failed(_m)) => {
+                    self.finish_call(super::tool_bash::unknown_job(&job, false))
+                }
+                _ => self.finish_call(Outcome::denied("the job gave an unexpected answer")),
+            },
             // The command settled: classify the sandbox, then render.
             (
                 Stage::Executing {
@@ -779,9 +980,18 @@ impl Executor {
         fence: Fence,
         root: &str,
         sandbox: &super::tool_bash::SandboxContext,
+        jobs: &Jobs,
     ) -> Vec<ExecutorOut> {
         if call.name == "bash" {
             return self.start_bash(&args, &fence, root, sandbox);
+        }
+        // The three job controls take the same early return `bash` does and
+        // for the same reason: no filesystem target, so no `Stat`. Their
+        // "target" is the job table itself, and the only world they touch is
+        // the detached process — reached through `ExecRead`/`ExecKill`, with
+        // no confinement decision to make.
+        if matches!(call.name.as_str(), "job_output" | "job_list" | "job_kill") {
+            return self.start_job(call, &args, jobs);
         }
         let acting = match call.name.as_str() {
             "read" => match read_window(&args, root) {
@@ -840,13 +1050,6 @@ impl Executor {
             Ok(request) => request,
             Err(message) => return self.finish_call(Outcome::denied(message)),
         };
-        // The schema does not advertise `run_in_background`, but the schema also
-        // does not forbid extra keys, so a call can still carry it — and there is
-        // no jobs service here to collect a background run. Refuse it rather
-        // than silently running it in the foreground.
-        if request.background {
-            return self.finish_call(Outcome::denied(super::tool_bash::BACKGROUND_UNAVAILABLE));
-        }
         // A model command is `bash -c <command>`, a fresh shell per call.
         let argv = vec![
             "bash".to_string(),
@@ -859,6 +1062,21 @@ impl Executor {
                     .with_error(super::tool::sandbox_unavailable()),
             ),
             Ok(confined) => {
+                // A background call neither blocks the step nor renders the
+                // process's own output: the driver answers a pid, the machine
+                // names the id, and the call closes on the acknowledgment —
+                // which is what lets the queue advance while the command runs
+                // (`tool-bash`'s `{kind: 'background'}` result, immediately).
+                if request.background {
+                    self.stage = Some(Stage::StartingDetached {
+                        request: request.clone(),
+                    });
+                    return vec![ExecutorOut::Effect(Effect::ExecDetached {
+                        confined,
+                        workdir: request.workdir.clone(),
+                        env: sandbox.env.clone(),
+                    })];
+                }
                 let mode = fence.mode();
                 let enforcement = confined.enforcement;
                 let denial_signatures = confined.denial_signatures.clone();
@@ -878,6 +1096,82 @@ impl Executor {
                     timeout_ms: request.timeout_ms,
                 })]
             }
+        }
+    }
+
+    /// A job control's start: resolve the id against the session's table and
+    /// issue its effect, or refuse with the registry's own wording.
+    ///
+    /// Upstream's `tool-jobs` puts the ownership fence at the *service*
+    /// (`jobs-local`'s `job.belongsTo` check); here the table the machine
+    /// holds is already that session's own, so an unknown id and a foreign
+    /// one are the same fact — this session owns no such job — and the
+    /// refusal is the only answer either receives.
+    fn start_job(&mut self, call: &Call, args: &Arguments, jobs: &Jobs) -> Vec<ExecutorOut> {
+        use super::tool_bash::{JobStatus, job_kill_outcome, job_list_outcome, unknown_job};
+        let parse_id = |args: &Arguments| -> Result<String, Outcome> {
+            let Some(obj) = args.as_object() else {
+                return Err(Outcome::denied("invalid arguments: expected an object"));
+            };
+            match obj.get("job_id").and_then(Value::as_str) {
+                // `validateJobId`, verbatim.
+                Some(id) if !id.is_empty() => Ok(id.to_string()),
+                other => {
+                    let got = serde_json::to_string(&other.unwrap_or("")).unwrap_or_default();
+                    Err(Outcome::denied(format!(
+                        "invalid job_id: expected a non-empty string, got {got}"
+                    )))
+                }
+            }
+        };
+        match call.name.as_str() {
+            // No effect at all: the table is the machine's own record, so a
+            // list answers from it without touching the world. The settle
+            // statuses are as observed at the last read; a job that has never
+            // been read lists as running, matching upstream's snapshot shape.
+            "job_list" => self.finish_call(job_list_outcome(&jobs.list())),
+            "job_output" => {
+                let id = match parse_id(args) {
+                    Ok(id) => id,
+                    Err(outcome) => return self.finish_call(outcome),
+                };
+                let Some(row) = jobs.find(&id) else {
+                    return self.finish_call(unknown_job(&id, false));
+                };
+                // `wait: true` is the documented reduction: the driver's
+                // synchronous effect loop has no wait to lean on (an effect
+                // that blocks would hold the pump against the child it must
+                // move), so the call answers immediately whether the job has
+                // settled or not — upstream's timed-out wait returns
+                // `[status: running]`, which is exactly what an immediate
+                // read of a running job reports.
+                let _ = args.as_object().and_then(|o| o.get("wait"));
+                if let JobStatus::Running = row.status {
+                    self.stage = Some(Stage::ReadingJob { job: id });
+                    return vec![ExecutorOut::Effect(Effect::ExecRead { pid: row.pid })];
+                }
+                // Already observed as settled: upstream answers the drain
+                // idempotently rather than re-killing the snapshot, so an
+                // already-read job answers empty with its settled marker.
+                self.finish_call(super::tool_bash::job_output_outcome("", &row.status))
+            }
+            "job_kill" => {
+                let id = match parse_id(args) {
+                    Ok(id) => id,
+                    Err(outcome) => return self.finish_call(outcome),
+                };
+                let Some(row) = jobs.find(&id) else {
+                    return self.finish_call(unknown_job(&id, false));
+                };
+                if let JobStatus::Running = row.status {
+                    self.stage = Some(Stage::KillingJob { job: id });
+                    return vec![ExecutorOut::Effect(Effect::ExecKill { pid: row.pid })];
+                }
+                // The kill arrived too late; the answer names the settle it
+                // found, which is the `already-finished` render's branch.
+                self.finish_call(job_kill_outcome(&id, Some(row.status.clone())))
+            }
+            other => self.finish_call(unknown_tool(other)),
         }
     }
     fn act(
@@ -1110,7 +1404,7 @@ mod tests {
     #[test]
     fn a_read_resolves_then_reads() {
         let mut e = Executor::new(vec![call("read", json!({ "file_path": "a.txt" }))], 1, 1);
-        let outs = e.begin("/w", &fence(), &sandbox());
+        let outs = e.begin("/w", &fence(), &sandbox(), &Jobs::default());
         assert_eq!(row_types(&outs), vec!["tool/call"]);
         assert_eq!(
             effects(&outs),
@@ -1129,6 +1423,7 @@ mod tests {
                 is_dir: false,
             version: Some("v1".into()),
             }),
+        &mut Jobs::default(),
         );
         assert_eq!(
             effects(&outs),
@@ -1142,6 +1437,7 @@ mod tests {
                 path: "/w/a.txt".into(),
             },
             Ok(Answer::Text("hello\n".into())),
+        &mut Jobs::default(),
         );
         let r: Vec<Value> = rows(&outs).into_iter().map(|(_, d)| d).collect();
         assert_eq!(r.len(), 1);
@@ -1159,13 +1455,14 @@ mod tests {
     #[test]
     fn a_missing_read_names_the_path() {
         let mut e = Executor::new(vec![call("read", json!({ "file_path": "gone.txt" }))], 1, 1);
-        e.begin("/w", &fence(), &sandbox());
+        e.begin("/w", &fence(), &sandbox(), &Jobs::default());
         e.observe_row("tool/call", 1);
         let outs = e.on_effect(
             &Effect::Stat {
                 path: "/w/gone.txt".into(),
             },
             Ok(Answer::NotFound),
+        &mut Jobs::default(),
         );
         let r: Vec<Value> = rows(&outs).into_iter().map(|(_, d)| d).collect();
         assert_eq!(
@@ -1180,7 +1477,7 @@ mod tests {
     #[test]
     fn a_directory_is_not_a_regular_file() {
         let mut e = Executor::new(vec![call("read", json!({ "file_path": "d" }))], 1, 1);
-        e.begin("/w", &fence(), &sandbox());
+        e.begin("/w", &fence(), &sandbox(), &Jobs::default());
         e.observe_row("tool/call", 1);
         let outs = e.on_effect(
             &Effect::Stat {
@@ -1191,6 +1488,7 @@ mod tests {
                 is_dir: true,
             version: Some("v1".into()),
             }),
+        &mut Jobs::default(),
         );
         assert!(
             data(&outs, 0)["message"]["content"][0]["content"][0]["text"]
@@ -1212,7 +1510,7 @@ mod tests {
             1,
             1,
         );
-        let outs = e.begin("/w", &fence(), &sandbox());
+        let outs = e.begin("/w", &fence(), &sandbox(), &Jobs::default());
         assert_eq!(effects(&outs).len(), 1);
         e.observe_row("tool/call", 1);
 
@@ -1221,6 +1519,7 @@ mod tests {
                 path: "/w/new.txt".into(),
             },
             Ok(Answer::NotFound),
+        &mut Jobs::default(),
         );
         assert_eq!(
             effects(&outs),
@@ -1238,6 +1537,7 @@ mod tests {
             expect: vocoder_cordis::WriteExpect::Absent,
             },
             Ok(Answer::Done),
+        &mut Jobs::default(),
         );
         let r: Vec<Value> = rows(&outs).into_iter().map(|(_, d)| d).collect();
         assert!(
@@ -1264,7 +1564,7 @@ mod tests {
             1,
             1,
         );
-        e.begin("/w", &fence(), &sandbox());
+        e.begin("/w", &fence(), &sandbox(), &Jobs::default());
         e.observe_row("tool/call", 1);
         e.on_effect(
             &Effect::Stat {
@@ -1275,16 +1575,18 @@ mod tests {
                 is_dir: false,
                 version: Some("v1".into()),
             }),
+        &mut Jobs::default(),
         );
         e.on_effect(
             &Effect::Read {
                 path: "/w/a.txt".into(),
             },
             Ok(Answer::Text("old\r\n".into())),
+        &mut Jobs::default(),
         );
         // The write call now runs: its own stat, then the diff-read, then the
         // guarded write.
-        e.begin("/w", &fence(), &sandbox());
+        e.begin("/w", &fence(), &sandbox(), &Jobs::default());
         e.observe_row("tool/call", 2);
         let outs = e.on_effect(
             &Effect::Stat {
@@ -1295,6 +1597,7 @@ mod tests {
                 is_dir: false,
                 version: Some("v1".into()),
             }),
+        &mut Jobs::default(),
         );
         assert!(matches!(effects(&outs)[0], Effect::Read { .. }));
         let outs = e.on_effect(
@@ -1302,6 +1605,7 @@ mod tests {
                 path: "/w/a.txt".into(),
             },
             Ok(Answer::Text("old\r\n".into())),
+        &mut Jobs::default(),
         );
         assert!(matches!(effects(&outs)[0], Effect::Write { .. }));
         let outs = e.on_effect(
@@ -1311,6 +1615,7 @@ mod tests {
                 expect: vocoder_cordis::WriteExpect::Version("v1".into()),
             },
             Ok(Answer::Done),
+        &mut Jobs::default(),
         );
         let r: Vec<Value> = rows(&outs).into_iter().map(|(_, d)| d).collect();
         assert!(
@@ -1338,7 +1643,7 @@ mod tests {
             1,
             1,
         );
-        e.begin("/w", &fence(), &sandbox());
+        e.begin("/w", &fence(), &sandbox(), &Jobs::default());
         e.observe_row("tool/call", 1);
         let outs = e.on_effect(
             &Effect::Stat {
@@ -1349,6 +1654,7 @@ mod tests {
                 is_dir: false,
                 version: Some("v1".into()),
             }),
+        &mut Jobs::default(),
         );
         assert!(matches!(effects(&outs)[0], Effect::Read { .. }));
         let _outs = e.on_effect(
@@ -1356,11 +1662,12 @@ mod tests {
                 path: "/w/a.txt".into(),
             },
             Ok(Answer::Text("x y\n".into())),
+        &mut Jobs::default(),
         );
         // The read is done; the edit is still queued, and running it left the
         // `read` call's result as the executor's owed row.
         assert!(!e.finished(), "the edit must still be queued");
-        let outs = e.begin("/w", &fence(), &sandbox());
+        let outs = e.begin("/w", &fence(), &sandbox(), &Jobs::default());
         assert!(!rows(&outs).is_empty(), "the read's result row is owed");
         e.observe_row("tool/call", 2);
         let outs = e.on_effect(
@@ -1372,6 +1679,7 @@ mod tests {
                 is_dir: false,
                 version: Some("v1".into()),
             }),
+        &mut Jobs::default(),
         );
         assert!(matches!(effects(&outs)[0], Effect::Read { .. }));
 
@@ -1380,6 +1688,7 @@ mod tests {
                 path: "/w/a.txt".into(),
             },
             Ok(Answer::Text("x y\n".into())),
+        &mut Jobs::default(),
         );
         assert_eq!(
             effects(&outs),
@@ -1396,6 +1705,7 @@ mod tests {
                 expect: vocoder_cordis::WriteExpect::Version("v1".into()),
             },
             Ok(Answer::Done),
+        &mut Jobs::default(),
         );
         let r: Vec<Value> = rows(&outs).into_iter().map(|(_, d)| d).collect();
         assert_eq!(
@@ -1419,7 +1729,7 @@ mod tests {
             1,
             1,
         );
-        e.begin("/w", &fence(), &sandbox());
+        e.begin("/w", &fence(), &sandbox(), &Jobs::default());
         e.observe_row("tool/call", 1);
         let outs = e.on_effect(
             &Effect::Stat {
@@ -1430,6 +1740,7 @@ mod tests {
                 is_dir: false,
                 version: Some("v1".into()),
             }),
+        &mut Jobs::default(),
         );
         assert!(
             effects(&outs).is_empty(),
@@ -1461,7 +1772,7 @@ mod tests {
             1,
             1,
         );
-        e.begin("/w", &fence(), &sandbox());
+        e.begin("/w", &fence(), &sandbox(), &Jobs::default());
         e.observe_row("tool/call", 1);
         e.on_effect(
             &Effect::Stat {
@@ -1472,14 +1783,16 @@ mod tests {
                 is_dir: false,
                 version: Some("v1".into()),
             }),
+        &mut Jobs::default(),
         );
         e.on_effect(
             &Effect::Read {
                 path: "/w/a.txt".into(),
             },
             Ok(Answer::Text("x y\n".into())),
+        &mut Jobs::default(),
         );
-        e.begin("/w", &fence(), &sandbox());
+        e.begin("/w", &fence(), &sandbox(), &Jobs::default());
         e.observe_row("tool/call", 2);
         e.on_effect(
             &Effect::Stat {
@@ -1490,12 +1803,14 @@ mod tests {
                 is_dir: false,
                 version: Some("v1".into()),
             }),
+        &mut Jobs::default(),
         );
         let outs = e.on_effect(
             &Effect::Read {
                 path: "/w/a.txt".into(),
             },
             Ok(Answer::Text("x y\n".into())),
+        &mut Jobs::default(),
         );
         assert!(
             effects(&outs).is_empty(),
@@ -1528,7 +1843,7 @@ mod tests {
             1,
             1,
         );
-        e.begin("/w", &fence(), &sandbox());
+        e.begin("/w", &fence(), &sandbox(), &Jobs::default());
         e.observe_row("tool/call", 1);
         e.on_effect(
             &Effect::Stat {
@@ -1539,14 +1854,16 @@ mod tests {
                 is_dir: false,
                 version: Some("v1".into()),
             }),
+        &mut Jobs::default(),
         );
         e.on_effect(
             &Effect::Read {
                 path: "/w/a.txt".into(),
             },
             Ok(Answer::Text("x y\n".into())),
+        &mut Jobs::default(),
         );
-        e.begin("/w", &fence(), &sandbox());
+        e.begin("/w", &fence(), &sandbox(), &Jobs::default());
         e.observe_row("tool/call", 2);
         e.on_effect(
             &Effect::Stat {
@@ -1557,12 +1874,14 @@ mod tests {
                 is_dir: false,
                 version: Some("v1".into()),
             }),
+        &mut Jobs::default(),
         );
         let outs = e.on_effect(
             &Effect::Read {
                 path: "/w/a.txt".into(),
             },
             Ok(Answer::Text("x y\n".into())),
+        &mut Jobs::default(),
         );
         // The write was issued against v1; the answer says the world moved —
         // which is what `fs/stale-version` from the driver encodes.
@@ -1573,6 +1892,7 @@ mod tests {
             Ok(Answer::Failed(
                 "fs/stale-version: file changed since it was read\nrename /w/a.txt".into(),
             )),
+        &mut Jobs::default(),
         );
         assert!(
             data(&outs, 0)["message"]["content"][0]["content"][0]["text"]
@@ -1596,7 +1916,7 @@ mod tests {
             1,
             1,
         );
-        e.begin("/w", &fence(), &sandbox());
+        e.begin("/w", &fence(), &sandbox(), &Jobs::default());
         e.observe_row("tool/call", 1);
         let outs = e.on_effect(
             &Effect::Stat {
@@ -1607,6 +1927,7 @@ mod tests {
                 is_dir: false,
                 version: Some("v1".into()),
             }),
+        &mut Jobs::default(),
         );
         assert!(
             effects(&outs).is_empty(),
@@ -1634,7 +1955,7 @@ mod tests {
             1,
             1,
         );
-        e.begin("/w", &fence(), &sandbox());
+        e.begin("/w", &fence(), &sandbox(), &Jobs::default());
         e.observe_row("tool/call", 1);
         e.on_effect(
             &Effect::Stat {
@@ -1645,14 +1966,16 @@ mod tests {
                 is_dir: false,
                 version: Some("v1".into()),
             }),
+        &mut Jobs::default(),
         );
         e.on_effect(
             &Effect::Read {
                 path: "/w/a.txt".into(),
             },
             Ok(Answer::Text("old\n".into())),
+        &mut Jobs::default(),
         );
-        e.begin("/w", &fence(), &sandbox());
+        e.begin("/w", &fence(), &sandbox(), &Jobs::default());
         e.observe_row("tool/call", 2);
         let outs = e.on_effect(
             &Effect::Stat {
@@ -1663,6 +1986,7 @@ mod tests {
                 is_dir: false,
                 version: Some("v1".into()),
             }),
+        &mut Jobs::default(),
         );
         // The write's diff-read fires, then the write itself.
         assert!(matches!(effects(&outs)[0], Effect::Read { .. }));
@@ -1671,6 +1995,7 @@ mod tests {
                 path: "/w/a.txt".into(),
             },
             Ok(Answer::Text("old\n".into())),
+        &mut Jobs::default(),
         );
         assert_eq!(
             effects(&outs),
@@ -1694,7 +2019,7 @@ mod tests {
             1,
             1,
         );
-        e.begin("/w", &fence(), &sandbox());
+        e.begin("/w", &fence(), &sandbox(), &Jobs::default());
         e.observe_row("tool/call", 1);
         // The first read finds the file *absent* (the model already removed
         // it in the world, as `fs-delete-recreate` does through bash before
@@ -1704,14 +2029,16 @@ mod tests {
                 path: "/w/a.txt".into(),
             },
             Ok(Answer::NotFound),
+        &mut Jobs::default(),
         );
-        e.begin("/w", &fence(), &sandbox());
+        e.begin("/w", &fence(), &sandbox(), &Jobs::default());
         e.observe_row("tool/call", 2);
         let outs = e.on_effect(
             &Effect::Stat {
                 path: "/w/a.txt".into(),
             },
             Ok(Answer::NotFound),
+        &mut Jobs::default(),
         );
         assert_eq!(
             effects(&outs),
@@ -1735,7 +2062,7 @@ mod tests {
             1,
             1,
         );
-        e.begin("/w", &fence(), &sandbox());
+        e.begin("/w", &fence(), &sandbox(), &Jobs::default());
         e.observe_row("tool/call", 1);
         let outs = e.on_effect(
             &Effect::Stat {
@@ -1746,6 +2073,7 @@ mod tests {
                 is_dir: false,
             version: Some("v1".into()),
             }),
+        &mut Jobs::default(),
         );
         assert!(effects(&outs).is_empty(), "a denied write must not run");
         let text = data(&outs, 0)["message"]["content"][0]["content"][0]["text"]
@@ -1768,7 +2096,7 @@ mod tests {
     #[test]
     fn an_unknown_tool_is_a_result_not_a_turn_failure() {
         let mut e = Executor::new(vec![call("subagent", json!({ "command": "ls" }))], 1, 1);
-        let outs = e.begin("/w", &fence(), &sandbox());
+        let outs = e.begin("/w", &fence(), &sandbox(), &Jobs::default());
         assert_eq!(row_types(&outs), vec!["tool/call", "tool/result"]);
         assert!(effects(&outs).is_empty());
         assert_eq!(
@@ -1792,7 +2120,7 @@ mod tests {
             1,
             1,
         );
-        let outs = e.begin("/w", &fence(), &sandbox());
+        let outs = e.begin("/w", &fence(), &sandbox(), &Jobs::default());
         assert!(
             !outs
                 .iter()
@@ -1819,7 +2147,7 @@ mod tests {
             1,
             1,
         );
-        let outs = e.begin("/w", &ro, &sandbox());
+        let outs = e.begin("/w", &ro, &sandbox(), &Jobs::default());
         assert_eq!(row_types(&outs), vec!["tool/call"]);
         let dispatch = outs
             .iter()
@@ -1841,6 +2169,7 @@ mod tests {
             &json!({ "outcome": "allowed-once", "approvalId": "approval-1" }),
             "/w",
             &sandbox(),
+            &Jobs::default(),
         );
         assert_eq!(
             row_types(&outs),
@@ -1873,11 +2202,12 @@ mod tests {
             1,
             1,
         );
-        e.begin("/w", &ro, &sandbox());
+        e.begin("/w", &ro, &sandbox(), &Jobs::default());
         let outs = e.on_verdict(
             &json!({ "outcome": "rejected", "approvalId": "approval-7" }),
             "/w",
             &sandbox(),
+            &Jobs::default(),
         );
         assert_eq!(
             row_types(&outs),
@@ -1914,7 +2244,7 @@ mod tests {
             1,
             1,
         );
-        e.begin("/w", &ro, &sandbox());
+        e.begin("/w", &ro, &sandbox(), &Jobs::default());
         let outs = e.on_verdict(
             &json!({
                 "outcome": "unavailable",
@@ -1923,6 +2253,7 @@ mod tests {
             }),
             "/w",
             &sandbox(),
+            &Jobs::default(),
         );
         assert!(effects(&outs).is_empty(), "a denied call must not run");
         assert_eq!(
@@ -1961,8 +2292,13 @@ mod tests {
             1,
             1,
         );
-        e.begin("/w", &ro, &sandbox());
-        let outs = e.on_verdict(&json!({ "outcome": "unavailable" }), "/w", &sandbox());
+        e.begin("/w", &ro, &sandbox(), &Jobs::default());
+        let outs = e.on_verdict(
+            &json!({ "outcome": "unavailable" }),
+            "/w",
+            &sandbox(),
+            &Jobs::default(),
+        );
         assert_eq!(row_types(&outs), vec!["tool/result"]);
     }
 
@@ -1978,7 +2314,7 @@ mod tests {
             1,
             1,
         );
-        let outs = e.begin("/w", &fence(), &sandbox());
+        let outs = e.begin("/w", &fence(), &sandbox(), &Jobs::default());
         assert_eq!(row_types(&outs), vec!["tool/call", "tool/result"]);
         assert!(
             !outs
@@ -2005,7 +2341,7 @@ mod tests {
             1,
             1,
         );
-        let outs = e.begin("/w", &fence(), &sandbox());
+        let outs = e.begin("/w", &fence(), &sandbox(), &Jobs::default());
         e.observe_row("tool/call", 1);
         assert_eq!(
             effects(&outs)[0],
@@ -2023,19 +2359,21 @@ mod tests {
                 is_dir: false,
             version: Some("v1".into()),
             }),
+        &mut Jobs::default(),
         );
         let outs = e.on_effect(
             &Effect::Read {
                 path: "/w/a.txt".into(),
             },
             Ok(Answer::Text("a\n".into())),
+        &mut Jobs::default(),
         );
         assert!(!e.finished(), "the second call is still queued");
         // The next call does not begin until the agent asks for it, which is
         // what keeps a call's rows contiguous.
         assert!(effects(&outs).is_empty());
 
-        let outs = e.begin("/w", &fence(), &sandbox());
+        let outs = e.begin("/w", &fence(), &sandbox(), &Jobs::default());
         assert_eq!(row_types(&outs), vec!["tool/call"]);
         assert_eq!(
             effects(&outs)[0],
@@ -2076,7 +2414,7 @@ mod tests {
             1,
             1,
         );
-        let outs = e.begin("/w", &fence(), &confining());
+        let outs = e.begin("/w", &fence(), &confining(), &Jobs::default());
         assert_eq!(row_types(&outs), vec!["tool/call"]);
         let Effect::Exec {
             confined,
@@ -2115,7 +2453,7 @@ mod tests {
             1,
             1,
         );
-        let outs = e.begin("/w", &fence(), &confining());
+        let outs = e.begin("/w", &fence(), &confining(), &Jobs::default());
         let effect = effects(&outs)[0].clone();
         let outs = e.on_effect(
             &effect,
@@ -2129,6 +2467,7 @@ mod tests {
                 aborted: false,
                 spill_path: None,
             }),
+        &mut Jobs::default(),
         );
         assert_eq!(row_types(&outs), vec!["tool/result"]);
         let text = text_of(&outs, 0);
@@ -2148,7 +2487,7 @@ mod tests {
             1,
             1,
         );
-        let outs = e.begin("/w", &fence(), &confining());
+        let outs = e.begin("/w", &fence(), &confining(), &Jobs::default());
         let effect = effects(&outs)[0].clone();
         let outs = e.on_effect(
             &effect,
@@ -2162,6 +2501,7 @@ mod tests {
                 aborted: false,
                 spill_path: None,
             }),
+        &mut Jobs::default(),
         );
         let text = text_of(&outs, 0);
         assert!(
@@ -2185,7 +2525,7 @@ mod tests {
             1,
             1,
         );
-        let outs = e.begin("/w", &fence(), &confining());
+        let outs = e.begin("/w", &fence(), &confining(), &Jobs::default());
         let effect = effects(&outs)[0].clone();
         let outs = e.on_effect(
             &effect,
@@ -2199,6 +2539,7 @@ mod tests {
                 aborted: false,
                 spill_path: None,
             }),
+        &mut Jobs::default(),
         );
         let text = text_of(&outs, 0);
         assert!(text.contains("no sandbox backend is usable"), "{text}");
@@ -2217,7 +2558,7 @@ mod tests {
             1,
             1,
         );
-        let outs = e.begin("/w", &fence(), &sandbox()); // fail-closed default
+        let outs = e.begin("/w", &fence(), &sandbox(), &Jobs::default()); // fail-closed default
         assert_eq!(row_types(&outs), vec!["tool/call", "tool/result"]);
         assert!(effects(&outs).is_empty(), "no command runs unconfined");
         let text = text_of(&outs, 1);
@@ -2236,7 +2577,7 @@ mod tests {
             1,
         );
         let ro = Fence::new(Mode::DangerFullAccess, "/w");
-        let outs = e.begin("/w", &ro, &sandbox());
+        let outs = e.begin("/w", &ro, &sandbox(), &Jobs::default());
         let Effect::Exec { confined, .. } = &effects(&outs)[0] else {
             panic!("expected an exec effect");
         };
@@ -2248,9 +2589,312 @@ mod tests {
     fn a_malformed_command_is_refused() {
         let mut e = Executor::new(vec![bash_call(json!({ "command": "ls" }))], 1, 1);
         // Missing `description`.
-        let outs = e.begin("/w", &fence(), &confining());
+        let outs = e.begin("/w", &fence(), &confining(), &Jobs::default());
         assert!(effects(&outs).is_empty());
         let text = text_of(&outs, 1);
         assert!(text.contains("invalid description"), "{text}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Background jobs: the `run_in_background` arm and the three `job_*`
+    // controls, driven purely — the executor names the effects and updates the
+    // table; the driver's own tests cover the real spawn.
+    // -----------------------------------------------------------------------
+
+    /// A background call mints the job on the start's answer and closes
+    /// immediately — never blocking the step.
+    #[test]
+    fn a_background_call_detaches_and_reports_the_id() {
+        let mut e = Executor::new(
+            vec![bash_call(
+                json!({ "command": "sleep 10", "description": "Sleep ten seconds", "run_in_background": true }),
+            )],
+            1,
+            1,
+        );
+        let mut jobs = Jobs::default();
+        let outs = e.begin("/w", &fence(), &confining(), &jobs);
+        assert_eq!(row_types(&outs), vec!["tool/call"]);
+        // One effect, the detached one — the blocked executor never starts.
+        let Effect::ExecDetached { confined, .. } = &effects(&outs)[0] else {
+            panic!("expected a detached exec, got {:?}", effects(&outs));
+        };
+        assert_eq!(confined.argv[0], "bwrap");
+        assert!(!e.finished(), "the call is still out, waiting only on the pid");
+
+        let outs = e.on_effect(
+            &effects::last_detached(&outs),
+            Ok(Answer::ProcessStarted { pid: 4242 }),
+            &mut jobs,
+        );
+        assert_eq!(row_types(&outs), vec!["tool/result"]);
+        // Upstream's `render` over `{kind: 'background'}`, verbatim.
+        assert_eq!(text_of(&outs, 0), "started background job bash-1");
+        // The table recorded the pid against the label the model passed.
+        let listed = jobs.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].0, "bash-1");
+        assert_eq!(listed[0].2, "Sleep ten seconds");
+        assert!(e.finished());
+    }
+
+    /// A `job_output` on a running job drains the delta and reports the
+    /// `[status: running]` marker upstream's `statusLine` renders.
+    #[test]
+    fn a_job_output_reports_running_then_completed() {
+        let mut jobs = Jobs::default();
+        jobs.record(4242, "Sleep ten seconds".into());
+        let mut e = Executor::new(
+            vec![call("job_output", json!({ "job_id": "bash-1" }))],
+            1,
+            1,
+        );
+        let outs = e.begin("/w", &fence(), &sandbox(), &jobs);
+        let Effect::ExecRead { pid } = &effects(&outs)[0] else {
+            panic!("expected a read effect, got {:?}", effects(&outs));
+        };
+        assert_eq!(*pid, 4242);
+
+        let outs = e.on_effect(
+            &Effect::ExecRead { pid: 4242 },
+            Ok(Answer::ProcessChunk {
+                running: true,
+                stdout_delta: "one\n".into(),
+                stderr_delta: String::new(),
+                exit_code: None,
+                signal: None,
+                aborted: false,
+            }),
+            &mut jobs,
+        );
+        let text = text_of(&outs, 0);
+        assert_eq!(text, "one\n[status: running]");
+
+        // The settle arrives on a later read: `completed` with the exit code
+        // as detail, which is `processOutcome`'s own spelling.
+        let mut e = Executor::new(
+            vec![call("job_output", json!({ "job_id": "bash-1" }))],
+            1,
+            2,
+        );
+        let outs = e.begin("/w", &fence(), &sandbox(), &jobs);
+        let outs = e.on_effect(
+            &effects(&outs)[0],
+            Ok(Answer::ProcessChunk {
+                running: false,
+                stdout_delta: "two\n".into(),
+                stderr_delta: String::new(),
+                exit_code: Some(0),
+                signal: None,
+                aborted: false,
+            }),
+            &mut jobs,
+        );
+        let text = text_of(&outs, 0);
+        assert_eq!(text, "two\n[status: completed, exit code: 0]");
+        // The observed settle sticks: a third read is idempotent, on the
+        // table rather than the driver.
+        let mut e = Executor::new(
+            vec![call("job_output", json!({ "job_id": "bash-1" }))],
+            1,
+            3,
+        );
+        let outs = e.begin("/w", &fence(), &sandbox(), &jobs);
+        assert!(effects(&outs).is_empty(), "a settled job answers from the table");
+        assert_eq!(text_of(&outs, 1), "(no new output)\n[status: completed, exit code: 0]");
+    }
+
+    /// A `job_output`'s `[stderr]` section joins the delta the way bash's own
+    /// body does, and a signal death reports `killed` with its signal.
+    #[test]
+    fn a_job_output_reports_a_kill_with_its_signal() {
+        let mut jobs = Jobs::default();
+        jobs.record(4242, "run server".into());
+        let mut e = Executor::new(
+            vec![call("job_output", json!({ "job_id": "bash-1" }))],
+            1,
+            1,
+        );
+        let outs = e.begin("/w", &fence(), &sandbox(), &jobs);
+        let outs = e.on_effect(
+            &effects(&outs)[0],
+            Ok(Answer::ProcessChunk {
+                running: false,
+                stdout_delta: "ready\n".into(),
+                stderr_delta: "killed\n".into(),
+                exit_code: None,
+                signal: Some(15),
+                aborted: true,
+            }),
+            &mut jobs,
+        );
+        let text = text_of(&outs, 0);
+        assert_eq!(
+            text,
+            "ready\n[stderr]\nkilled\n[status: killed, signal: SIGTERM]"
+        );
+    }
+
+    /// `job_kill` asks for the kill and answers *requested*, never *done* —
+    /// the job still has to settle, which a later `job_output` observes.
+    #[test]
+    fn a_job_kill_requests_cancellation() {
+        let mut jobs = Jobs::default();
+        jobs.record(4242, "run server".into());
+        let mut e = Executor::new(
+            vec![call("job_kill", json!({ "job_id": "bash-1" }))],
+            1,
+            1,
+        );
+        let outs = e.begin("/w", &fence(), &sandbox(), &jobs);
+        let Effect::ExecKill { pid } = &effects(&outs)[0] else {
+            panic!("expected a kill effect, got {:?}", effects(&outs));
+        };
+        assert_eq!(*pid, 4242);
+        let outs = e.on_effect(
+            &Effect::ExecKill { pid: 4242 },
+            Ok(Answer::Done),
+            &mut jobs,
+        );
+        assert_eq!(text_of(&outs, 0), "requested cancellation of job bash-1");
+    }
+
+    /// A kill reaching an already-settled job names the settle it found.
+    #[test]
+    fn a_kill_of_a_settled_job_reports_already_finished() {
+        let mut jobs = Jobs::default();
+        jobs.record(4242, "run server".into());
+        jobs.settle(
+            "bash-1",
+            super::super::tool_bash::JobStatus::Completed { exit_code: Some(0) },
+        );
+        let mut e = Executor::new(
+            vec![call("job_kill", json!({ "job_id": "bash-1" }))],
+            1,
+            1,
+        );
+        let outs = e.begin("/w", &fence(), &sandbox(), &jobs);
+        assert!(effects(&outs).is_empty(), "no effect: the job is already over");
+        assert_eq!(
+            text_of(&outs, 1),
+            "job bash-1 had already finished [status: completed, exit code: 0]"
+        );
+    }
+
+    /// An unknown id is refused with the registry's own wording, on every
+    /// control — and never issues an effect.
+    #[test]
+    fn an_unknown_job_is_refused_by_name() {
+        let jobs = Jobs::default();
+        for (tool, args) in [
+            ("job_output", json!({ "job_id": "bash-99" })),
+            ("job_kill", json!({ "job_id": "bash-99" })),
+        ] {
+            let mut e = Executor::new(vec![call(tool, args)], 1, 1);
+            let outs = e.begin("/w", &fence(), &sandbox(), &jobs);
+            assert!(
+                effects(&outs).is_empty(),
+                "{tool}: an unknown id must not reach the driver"
+            );
+            assert_eq!(text_of(&outs, 1), "Error: unknown job bash-99");
+        }
+        let mut e = Executor::new(vec![call("job_output", json!({}))], 1, 1);
+        let outs = e.begin("/w", &fence(), &sandbox(), &jobs);
+        assert!(
+            text_of(&outs, 1).contains("invalid job_id"),
+            "{}",
+            text_of(&outs, 1)
+        );
+    }
+
+    /// `job_list` renders registration order, and the empty table's own line.
+    #[test]
+    fn a_job_list_reports_every_job_in_order() {
+        let jobs = Jobs::default();
+        let mut e = Executor::new(vec![call("job_list", json!({}))], 1, 1);
+        let outs = e.begin("/w", &fence(), &sandbox(), &jobs);
+        assert!(effects(&outs).is_empty());
+        assert_eq!(text_of(&outs, 1), "(no background jobs)");
+
+        let mut jobs = Jobs::default();
+        jobs.record(1, "sleep one".into());
+        jobs.settle(
+            "bash-1",
+            super::super::tool_bash::JobStatus::Killed { signal: Some(15) },
+        );
+        jobs.record(2, "sleep two".into());
+        let mut e = Executor::new(vec![call("job_list", json!({}))], 1, 1);
+        let outs = e.begin("/w", &fence(), &sandbox(), &jobs);
+        assert_eq!(
+            text_of(&outs, 1),
+            "bash-1 [bash] killed — sleep one\nbash-2 [bash] running — sleep two"
+        );
+    }
+
+    /// The catalog's absence check for the tool surface this module reduced:
+    /// `wait: true` parses and still answers from a read rather than blocking.
+    #[test]
+    fn a_wait_read_is_the_reduction_answering_immediately() {
+        let mut jobs = Jobs::default();
+        jobs.record(4242, "sleep".into());
+        let mut e = Executor::new(
+            vec![call(
+                "job_output",
+                json!({ "job_id": "bash-1", "wait": true, "timeout_ms": 5000 }),
+            )],
+            1,
+            1,
+        );
+        let outs = e.begin("/w", &fence(), &sandbox(), &jobs);
+        // One non-blocking read, rather than a suspend the pump cannot serve.
+        assert!(matches!(effects(&outs)[0], Effect::ExecRead { pid: 4242 }));
+    }
+
+    /// The foreground path is untouched by the background arm: a plain call
+    /// still issues the blocking exec and renders as it always has.
+    #[test]
+    fn a_foreground_call_is_unchanged() {
+        let mut e = Executor::new(
+            vec![bash_call(json!({ "command": "echo hi", "description": "Say hi" }))],
+            1,
+            1,
+        );
+        let mut jobs = Jobs::default();
+        let outs = e.begin("/w", &fence(), &confining(), &jobs);
+        assert!(matches!(effects(&outs)[0], Effect::Exec { .. }));
+        let outs = e.on_effect(
+            &effects(&outs)[0],
+            Ok(Answer::Process {
+                exit_code: Some(0),
+                signal: None,
+                stdout: "hi\n".into(),
+                stderr: String::new(),
+                truncated: false,
+                timed_out: false,
+                aborted: false,
+                spill_path: None,
+            }),
+            &mut jobs,
+        );
+        assert_eq!(text_of(&outs, 0), "hi\n");
+        assert!(jobs.list().is_empty(), "no job minted for a foreground call");
+    }
+}
+
+/// Small helpers the job tests share; kept out of the executor's own path so
+/// the tests read as sequences of calls rather than plumbing.
+#[cfg(test)]
+mod effects {
+    use super::*;
+
+    /// The last (and only) detached effect a batch of outs asked for.
+    pub fn last_detached(outs: &[ExecutorOut]) -> Effect {
+        outs.iter()
+            .filter_map(|o| match o {
+                ExecutorOut::Effect(e) => Some(e.clone()),
+                _ => None,
+            })
+            .last()
+            .expect("an effect")
     }
 }

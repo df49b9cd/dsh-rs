@@ -92,6 +92,24 @@ for suite in "${SUITES[@]}"; do
         (cd "$ROOT/rust" && cargo test -p vocoder-session) \
             || { echo "session-replay: rust/crates/vocoder-session/tests/interop.rs failed"; status=1; }
         ;;
+    composition-replay)
+        # The candidate half is the Rust in-process runner; the control half
+        # replays the same traces over the live wire (unary over HTTP, streams
+        # over WS) and the two reports are diffed — the measure the
+        # axis exists to take. Both run against the running host; the trace's
+        # expectations are the shared assertion (not a parade of codes each
+        # host happens to give).
+        if [ "$HOST" = vocoderd ]; then
+            (cd "$ROOT/rust" && cargo test -p vocoderd --bin vocoderd composition) \
+                || status=1
+        fi
+        for t in session workspace; do
+            (cd "$ROOT/conformance/e2e-replay" && node ../composition-replay/replay-against-host.mjs \
+                "$ROOT/conformance/composition-replay/trace/$t.jsonl") \
+                | tee "$CONFORMANCE_HOME/composition-$t.jsonl" \
+                || status=1
+        done
+        ;;
     interop)
         # Only meaningful for the Rust host: drive a few writes, then let
         # the JS session stack read the produced home back.

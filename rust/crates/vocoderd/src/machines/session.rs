@@ -2189,7 +2189,11 @@ mod tests {
         let text = std::fs::read_to_string(&trace_path)
             .expect("session trace committed under conformance/composition-replay/trace/");
         let (_dir, mut m, _registry) = machine();
+        let wd = tempfile::tempdir().unwrap();
         let mut vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        vars.insert("CWD".into(), wd.path().display().to_string());
+        vars.insert("SID".into(), "comp-rust".into());
+        vars.insert("R2".into(), "r2-rust".into());
         let steps = crate::composition::replay_trace(&mut m, &text, &mut vars);
         assert!(steps >= 5, "trace too thin: {steps} steps");
     }
