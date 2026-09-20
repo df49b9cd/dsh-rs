@@ -111,3 +111,80 @@ impl WorkspaceRegistryStore {
         })
     }
 }
+
+/// One staged file upload, as `fileUploads/upload` mints it and `session/prompt`
+/// resolves it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedFile {
+    /// The stored object's `sha256:<hex>` identity.
+    pub attachment_id: String,
+    /// The sanitized display name, which is also the stored alias's leaf name.
+    pub name: String,
+    /// The exact decoded byte length.
+    pub bytes: u64,
+}
+
+/// Staged file-upload receipts, shared between the `fileUploads` machine that
+/// mints them and the `session` machine that resolves them at prompt admission.
+///
+/// Upstream (`dsh/packages/client/file-upload/src/index.ts`) keeps these in a
+/// `WeakMap<Session, Map<receiptId, StagedFileUpload>>` owned by the
+/// `fileUploads` service, and the session controller resolves them through
+/// `ctx.fileUploads.resolve(agent, receiptId)` (`api/session-controller/src/
+/// commands.ts:351`). Both are runtime state and never persisted: the receipt
+/// names bytes that are already durable under `attachments/v1`, and the receipt
+/// itself is authority scoped to one live session — which is why the store is
+/// keyed by session id and a foreign session's receipt is simply absent rather
+/// than an error.
+///
+/// The two machines reach for the same store because the router cannot make one
+/// machine synchronously call another's method; this is the registration-time
+/// injection the module doc describes.
+#[derive(Default)]
+pub struct StagedUploadsStore {
+    /// session id → receipt id → staged file.
+    inner: Mutex<BTreeMap<String, BTreeMap<String, StagedFile>>>,
+}
+
+impl StagedUploadsStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one completed upload under its receipt.
+    pub fn stage(&self, session: &str, receipt: &str, file: StagedFile) {
+        self.inner
+            .lock()
+            .entry(session.to_string())
+            .or_default()
+            .insert(receipt.to_string(), file);
+    }
+
+    /// The file behind a receipt, or `None` for an unknown or foreign one.
+    ///
+    /// A miss is the same answer for both, matching upstream: the staged map is
+    /// per-session, so a receipt staged for another session is indistinguishable
+    /// from one that never existed — and the caller answers both with
+    /// `FILE_NOT_STAGED`.
+    pub fn resolve(&self, session: &str, receipt: &str) -> Option<StagedFile> {
+        self.inner.lock().get(session)?.get(receipt).cloned()
+    }
+
+    /// Spend every receipt named by one accepted prompt.
+    ///
+    /// Upstream reaches this in two steps — `bindPrompt` stamps each receipt
+    /// with the request id and a later `session:event` observation retires
+    /// them — but the observable contract is the one step: a receipt is usable
+    /// by exactly one accepted prompt. Measured on the control: the first prompt
+    /// citing a receipt is accepted and a second citing it is
+    /// `session/attachment-invalid` / `FILE_NOT_STAGED`.
+    pub fn spend(&self, session: &str, receipts: &[String]) {
+        let mut guard = self.inner.lock();
+        let Some(staged) = guard.get_mut(session) else {
+            return;
+        };
+        for receipt in receipts {
+            staged.remove(receipt);
+        }
+    }
+}

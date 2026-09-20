@@ -285,6 +285,13 @@ async fn main() -> Result<()> {
 
     let sessions_root = args.home.join("sessions");
     let workspace_registry = crate::registry::WorkspaceRegistryStore::open(&args.home);
+    // Staged upload receipts are runtime state shared between the `fileUploads`
+    // machine that mints them and the `session` machine that resolves them at
+    // prompt admission. Upstream keeps the equivalent map on the `fileUploads`
+    // service and has the session controller reach it through
+    // `ctx.fileUploads.resolve`; the router here cannot make one machine call
+    // another, so both mount with a handle to the same store.
+    let staged_uploads = std::sync::Arc::new(crate::registry::StagedUploadsStore::new());
 
     let mut initial_router = Router::new();
     // Business machines mounted at boot (M3+: from profile composition).
@@ -294,10 +301,15 @@ async fn main() -> Result<()> {
     });
     initial_router.handle(RouteIn::Mount {
         id: MachineId::new("session"),
-        machine: Box::new(crate::machines::session::SessionMachine::new(
-            sessions_root.clone(),
-            workspace_registry.clone(),
-        )),
+        machine: Box::new(
+            crate::machines::session::SessionMachine::new(
+                sessions_root.clone(),
+                workspace_registry.clone(),
+            )
+            // Prompt admission resolves a staged upload receipt through the same
+            // store the `fileUploads` machine stages into.
+            .with_staged_uploads(staged_uploads.clone()),
+        ),
     });
     initial_router.handle(RouteIn::Mount {
         id: MachineId::new("workspace"),
@@ -360,6 +372,14 @@ async fn main() -> Result<()> {
         machine: Box::new(
             crate::machines::file_references::FileReferencesMachine::new(sessions_root.clone()),
         ),
+    });
+    initial_router.handle(RouteIn::Mount {
+        id: MachineId::new("fileUploads"),
+        machine: Box::new(crate::machines::file_uploads::FileUploadsMachine::new(
+            args.home.clone(),
+            sessions_root.clone(),
+            staged_uploads.clone(),
+        )),
     });
     initial_router.handle(RouteIn::Mount {
         id: MachineId::new("agentPresets"),
@@ -446,6 +466,7 @@ async fn main() -> Result<()> {
     registry_owner_register(&mut registry, "credentials", "credentials");
     registry_owner_register(&mut registry, "skills", "skills");
     registry_owner_register(&mut registry, "fileReferences", "fileReferences");
+    registry_owner_register(&mut registry, "fileUploads", "fileUploads");
     registry_owner_register(&mut registry, "commands", "commands");
     registry_owner_register(&mut registry, "agentPresets", "agentPresets");
     registry_owner_register(&mut registry, "messageFeedback", "messageFeedback");

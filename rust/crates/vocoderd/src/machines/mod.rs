@@ -16,6 +16,7 @@ pub mod directory_picker;
 pub mod dynamic_cordis_runner;
 pub mod events;
 pub mod file_references;
+pub mod file_uploads;
 pub mod goals;
 pub mod llm;
 pub mod llm_replay;

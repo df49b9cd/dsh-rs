@@ -424,6 +424,77 @@ async fn session_prompt_requires_content_cell() {
     assert_eq!(error_code(&p), "gateway/bad-request");
 }
 
+/// A **nested** missing required field is refused at the boundary and reported
+/// as the **outer** arg — the class the recorded divergence used to cover.
+///
+/// `session/page`'s `request` requires `childSessionId`, `session/updateQueue`'s
+/// requires `kind`, and `session/prompt`'s requires `content`. When the inner
+/// object omits one, the control answers `gateway/input-invalid` with
+/// `details.field` naming `request`, not the inner name — a *boundary* refusal
+/// rather than the domain logic seeing a half-formed request. (A present-but-
+/// empty `content: []` is a *different* answer, `gateway/bad-request`, asserted
+/// above; that is a `min(1)` the extracted schema does not carry.)
+///
+/// This cell exists because the class drifted unnoticed once: the candidate
+/// answered `gateway/bad-request` for a missing nested required while the
+/// control answered `input-invalid`, and nothing failed. The validator now
+/// descends into object members and array items, so both hosts name the outer
+/// arg; this pins that.
+#[tokio::test]
+async fn a_nested_missing_required_field_is_input_invalid_cell() {
+    // Each case is `args` whose single arg `request` omits one required member.
+    for (method, args) in [
+        (
+            "session/page",
+            json!({"request": {"sessionId": "cell-s"}}),
+        ),
+        (
+            "session/updateQueue",
+            json!({"request": {"sessionId": "cell-s"}}),
+        ),
+        (
+            "session/prompt",
+            json!({"request": {"sessionId": "cell-s", "requestId": "r", "mode": "queue"}}),
+        ),
+    ] {
+        let r = rpc(method, args).await;
+        assert_eq!(
+            error_code(&r), "gateway/input-invalid",
+            "{method}: missing nested required → {r}"
+        );
+        assert_eq!(
+            r["result"]["error"]["details"]["field"], "request",
+            "{method}: the outer arg is what is named → {r}"
+        );
+    }
+}
+
+/// The converse, pinned so the descent cannot overreach: an **unexpected nested
+/// key** still reaches domain logic. The control tolerates a key below the top
+/// level of `args`, so a stricter candidate would diverge; the proof is that the
+/// answer is a *domain* code, not a `gateway/*` one.
+#[tokio::test]
+async fn a_nested_extra_key_is_not_a_boundary_failure_cell() {
+    let r = rpc(
+        "subagents/prompt",
+        json!({"request": {
+            "requestId": "r",
+            "parentSessionId": "cell-p",
+            "childSessionId": "cell-c",
+            "mode": "continuable",
+            "delivery": "queue",
+            "content": [{"type": "text", "text": "hi"}],
+            "smuggled": true,
+        }}),
+    )
+    .await;
+    let code = error_code(&r);
+    assert!(
+        !code.starts_with("gateway/"),
+        "a nested extra key is domain logic's, not the boundary's: {r}"
+    );
+}
+
 #[tokio::test]
 async fn session_model_catalog_shape_cell() {
     let r = rpc("session/modelCatalog", json!({})).await;
@@ -671,4 +742,125 @@ async fn malformed_envelope_is_refused_cleanly_cell() {
             assert!(!body.is_empty(), "the refusal carries a reason");
         }
     }
+}
+
+// ------------------------------------------------------- fileUploads/upload
+
+/// `fileUploads/upload` stages a content-addressed file and answers a receipt.
+///
+/// Three facts this cell pins, each measured on the control first:
+///
+/// 1. **The digest is the sha256 of the exact decoded bytes**, not the base64
+///    text — so a client can de-duplicate and a model can verify.
+/// 2. **A non-canonical payload is refused** with `session/attachment-invalid`
+///    and `details.reason = "INVALID_FILE_BASE64"`, and the checks run *after*
+///    the session resolves: an unknown session with invalid base64 answers
+///    `session/not-found` instead.
+/// 3. **`{type: 'file', receiptId}` in `session/prompt` resolves** to the
+///    durable reference the receipt names, which is what makes the receipt
+///    useful rather than decorative.
+#[tokio::test]
+async fn file_upload_round_trip_cell() {
+    let sid = session_for_agent().await;
+    let sid = sid.as_str().expect("sessionId");
+
+    // "hello world" → sha256 b94d27b9…cde9, the digest both hosts return.
+    let up = rpc(
+        "fileUploads/upload",
+        json!({"agentId": sid, "request": {"data": "aGVsbG8gd29ybGQ=", "name": "poem.txt"}}),
+    )
+    .await;
+    assert_eq!(up["result"]["ok"], true, "{up}");
+    let v = value(&up);
+    assert_eq!(
+        v["file"]["attachmentId"],
+        "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+        "{v}"
+    );
+    assert_eq!(v["file"]["name"], "poem.txt", "{v}");
+    assert_eq!(v["file"]["bytes"], 11, "{v}");
+    let receipt = v["receiptId"].as_str().expect("receiptId");
+    assert!(!receipt.is_empty(), "{v}");
+
+    // A non-canonical payload is refused, with the control's exact reason.
+    let bad = rpc(
+        "fileUploads/upload",
+        json!({"agentId": sid, "request": {"data": "aGVsbG8"}}),
+    )
+    .await;
+    assert_eq!(error_code(&bad), "session/attachment-invalid", "{bad}");
+    assert_eq!(
+        bad["result"]["error"]["details"]["reason"], "INVALID_FILE_BASE64",
+        "{bad}"
+    );
+
+    // An unknown session resolves first, so an invalid payload still answers
+    // `session/not-found` rather than the base64 refusal.
+    let gone = rpc(
+        "fileUploads/upload",
+        json!({"agentId": "session-does-not-exist", "request": {"data": "aGVsbG8"}}),
+    )
+    .await;
+    assert_eq!(error_code(&gone), "session/not-found", "{gone}");
+
+    // The receipt resolves at prompt admission into the durable reference.
+    let prompt = rpc(
+        "session/prompt",
+        json!({"request": {
+            "sessionId": sid,
+            "requestId": "upload-cell-1",
+            "mode": "queue",
+            "content": [
+                {"type": "file", "receiptId": receipt},
+                {"type": "text", "text": "read it"},
+            ],
+        }}),
+    )
+    .await;
+    assert_eq!(prompt["result"]["ok"], true, "{prompt}");
+
+    // A receipt nothing staged is the control's `FILE_NOT_STAGED` wording.
+    let unstaged = rpc(
+        "session/prompt",
+        json!({"request": {
+            "sessionId": sid,
+            "requestId": "upload-cell-2",
+            "mode": "queue",
+            "content": [{"type": "file", "receiptId": "not-a-receipt"}],
+        }}),
+    )
+    .await;
+    assert_eq!(error_code(&unstaged), "session/attachment-invalid", "{unstaged}");
+    assert_eq!(
+        unstaged["result"]["error"]["details"]["reason"], "FILE_NOT_STAGED",
+        "{unstaged}"
+    );
+}
+
+/// The upload's argument shape is enforced at the boundary, not inside the
+/// machine: an unexpected top-level arg and a missing `agentId` are both
+/// `gateway/arguments-invalid`, while a wrong-typed `request` is
+/// `gateway/input-invalid` naming the field.
+#[tokio::test]
+async fn file_upload_arg_shape_cell() {
+    let sid = session_for_agent().await;
+    let sid = sid.as_str().expect("sessionId");
+
+    let missing = rpc("fileUploads/upload", json!({"request": {"data": "YQ=="}})).await;
+    assert_eq!(error_code(&missing), "gateway/arguments-invalid", "{missing}");
+
+    let extra = rpc(
+        "fileUploads/upload",
+        json!({"agentId": sid, "request": {"data": "YQ=="}, "zz": 1}),
+    )
+    .await;
+    assert_eq!(error_code(&extra), "gateway/arguments-invalid", "{extra}");
+
+    let wrong = rpc(
+        "fileUploads/upload",
+        json!({"agentId": sid, "request": "not-an-object"}),
+    )
+    .await;
+    assert_eq!(error_code(&wrong), "gateway/input-invalid", "{wrong}");
+    assert_eq!(wrong["result"]["error"]["details"]["field"], "request", "{wrong}");
 }

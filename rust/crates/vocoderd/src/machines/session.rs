@@ -300,6 +300,16 @@ pub struct SessionMachine {
     state: BTreeMap<String, SessionState>,
     /// Shared workspace registry for workspaceId → path resolution.
     workspaces: std::sync::Arc<crate::registry::WorkspaceRegistryStore>,
+    /// Staged file-upload receipts, resolved at prompt admission.
+    ///
+    /// Upstream's session controller resolves a `{type: 'file', receiptId}`
+    /// content part through `ctx.fileUploads.resolve(agent, receiptId)` before
+    /// the message is built (`api/session-controller/src/commands.ts:351`), and
+    /// the model receives the durable reference the receipt names. The store is
+    /// owned by the `fileUploads` machine; this is a handle to it, injected at
+    /// mount. Absent by default so a machine driven without one refuses a file
+    /// part as unstaged rather than storing an unresolvable one.
+    staged_uploads: Option<std::sync::Arc<crate::registry::StagedUploadsStore>>,
     /// Live `session/follow` streams: streamId → the followed session id.
     follow_streams: BTreeMap<String, String>,
     /// Follow streams that asked for assistant-stream frames, by stream id.
@@ -338,6 +348,7 @@ impl SessionMachine {
             store: SessionStore::new(root),
             state: BTreeMap::new(),
             workspaces,
+            staged_uploads: None,
             follow_streams: BTreeMap::new(),
             assistant_followers: BTreeMap::new(),
             streams: BTreeMap::new(),
@@ -346,6 +357,22 @@ impl SessionMachine {
             pending: None,
             effects: 0,
         }
+    }
+
+    /// Hand this machine the shared staged-upload receipts it resolves at
+    /// prompt admission.
+    ///
+    /// The store is the `fileUploads` machine's; the session machine only reads
+    /// it, which is why this is a separate seam rather than a constructor
+    /// argument — a machine built without one (every unit test) still starts,
+    /// and a file part then answers `FILE_NOT_STAGED`, which is exactly the
+    /// answer for a receipt nothing staged.
+    pub fn with_staged_uploads(
+        mut self,
+        staged: std::sync::Arc<crate::registry::StagedUploadsStore>,
+    ) -> Self {
+        self.staged_uploads = Some(staged);
+        self
     }
 
     /// The sessions tree, requesting it once if not yet cached.
@@ -1283,12 +1310,35 @@ impl SessionMachine {
             // the follow broadcast, so the event is rebuilt from the stored
             // row and re-emitted; the first returns the plain acceptance.
             if let Some(event) = self.cache.recall_pending("prompt.event") {
+                // This is *our* committed write, so the receipts it consumed
+                // are now spent. Spending here rather than after the publish is
+                // forced by the suspension: `publish_generation` returns without
+                // a reply, and the re-run observes the row it wrote and returns
+                // through this branch — so a spend placed after the publish
+                // would never run. A genuine duplicate delivery is the other
+                // case (no remembered event) and leaves the receipts alone.
+                if let Some(staged) = &self.staged_uploads {
+                    let spent = self
+                        .cache
+                        .recall_pending("prompt.receipts")
+                        .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
+                        .unwrap_or_default();
+                    staged.spend(id, &spent);
+                }
                 let mut outs = rpc::ok(serde_json::json!({ "accepted": true }));
                 outs.append(&mut self.emit_follow_event(id, &event));
                 return Ok(outs);
             }
             return Ok(rpc::ok(serde_json::json!({ "accepted": true })));
         }
+        // Resolve any `{type: 'file', receiptId}` part to the durable reference
+        // the upload staged, *before* the message is written: the model must
+        // never receive a receipt, and the log must never hold one. This runs
+        // only on the first pass — the re-run after the write landed returns
+        // above, where the resolution is not repeated (a receipt this prompt
+        // spent would then refuse the retry the idempotency check exists to
+        // accept).
+        let (content, receipt_ids) = self.resolve_file_receipts(id, &content)?;
         let seq = rows.len().saturating_sub(1) as f64;
         let event = serde_json::json!({
             "type": "user/message",
@@ -1300,12 +1350,68 @@ impl SessionMachine {
         rows.push(event.clone());
         // Remembered so the post-write re-run can replay the broadcast: the
         // re-run cannot distinguish "my write landed" from "a duplicate call"
-        // by looking at the log alone.
+        // by looking at the log alone. The consumed receipts ride along so that
+        // same re-run can spend them.
         self.cache.remember_pending("prompt.event", &event);
+        self.cache.remember_pending(
+            "prompt.receipts",
+            &serde_json::to_value(&receipt_ids).unwrap_or(serde_json::Value::Null),
+        );
         self.publish_generation(&s, &rows)?;
         let mut outs = rpc::ok(serde_json::json!({ "accepted": true }));
         outs.append(&mut self.emit_follow_event(id, &event));
         Ok(outs)
+    }
+
+    /// Replace every `{type: 'file', receiptId}` part with the durable
+    /// `{type: 'file', attachment: {…}}` reference its receipt names.
+    ///
+    /// Returns the rewritten content and the distinct receipts it consumed, so
+    /// the caller can bind them to the accepted request. A receipt that nothing
+    /// staged — or one staged for a different session, which is indistinguishable
+    /// — is `session/attachment-invalid` with `FILE_NOT_STAGED`, upstream's own
+    /// wording (`commands.ts:571`). Non-file parts pass through untouched, and a
+    /// text-only prompt never consults the store.
+    fn resolve_file_receipts(
+        &self,
+        session_id: &str,
+        content: &[serde_json::Value],
+    ) -> Result<(Vec<serde_json::Value>, Vec<String>), Vec<MachineOut>> {
+        let mut out = Vec::with_capacity(content.len());
+        let mut consumed: Vec<String> = Vec::new();
+        for part in content {
+            if part.get("type").and_then(|v| v.as_str()) != Some("file") {
+                out.push(part.clone());
+                continue;
+            }
+            let receipt = part
+                .get("receiptId")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let resolved = self
+                .staged_uploads
+                .as_ref()
+                .and_then(|s| s.resolve(session_id, receipt));
+            let Some(file) = resolved else {
+                return Err(rpc::err_details(
+                    "session/attachment-invalid",
+                    "File was not uploaded for this session.",
+                    serde_json::json!({ "reason": "FILE_NOT_STAGED" }),
+                ));
+            };
+            if !consumed.iter().any(|r| r == receipt) {
+                consumed.push(receipt.to_string());
+            }
+            out.push(serde_json::json!({
+                "type": "file",
+                "attachment": {
+                    "attachmentId": file.attachment_id,
+                    "name": file.name,
+                    "bytes": file.bytes,
+                }
+            }));
+        }
+        Ok((out, consumed))
     }
 
     /// Cancel the live turn of one attached Session, keeping its pending inbox.
@@ -1698,6 +1804,100 @@ mod tests {
             })
             .expect("expected a reply");
         reply.to_wire_json()
+    }
+
+    /// A `{type: 'file', receiptId}` prompt part resolves into the durable
+    /// reference the upload staged, and the receipt is then spent.
+    ///
+    /// This is the seam that makes `fileUploads/upload` *useful* rather than a
+    /// stored receipt nothing reads: upstream resolves receipts at prompt
+    /// admission and the model receives the attachment reference, so a receipt
+    /// that survived into the log — or a durable reference that never appeared —
+    /// would be a defect the upload's own tests cannot see.
+    #[test]
+    fn a_file_receipt_resolves_into_the_durable_reference_and_is_spent() {
+        let (_dir, mut m, _registry) = machine();
+        let staged = std::sync::Arc::new(crate::registry::StagedUploadsStore::new());
+        // The store is injected the way mount does it.
+        m = m.with_staged_uploads(staged.clone());
+
+        let c = call(
+            &mut m,
+            "create",
+            serde_json::json!({"request": {"cwd": "/tmp/x"}}),
+        );
+        let id = c["value"]["sessionId"].as_str().unwrap().to_string();
+
+        staged.stage(
+            &id,
+            "receipt-1",
+            crate::registry::StagedFile {
+                attachment_id: "sha256:abc".into(),
+                name: "poem.txt".into(),
+                bytes: 16,
+            },
+        );
+
+        let p = call(
+            &mut m,
+            "prompt",
+            serde_json::json!({"request": {
+                "sessionId": id, "requestId": "req-1", "mode": "queue",
+                "content": [
+                    {"type": "file", "receiptId": "receipt-1"},
+                    {"type": "text", "text": "read it"},
+                ],
+            }}),
+        );
+        assert!(p["value"]["accepted"].as_bool().unwrap(), "{p}");
+
+        // The logged row carries the durable reference, never the receipt.
+        // Read the session's own generation through the machine's own log path
+        // rather than through the `page` projection: the log is what the model's
+        // request is rebuilt from, so it is the authority here.
+        let s = m.find(&id).unwrap().expect("session");
+        let rows = m.rows_of(&s).unwrap();
+        let logged = serde_json::to_string(&rows).unwrap();
+        assert!(logged.contains("sha256:abc"), "{logged}");
+        assert!(logged.contains("poem.txt"), "{logged}");
+        assert!(!logged.contains("receipt-1"), "{logged}");
+
+        // The receipt is spent: a second prompt citing it is refused with the
+        // control's own wording, which is what a single-use receipt means.
+        let again = call(
+            &mut m,
+            "prompt",
+            serde_json::json!({"request": {
+                "sessionId": id, "requestId": "req-2", "mode": "queue",
+                "content": [{"type": "file", "receiptId": "receipt-1"}],
+            }}),
+        );
+        assert_eq!(again["ok"], false, "{again}");
+        assert_eq!(again["error"]["code"], "session/attachment-invalid");
+        assert_eq!(again["error"]["details"]["reason"], "FILE_NOT_STAGED");
+    }
+
+    /// A text-only prompt never consults the staged store, and a machine built
+    /// without one still accepts it — the store is optional, and its absence
+    /// only matters when a file part arrives.
+    #[test]
+    fn a_text_prompt_needs_no_staged_store() {
+        let (_dir, mut m, _registry) = machine();
+        let c = call(
+            &mut m,
+            "create",
+            serde_json::json!({"request": {"cwd": "/tmp/y"}}),
+        );
+        let id = c["value"]["sessionId"].as_str().unwrap().to_string();
+        let p = call(
+            &mut m,
+            "prompt",
+            serde_json::json!({"request": {
+                "sessionId": id, "requestId": "t1", "mode": "queue",
+                "content": [{"type": "text", "text": "hello"}],
+            }}),
+        );
+        assert!(p["value"]["accepted"].as_bool().unwrap(), "{p}");
     }
 
     #[test]

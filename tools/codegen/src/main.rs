@@ -222,33 +222,16 @@ fn generate() -> Result<()> {
          #![allow(clippy::all)]\n\n",
     );
     validate_rs.push_str(
-        "/// The shape a wire value must have to satisfy its codec's schema.\n\
-         #[derive(Debug, Clone, Copy, PartialEq, Eq)]\n\
-         pub enum WireShape {\n\
-         \x20   /// Any JSON value (`unknown` / no `type`).\n\
-         \x20   Any,\n\
-         \x20   String,\n\
-         \x20   Number,\n\
-         \x20   Boolean,\n\
-         \x20   Array,\n\
-         \x20   Object,\n\
-         \x20   /// `const` — the one value it may take.\n\
-         \x20   Const(&'static str),\n\
-         \x20   /// An `enum` of string values.\n\
-         \x20   Enum(&'static [&'static str]),\n\
-         \x20   /// An `anyOf`/`oneOf` union; the value must satisfy at least one.\n\
-         \x20   Union(&'static [WireShape]),\n\
-         }\n\n",
-    );
-    validate_rs.push_str(
         "/// One wire argument of one endpoint.\n\
          #[derive(Debug, Clone, Copy)]\n\
          pub struct ArgSpec {\n\
          \x20   /// The argument's **wire** name (not always its source name).\n\
          \x20   pub wire: &'static str,\n\
          \x20   pub required: bool,\n\
-         \x20   pub shape: WireShape,\n\
-         }\n\n",
+         \x20   /// The arg value's **pruned** JSON Schema, as JSON text; `\"\"`\n\
+         \x20   /// when the spec declares no constraint.\n\
+         \x20   pub schema: &'static str,\n\
+         \x20   }\n\n",
     );
     validate_rs.push_str(
         "/// One endpoint's argument list.\n\
@@ -257,74 +240,51 @@ fn generate() -> Result<()> {
          \x20   pub namespace: &'static str,\n\
          \x20   pub method: &'static str,\n\
          \x20   pub args: &'static [ArgSpec],\n\
-         }\n\n",
+         \x20   }\n\n",
     );
 
-    // Shape literals must outlive the table, so each distinct one is emitted as
-    // a `const` and referenced by name.
-    let mut shape_consts: BTreeMap<String, String> = BTreeMap::new();
-    let mut const_id = 0usize;
-    fn shape_expr(
-        schema: &serde_json::Value,
-        consts: &mut BTreeMap<String, String>,
-        id: &mut usize,
-    ) -> String {
-        const STRING: &str = "WireShape::String";
-        const NUMBER: &str = "WireShape::Number";
-        const BOOLEAN: &str = "WireShape::Boolean";
-        const ARRAY: &str = "WireShape::Array";
-        const OBJECT: &str = "WireShape::Object";
-        const ANY: &str = "WireShape::Any";
-
-        // `allOf: [x, {}]` is how the extractor wraps branded types; the first
-        // member carries the real shape.
-        if let Some(inner) = schema.get("allOf").and_then(|v| v.as_array()) {
-            let first = inner.iter().find(|v| v.as_object().is_some_and(|o| !o.is_empty()));
-            return match first {
-                Some(f) => shape_expr(f, consts, id),
-                None => ANY.to_string(),
-            };
-        }
-        if let Some(c) = schema.get("const").and_then(|v| v.as_str()) {
-            let name = format!("C{}", *id);
-            *id += 1;
-            consts.insert(name.clone(), format!("WireShape::Const({c:?})"));
-            return format!("/*shape*/{name}");
-        }
-        if let Some(vals) = schema.get("enum").and_then(|v| v.as_array()) {
-            let listed: Vec<String> = vals
-                .iter()
-                .filter_map(|v| v.as_str())
-                .map(|v| format!("{v:?}"))
-                .collect();
-            let name = format!("C{}", *id);
-            *id += 1;
-            consts.insert(
-                name.clone(),
-                format!("WireShape::Enum(&[{}])", listed.join(", ")),
-            );
-            return format!("/*shape*/{name}");
-        }
-        for key in ["anyOf", "oneOf"] {
-            if let Some(vals) = schema.get(key).and_then(|v| v.as_array()) {
-                let parts: Vec<String> =
-                    vals.iter().map(|v| shape_expr(v, consts, id)).collect();
-                let name = format!("C{}", *id);
-                *id += 1;
-                consts.insert(
-                    name.clone(),
-                    format!("WireShape::Union(&[{}])", parts.join(", ")),
-                );
-                return format!("/*shape*/{name}");
+    // Each arg carries the **pruned** JSON Schema of its codec, emitted as a
+    // JSON string literal and interpreted at the boundary by
+    // `vocoderd/src/validate.rs`. Pruning keeps exactly the keywords the
+    // control enforces (measured against the running control, 2026-09-20):
+    // `type`, `const`, `enum`, `required`, `properties`, `items`, and the
+    // `anyOf`/`oneOf`/`allOf`/`$ref`/`$defs` combinators. Everything else —
+    // most importantly `additionalProperties`, at any depth — is dropped,
+    // because the control tolerates an unexpected nested key: it validates
+    // nested *requireds* and nested *values* but never nested *extras*.
+    //
+    // Emitting the schema as data (rather than compiling it to a Rust shape
+    // enum) keeps the interpreter's recursion honest: `$ref`/`$defs` cycles
+    // and arbitrary `anyOf` nesting are handled by the same walk, and a new
+    // spec keyword that matters is a change in one place.
+    const KEEP: &[&str] = &[
+        "type", "const", "enum", "required", "properties", "items", "anyOf", "oneOf",
+        "allOf", "$ref", "$defs",
+    ];
+    fn prune(schema: &serde_json::Value) -> serde_json::Value {
+        use serde_json::Value;
+        match schema {
+            Value::Object(map) => {
+                let mut out = serde_json::Map::new();
+                for (k, v) in map {
+                    // `properties` and `$defs` are name→schema maps; recurse
+                    // into each member rather than pruning them as schemas.
+                    if k == "properties" || k == "$defs" {
+                        if let Value::Object(members) = v {
+                            let mut pruned = serde_json::Map::new();
+                            for (name, sub) in members {
+                                pruned.insert(name.clone(), prune(sub));
+                            }
+                            out.insert(k.clone(), Value::Object(pruned));
+                        }
+                    } else if KEEP.contains(&k.as_str()) {
+                        out.insert(k.clone(), prune(v));
+                    }
+                }
+                Value::Object(out)
             }
-        }
-        match schema.get("type").and_then(|t| t.as_str()) {
-            Some("string") => STRING.to_string(),
-            Some("number") | Some("integer") => NUMBER.to_string(),
-            Some("boolean") => BOOLEAN.to_string(),
-            Some("array") => ARRAY.to_string(),
-            Some("object") => OBJECT.to_string(),
-            _ => ANY.to_string(),
+            Value::Array(items) => Value::Array(items.iter().map(prune).collect()),
+            other => other.clone(),
         }
     }
 
@@ -338,17 +298,26 @@ fn generate() -> Result<()> {
             .parameters
             .iter()
             .map(|p| {
-                let shape = p
+                let schema_json = p
                     .codec
                     .as_ref()
                     .and_then(|c| c.schema.as_ref())
-                    .map(|s| shape_expr(s, &mut shape_consts, &mut const_id))
-                    .unwrap_or_else(|| "WireShape::Any".to_string());
+                    .map(|s| {
+                        let pruned = prune(s);
+                        // `{}` carries no constraint — emit `""` so the
+                        // interpreter skips it entirely.
+                        if pruned.as_object().is_some_and(|o| o.is_empty()) {
+                            String::new()
+                        } else {
+                            serde_json::to_string(&pruned).expect("schema serializes")
+                        }
+                    })
+                    .unwrap_or_default();
                 format!(
-                    "ArgSpec {{ wire: {wire:?}, required: {req}, shape: {shape} }}",
+                    "ArgSpec {{ wire: {wire:?}, required: {req}, schema: {schema:?} }}",
                     wire = p.wire,
                     req = !p.accepts_undefined,
-                    shape = shape.replace("/*shape*/", ""),
+                    schema = schema_json,
                 )
             })
             .collect();
@@ -360,11 +329,6 @@ fn generate() -> Result<()> {
         ));
     }
 
-    // Shape consts first, then the table that references them.
-    validate_rs.push_str("// Shape literals (referenced by the table below).\n");
-    for (name, value) in &shape_consts {
-        validate_rs.push_str(&format!("const {name}: WireShape = {value};\n"));
-    }
     validate_rs.push_str("\n/// Every endpoint the spec declares, sorted by namespace then method.\n");
     validate_rs.push_str("pub static ENDPOINTS: &[EndpointSpec] = &[\n");
     validate_rs.push_str(&table);
@@ -424,6 +388,7 @@ fn coverage_report() -> Result<()> {
         ("credentials", "credentials.rs"),
         ("skills", "skills.rs"),
         ("fileReferences", "file_references.rs"),
+        ("fileUploads", "file_uploads.rs"),
         ("commands", "commands.rs"),
         ("agentPresets", "agent_presets.rs"),
         ("messageFeedback", "message_feedback.rs"),

@@ -55,6 +55,7 @@ const LIVE_NAMESPACES: &[&str] = &[
     "pluginInventory",
     "llm",
     "subagents",
+    "fileUploads",
 ];
 
 struct Endpoint {
@@ -154,6 +155,43 @@ async fn malformed_envelope_yields_bad_request() {
     assert_eq!(v["type"], "server-response", "{v}");
     assert_eq!(v["result"]["ok"], false, "{v}");
     assert_eq!(v["result"]["error"]["code"], "gateway/bad-request", "{v}");
+}
+
+/// An envelope whose `payload` carries **no `args` field** is refused by both
+/// hosts, in *different codes*, which this cell records rather than papers over.
+///
+/// - **control (dsh)**: `gateway/internal` "Remote payload must contain exactly
+///   one plain-object args field" — its payload reader rejects the absent key
+///   before the descriptor is consulted.
+/// - **candidate (vocoderd)**: `gateway/arguments-invalid` — a non-object (or
+///   absent) `args` cannot satisfy a descriptor that requires args, so it reads
+///   as a *missing required arg*.
+///
+/// Both refuse; the code differs because each host reaches the judgement by a
+/// different route. The cell asserts the invariant both meet — a typed
+/// `gateway/*` failure, never a 5xx and never a silent success — so a candidate
+/// that started accepting an args-less envelope would fail here.
+#[tokio::test]
+async fn an_absent_args_field_is_refused_by_both_hosts() {
+    for payload in [json!({}), json!({ "args": null }), json!({ "args": "not-an-object" })] {
+        let (status, v) = post_raw(
+            "subagents/list",
+            &json!({
+                "type": "client-request",
+                "rpcId": format!("cell-{}", uuid()),
+                "method": "subagents/list",
+                "payload": payload,
+            }),
+        )
+        .await;
+        assert!(status < 500, "never a server fault ({status}): {v}");
+        assert_eq!(v["result"]["ok"], false, "payload {payload}: {v}");
+        let code = v["result"]["error"]["code"].as_str().unwrap_or_default();
+        assert!(
+            code.starts_with("gateway/"),
+            "payload {payload}: expected a gateway/* refusal, got {code}: {v}"
+        );
+    }
 }
 
 /// An unknown method is refused cleanly — and the two hosts refuse it in

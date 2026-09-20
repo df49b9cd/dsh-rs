@@ -106,7 +106,7 @@ run: see *Known gaps* below.
     above was caught by replay. A test now asserts the recorded row shape
     (`the_recorded_cancel_fixes_the_interrupted_row_shape`); widening the replay
     discovery to the other snapshot roots is still open.
-- [x] `conformance/wire` endpoint coverage on both hosts — 45 cells, and both
+- [x] `conformance/wire` endpoint coverage on both hosts — **53 cells**, and both
   hosts are green on every one of them, run as
   `./run-conformance.sh {dsh,vocoderd} wire`. Extending coverage to `llm` and
   `subagents` and running the control found **five more candidate defects**
@@ -378,8 +378,7 @@ which, since it landed, leaves the axis's wiring as the remaining work.
     (`GET /open-in-app/apps`, the Linux locator subset — `cli`/`file`/`desktop`
     — ported with the SSH and display gates), and the `dynamicCordisRunner`
     namespace (an empty registry, answering `[]`/`null`, is the control's own
-    answer before a dynamic plugin is defined). Coverage moved 74/87 → 86/87;
-    only `fileUploads/upload` remains.
+    answer before a dynamic plugin is defined). Coverage moved 74/87 → 86/87.
   - **What this does not do.** The e2e axis still runs four hand-written cells,
     not the 35 URL-only upstream specs; wiring those is the remaining M5 work.
     The 60 in-process specs stay unreachable by any adapter (see M3).
@@ -391,6 +390,21 @@ which, since it landed, leaves the axis's wiring as the remaining work.
     is no HMR rebuild path (the graph composes once; `/plugins/events` serves
     the connect snapshot and never a `rebuilt` frame).
 - Composition-replay axis reaches full profile coverage
+- [x] **File-upload staging** — the last uncovered endpoint. `machines/
+  file_uploads.rs` admits one canonical-base64 payload, stores it verbatim in
+  upstream's two-name content-addressed layout under `<home>/attachments/v1`,
+  and answers a `{receiptId, file}` receipt; a `{type: 'file', receiptId}` part
+  in `session/prompt` resolves through a store shared between the two machines
+  into the durable reference the model reads. Coverage reached **87/87**, and
+  both hosts are **50/50** green on `wire` (measured 2026-09-20).
+  - The sanitizer (`fileLeafName`) and the canonical-base64 rule are wire
+    contracts, reproduced byte for byte and pinned by tests whose expectations
+    were read off the running control rather than inferred from the source.
+  - What is reduced is durability, not shape: upstream stages to `O_EXCL` +
+    fsync + hardlink + read-only chmod, and the effect vocabulary has no `link`,
+    so each name is written atomically with the same bytes, names, digest, and
+    byte count. The raw binary route (`POST /api/session/uploadFileBinary`) is a
+    separate surface this host does not serve.
 - [ ] Optional JS-compat island (rquickjs) scoped to `Out::SpawnScope` subtrees
 
 ## Known gaps
@@ -443,6 +457,29 @@ than it is:
   leaves the machine, and the two kernel-backed agent tests assert the
   *observable world* (an outside write does not land). Upstream's own framing —
   that `fs-sandbox` is containment — still stands for the fs family.
+- **A *nested* missing required field is now the same error code on both hosts**
+  (was a divergence; closed 2026-09-20). When an arg's own object omitted a
+  required member — `session/page`'s `request` without `childSessionId`,
+  `session/updateQueue`'s without `kind` — the control answered
+  `gateway/input-invalid` with `details.field` naming the outer arg while
+  vocoderd answered `gateway/bad-request`. The generated boundary validator now
+  emits each arg's *pruned* JSON Schema as data and interprets it at the
+  boundary, descending into object members, array items, and
+  `anyOf`/`allOf`/`$ref` branches — teaching nested requireds and nested *values*
+  while still tolerating a nested *extra* key, which is the control's own
+  asymmetry. Re-measured live on both hosts, the five endpoints
+  (`session/page`, `session/prompt`, `session/updateQueue`, `subagents/prompt`,
+  `dynamicCordisRunner/syncInspectManifest`) now agree, and
+  `a_nested_missing_required_field_is_input_invalid_cell` plus
+  `a_nested_extra_key_is_not_a_boundary_failure_cell` pin both halves.
+- **An envelope with no `args` field is a different error code on the
+  candidate** (found in the same 2026-09-20 sweep). A `payload` that carries no
+  `args` (or a non-object one) is `gateway/internal` on the control ("Remote
+  payload must contain exactly one plain-object args field") and
+  `gateway/arguments-invalid` on vocoderd, which reads a non-object `args` as a
+  missing required arg. Both refuse, in different codes; the invariant they
+  share is asserted by `an_absent_args_field_is_refused_by_both_hosts` and the
+  divergence is named in [docs/conformance.md](docs/conformance.md).
 - **`seccomp` is not implemented** (see M4 step 4), despite the plan item naming
   it. Upstream's Linux chain does not use seccomp either — it is `bwrap` then
   Landlock — so the vocabulary in this item was wrong, not merely incomplete.

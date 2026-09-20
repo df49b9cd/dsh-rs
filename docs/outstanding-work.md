@@ -25,6 +25,12 @@ parity question existed.
 > vocoderd**, 430 vocoderd tests, e2e-replay 4/4 on both hosts. What remains
 > below is P3.2–P3.5 and P4.
 >
+> **Update, 2026-09-20 (later):** P4 is now **DONE** — `fileUploads/upload`
+> landed, so spec coverage is **87/87**. Measured state: **53 wire cells green
+> on both hosts** (up from 48: two hand-written upload cells, plus three that
+> pin the boundary's nested-required and absent-`args` behavior), 446
+> workspace tests, fmt + clippy clean. See the P4 section.
+>
 > Findings worth carrying forward:
 > - **P1.3's original framing was wrong.** "Adopt the generated service traits"
 >   could not have delivered working validation: the generated types drop
@@ -385,15 +391,50 @@ not be counted as work in progress.
 
 ## P4 — Remaining endpoint coverage
 
-86/87 endpoints answered. The one outstanding is:
+**87/87 endpoints answered — DONE (2026-09-20).** The last one was:
 
-- `fileUploads/upload` — needs an upload surface; independent of everything
-  above, and not on the critical path for the agent core or the GUI.
+- `fileUploads/upload` — **landed.** `machines/file_uploads.rs` admits one
+  canonical-base64 payload, stores it verbatim under
+  `<home>/attachments/v1` in upstream's two-name layout
+  (`file-objects/<h2>/<sha256>` and the per-name alias
+  `files/<h2>/<sha256>/<leaf>`), and answers `{receiptId, file}`. The receipt
+  is a real one: the shared `StagedUploadsStore` lets `session/prompt` resolve a
+  `{type: 'file', receiptId}` part into the durable reference the model reads,
+  which the `file-upload-round` snapshot shows the model doing with the `read`
+  tool. The store is runtime state (upstream keeps the equivalent map on the
+  `fileUploads` service), so a receipt is spent by exactly one accepted prompt —
+  measured on the control, not assumed. The raw same-name binary route
+  (`POST /api/session/uploadFileBinary`) is a separate surface this host does
+  not serve, and is stated as reduced in the machine's module doc.
 
 `dynamicCordisRunner/*` (12) landed 2026-09-19 as an empty registry — its
 `[]`/`null` are the control's own answers before a dynamic plugin is defined, so
-the namespace is answered rather than stubbed. Treat `fileUploads/upload` as
-backlog until a client needs it.
+the namespace is answered rather than stubbed.
+
+The upload landed with a **boundary divergence recorded rather than fixed**:
+a *nested* missing required field was `gateway/input-invalid` on the control and
+`gateway/bad-request` on the candidate, for the five endpoints whose args carry
+nested requireds (`session/page`, `session/prompt`, `session/updateQueue`,
+`subagents/prompt`, `dynamicCordisRunner/syncInspectManifest`).
+`fileUploads/upload` was the sixth such endpoint and *agreed* with the control
+because its machine checks its own `request`.
+
+**That class is now closed** (2026-09-20). The generated validator was rewritten
+to emit each arg's *pruned* JSON Schema as data and interpret it at the boundary,
+descending into object members, array items, and `anyOf`/`allOf`/`$ref`
+branches — taught nested *requireds* and nested *values* while still tolerating a
+nested *extra* key, which is the control's own asymmetry. Re-measured on both
+live hosts, the five endpoints now agree with the control
+(`gateway/input-invalid`, `details.field` = the outer arg), and
+`a_nested_missing_required_field_is_input_invalid_cell` +
+`a_nested_extra_key_is_not_a_boundary_failure_cell` pin both halves.
+
+One *different* divergence was found in the same sweep and is recorded rather
+than fixed: an envelope whose `payload` carries **no `args` field** (or a
+non-object one) is `gateway/internal` on the control ("must contain exactly one
+plain-object args field") and `gateway/arguments-invalid` on the candidate. Both
+refuse; the code differs by route. `an_absent_args_field_is_refused_by_both_hosts`
+asserts the shared invariant and the table in `docs/conformance.md` names both.
 
 ## Suggested sequencing
 
@@ -409,5 +450,5 @@ backlog until a client needs it.
 5. **P3** — M5. 3.1 (the client-module pipeline) landed; 3.2 (wiring the 35
    URL-only specs onto the e2e axis) is the open question to decide first.
 
-Deferred deliberately, not forgotten: P4's `fileUploads/upload`, and
+Deferred deliberately, not forgotten: the absent-`args` divergence above, and
 `harness/fixtures/`.

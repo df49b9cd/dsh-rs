@@ -43,6 +43,13 @@ tracing-subscriber.workspace = true
 # blocking effect loop instead of forcing a second async path through it.
 ureq = "3"
 zstd.workspace = true
+base64 = "0.23.1"
+sha2 = "0.10"
+# A staged upload receipt is a wire-visible opaque id, and upstream mints it as
+# `randomUUID()` — an RFC 4122 v4 UUID. Reproducing the *shape* rather than a
+# local hex fragment matters because the id is echoed by the client and could be
+# branched on; `v4` is the only feature needed.
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3"

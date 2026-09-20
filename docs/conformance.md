@@ -71,7 +71,9 @@ paper over. Each asserts the invariant *both* hosts meet:
 |---|---|---|
 | Unknown method / namespace | bare HTTP 404, `text/plain` | 200 + typed `gateway/*` envelope |
 | Non-JSON body | HTTP 400, `text/plain` | 200 + `gateway/bad-request` |
-| Malformed args | `gateway/input-invalid`, naming the field | `gateway/bad-request` |
+| Malformed args — an arg *value* failing its codec | `gateway/input-invalid`, naming the field | **agrees** — `gateway/input-invalid`, the same field |
+| A **nested** required field missing (e.g. `session/page`'s `request` without `childSessionId`; `session/updateQueue`'s without `kind`) | `gateway/input-invalid`, `field` = the outer arg | **agrees** — `gateway/input-invalid`, `field` = the outer arg (both hosts; `a_nested_missing_required_field_is_input_invalid_cell`) |
+| The envelope's `args` field absent or not a plain object | `gateway/internal` "Remote payload must contain exactly one plain-object args field" | `gateway/arguments-invalid` (it treats a non-object `args` as a missing required arg) |
 | `goals/complete` with a `ref` that names no goal | `gateway/internal` "no current goal" | `goal/not-found` |
 | `sessionReferenceResolver/candidates` for an unknown agent | `session/not-found` | empty array |
 | `directoryPicker/pick` | **blocks forever** on a native dialog | `directory-picker/unavailable` |

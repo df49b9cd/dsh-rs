@@ -22,7 +22,6 @@ license = "MIT"
 tokio = { version = "1.53", features = ["full"] }
 axum = { version = "0.8.9", features = ["ws"] }
 tower-http = "0.7"
-hyper = { version = "1.8", features = ["full"] }
 # Stream combinators for the one endpoint that holds a body open: the
 # client-module dev SSE channel (`GET /plugins/events`). Already in the tree
 # through axum; named directly so the handler can build a never-ending body.
