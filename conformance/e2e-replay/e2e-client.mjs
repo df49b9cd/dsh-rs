@@ -8,6 +8,7 @@
 //
 // Usage: node e2e-client.mjs <baseUrl>
 import { createRequire } from 'node:module'
+import { existsSync, readFileSync } from 'node:fs'
 const require = createRequire(new URL('../../dsh/apps/web/package.json', import.meta.url))
 const { chromium } = require('playwright')
 
@@ -17,6 +18,28 @@ if (!baseUrl) {
   process.exit(2)
 }
 
+// The control gates the index on an auth cookie (browser-auth.ts answers a
+// bare GET with 401). run.sh mints the cookie and writes `name=value` to
+// $CONFORMANCE_COOKIE_FILE; a browser context must carry it before the first
+// navigation. The variable is exported for *both* hosts and the file exists
+// only for the control, so check the file, not the variable. (Navigating to
+// the ?token= URL instead would 303-redirect, and the shell/boots cell pins
+// the un-rewritten URL.)
+let cookies = []
+const cookieFile = process.env.CONFORMANCE_COOKIE_FILE
+if (cookieFile && existsSync(cookieFile)) {
+  const pair = readFileSync(cookieFile, 'utf8').trim()
+  const eq = pair.indexOf('=')
+  if (eq > 0) {
+    cookies.push({
+      name: pair.slice(0, eq),
+      value: pair.slice(eq + 1),
+      domain: new URL(baseUrl).hostname,
+      path: '/',
+    })
+  }
+}
+
 const results = []
 function cell(name, pass, extra) {
   results.push({ cell: name, pass, ...(extra ? { extra } : {}) })
@@ -24,7 +47,9 @@ function cell(name, pass, extra) {
 }
 
 const browser = await chromium.launch({ headless: true })
-const page = await browser.newPage()
+const context = await browser.newContext()
+if (cookies.length) await context.addCookies(cookies)
+const page = await context.newPage()
 
 const consoleErrors = []
 page.on('console', (msg) => {

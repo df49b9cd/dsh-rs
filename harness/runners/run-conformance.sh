@@ -7,9 +7,10 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 
 HOST="${1:?usage: run-conformance.sh <host> [suites...]}"
 shift || true
-SUITES=("${@:-wire e2e-replay session-replay interop}")
-# zsh/bash default quirk guard:
-[ "${#SUITES[@]}" -eq 0 ] || [ "${SUITES[0]}" = "wire e2e-replay session-replay interop" ] && SUITES=(wire e2e-replay session-replay interop)
+SUITES=("$@")
+# @:-expansion on an empty rest yields one empty word in bash, not none — so
+# test membership, not array length.
+[ "${SUITES[*]-}" = "" ] && SUITES=(wire e2e-replay session-replay interop)
 
 export CONFORMANCE_HOME="$ROOT/.scratch/${HOST}-home"
 # The suites read the control's auth cookie from this path (see
@@ -18,6 +19,10 @@ export CONFORMANCE_HOME="$ROOT/.scratch/${HOST}-home"
 # not work as a one-command parity check. vocoderd is loopback-trusted and
 # simply ignores the file when it is absent.
 export CONFORMANCE_COOKIE_FILE="$CONFORMANCE_HOME/conformance.cookie"
+# The suites and run.sh must agree on the host's address even when
+# CONFORMANCE_PORT is overridden; without this export every consumer silently
+# re-defaults to 127.0.0.1:3080 and a non-default port runs against nothing.
+export CONFORMANCE_BASE_URL="http://127.0.0.1:${CONFORMANCE_PORT:-3080}"
 rm -rf "$CONFORMANCE_HOME"; mkdir -p "$CONFORMANCE_HOME"
 
 echo "== starting host: $HOST"
@@ -34,7 +39,7 @@ trap cleanup EXIT
 # bare would never succeed and the run would die at "did not become ready"
 # even though the host was up. (vocoderd is loopback-trusted and ignores the
 # cookie, so one form works for both.)
-BASE="${CONFORMANCE_BASE_URL:-http://127.0.0.1:3080}"
+BASE="$CONFORMANCE_BASE_URL"
 COOKIE_FILE="$CONFORMANCE_COOKIE_FILE"
 probe() {
     if [ -f "$COOKIE_FILE" ]; then

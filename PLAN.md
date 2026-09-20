@@ -440,9 +440,14 @@ which, since it landed, leaves the axis's wiring as the remaining work.
 Honest state of the claims above, so the plan does not read as further along
 than it is:
 
-- **The `dsh` control-host run for `wire` is now done and is one command**
-  (see M0/M1); the *other* axes — `e2e-replay`, `composition-replay` — are
-  still candidate-only, so their parity half remains unmeasured.
+- **The `dsh` control-host run for `wire` and `e2e-replay` is done and is one
+  command each** (see M0/M1). The e2e half needed the Playwright client to
+  carry the auth cookie (`e2e-client.mjs` reads `$CONFORMANCE_COOKIE_FILE`;
+  without it the control's index is a 401 and two of the four cells could not
+  have passed — the previously recorded "4/4 on the control" had been
+  measured with an ad-hoc client, not the committed one). Re-measured
+  2026-09-20 on the committed path: 4/4 on both hosts. `composition-replay`
+  remains candidate-only, so its parity half is still unmeasured.
   `session-replay` is not an axis with two hosts: its assertions are pure
   file-level interop (each side reads what the other wrote), so there is no
   control comparison to make.
