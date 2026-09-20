@@ -433,6 +433,7 @@ fn coverage_report() -> Result<()> {
         ("llm", "llm.rs"),
         ("subagents", "subagents.rs"),
         ("agentTeams", "agent_teams.rs"),
+        ("dynamicCordisRunner", "dynamic_cordis_runner.rs"),
     ]
     .into_iter()
     .map(|(ns, file)| {

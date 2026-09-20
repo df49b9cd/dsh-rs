@@ -152,10 +152,11 @@ Both are pure file-level assertions — no host needs to run.
 `conformance/e2e-replay/e2e-client.mjs` is a standalone smoke test with four
 hand-written cells — shell boots, root mounts, no console errors, boot payload
 observed. It does not reuse the upstream `.e2e.ts` specs, and there is no
-control comparison or `adapter.ts` yet. Current baseline against vocoderd: 3/4
-cells pass; the failure is real and informative — the GUI aborts with
-`window.__ModuleLoader__ bootstrap facade is missing`, i.e. vocoderd injects
-`__DSH_BOOT__` but not the module-loader facade the shell requires.
+control comparison or `adapter.ts` yet. **Current baseline against vocoderd:
+4/4**, and 4/4 against the control too (measured 2026-09-19): the client-module
+pipeline landed (below), so the shell boots with the module-loader facade, the
+boot graph, the combo route, and the dev channel — no console errors on either
+host.
 
 **Two independent obstacles, both larger than a missing credential.** An earlier
 draft of this section claimed the suite self-skips ~94 of 98 cases without
@@ -172,8 +173,12 @@ it. What actually blocks the replay:
    live `Context`. 60 of the 98 specs consume that host-side surface directly
    (49 `scaffold.ctx`, 33 `whenTurnSettled()`, 12 `harnessHome`/`persistenceRoot`,
    3 `hostFetch`). For those, the test *is* the host.
-2. **The client-module pipeline does not exist** (M5): the shell cannot boot
-   against a static dist.
+2. **The upstream `.e2e.ts` specs are not wired to this axis.** The
+   client-module pipeline that *did* block the shell (M5) has landed — vocoderd
+   now composes the boot graph and serves it, which is why this axis is 4/4 —
+   but the axis still runs its four hand-written cells, not the 35 URL-only
+   upstream specs. Pointing those at a base URL is the remaining M5 work; the
+   obstacle is wiring, not a missing pipeline.
 
 `conformance/e2e-replay/spec-classification.mjs` measures (1) per spec rather
 than assuming it; its URL-only list is the target M5 will replay. The recorded

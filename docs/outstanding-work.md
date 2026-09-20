@@ -16,7 +16,14 @@ parity question existed.
 > provider endpoint**, not only against recorded data: a `session/prompt` over
 > HTTP produces a complete, balanced turn with real token counts. That run found
 > a defect no fixture had (see "What the LLM seam's live run taught" below).
-> P2 steps 3–4 and P3–P4 remain.
+>
+> **Update, 2026-09-20:** P2 is now **complete through step 4**. The tool seam's
+> emitter landed (step 3) and the sandbox runner gained its consumer (step 4):
+> `bash` is now in the catalog, confined by the real runner chain, with two
+> kernel-backed agent tests asserting the observable world. P3.1 (the
+> client-module pipeline) also landed. Measured state: **48 wire cells green on
+> vocoderd**, 430 vocoderd tests, e2e-replay 4/4 on both hosts. What remains
+> below is P3.2–P3.5 and P4.
 >
 > Findings worth carrying forward:
 > - **P1.3's original framing was wrong.** "Adopt the generated service traits"
@@ -212,7 +219,7 @@ Suggested order, each step ending somewhere useful:
    `user/message → agent/inbox/spliced → turn/start → step/start →
    assistant/message → step/end → turn/end {completed}`, with real token counts
    and a stream record the replay provider can re-derive.
-3. **Tool seam + approval machine — the approval half is DONE** (2026-09-19).
+3. **Tool seam + approval machine — DONE** (2026-09-19; both halves).
    `machines/approval.rs` is mounted and answers the `approval/request`
    waterfall; a test drives it through the **real router** (mount, dispatch,
    verdict fold) rather than only calling the machine, because subscription and
@@ -222,16 +229,21 @@ Suggested order, each step ending somewhere useful:
    `never` policy means "do not ask", and mapping that to `allowed-once` would
    turn it into a silent grant.
 
-   What remains is the **emitter**. Upstream raises these from the tool
-   executor, so until that exists nothing dispatches the event — which is why
-   the audit row queue has no consumer and the module says so rather than
-   inventing a synthetic ask. A machine that raised its own requests would fill
-   the log with questions no tool asked and turn a real gap into a green test.
-   The `events.rs` note is updated accordingly: the waterfall events are
-   answered by their owners, not broadcast, and `user-questions/request` is the
-   remaining unanswered one.
-4. **Sandbox machines** (Landlock/seccomp native). Largely independent of 1–3;
-   can proceed in parallel if there is a second worker.
+   The **emitter** is `machines/tool_exec.rs`, which owns the turn's row order
+   and so writes the pair from the verdict. A tool-calling `session/prompt` now
+   runs its calls and continues — the whole sequence
+   `assistant/message → tool/call → tool/result → step/end → step/start →
+   assistant/message → step/end` is asserted with a real file's content. A
+   plain mutation does **not** ask (the corpus records zero `approval/asked`
+   rows for `fs-write`/`fs-edit`); the ask fires only on a request to *widen*.
+4. **Sandbox machines (step 4) — DONE** (2026-09-20). The runner seam
+   (`machines/sandbox_runner.rs`) now has its consumer: `bash`
+   (`machines/tool_bash.rs`) is in the catalog, the executor confines its argv
+   once, and `driver::probe_sandbox` resolves the chain at mount. Two
+   kernel-backed agent tests assert the observable world — a command runs
+   confined, and an outside write does not land. `seccomp` is not implemented
+   and is state in "Known gaps" of `PLAN.md`; upstream's Linux chain does not use
+   it either.
 
 ### Left undone in the LLM seam
 
@@ -242,10 +254,12 @@ Suggested order, each step ending somewhere useful:
   (`BTreeMap<String, Op>`) — every op already carries its own session id and
   rows, so only the *slot* is shared. Deliberately not a queue: delaying a prompt
   behind a slow model call reads to a client as a hang.
-- **Tool calls are recorded but not executed.** A `tool-calls` finish already
-  opens another step, so the loop is shaped for tools, but nothing runs them —
-  that is step 3's seam, and a turn that calls a tool currently opens a step
-  whose request has no tool results to send.
+- **Tool calls are recorded and executed (step 3 landed).** The executor runs
+  them in strict model order — the scheduler is a deliberate reduction — and the
+  results reach the next request. What is still *not* executed is a tool this
+  host does not compose: `bash` joined the catalog with step 4, but `subagent`,
+  `run_code`, and the rest remain absent on purpose (offering a name the host
+  cannot run teaches the model the tool exists and is broken).
 - **Reasoning is recorded but not re-sent.** A provider's reasoning is decoded
   and packed into the log, but `canonical_request` reads only text and tool
   items back out, so an Anthropic round trip loses unsigned thinking. Signed
@@ -283,24 +297,22 @@ Two more things the same run settled:
 
 ### Machine-level stubs that M4 closes
 
-`tools/codegen/src/main.rs:307` keeps an `m4_stubs` list that marks endpoints
-`yes, stub (M4)` in the coverage report. Two of the seven markers are now stale
-and the report overstates the gap:
+`tools/codegen/src/main.rs` keeps an `m4_stubs` list that marks endpoints
+`yes, stub (M4)` in the coverage report. The `modelCatalog` marker and the
+cancel/edit rows this table used to carry are now closed and **removed from the
+list** — `session/cancel` reaches the live turn, `session/selectModel` and
+`session/updateQueue` were re-checked, and the report no longer claims a gap
+that is closed. What remains marked stub is a short list:
 
 | Endpoint | Actual state |
 |---|---|
-| `session/modelCatalog` | **real** — delegates to `llm::model_catalog()`; marker stale |
+| `session/attachment` | stub — no attachment store |
 | `session/selectModel` | partial — validates and persists the choice; does not re-link a live agent |
 | `session/updateQueue` | partial — remove/edit over a placeholder queue |
-| `session/cancel` | no-op acceptance; needs the loop to mean anything |
-| `session/attachment` | stub — no attachment store |
-| `session/openWorkspacePath` | returns `{opened: false}`; OS integration, not agent core |
-| `session/canOpenWorkspacePath` | returns `false`; same |
 
-Fix the `modelCatalog` marker now (it is a one-line change and the report should
-not claim a gap that is closed). Re-examine the other two OS-integration rows —
-they may belong to a different category than "pending the agent core", since
-nothing about them depends on a loop.
+The two OS-integration rows (`session/openWorkspacePath` /
+`session/canOpenWorkspacePath`) are marked `yes, stub (native OS)` rather than
+`(M4)`, which is the right category: nothing about them depends on a loop.
 
 Also note: `commands` registers five non-runnable commands (`compact`, `export`,
 `feedback`, `permission`, `plan`) that answer a typed "needs the agent core"
@@ -311,13 +323,27 @@ deliberate and correctly documented; both close with M4.
 
 ### 3.1 The client-module pipeline
 
-The prerequisite for a working web GUI and the reason `e2e-replay` is stuck at
-3/4. `shell/no-console-errors` fails with `window.__ModuleLoader__ bootstrap
-facade is missing`.
+**Landed 2026-09-19.** vocoderd now composes the client-module boot graph the
+shell reads: it scans the dsh package tree for `dsh.client` declarations,
+selects the roster from the enabled bundle-patch rows plus the runtime-resolved
+picker backend, orders it by the module graph, partitions it into bootstrap and
+application batches, serves each package's built bundle through the combo route
+(`/plugins/??…`, script and indexed source-map forms), injects the facade +
+preload + graph + theme + ready table into `index.html`, and serves the
+`client-hmr` dev channel (`GET /plugins/events`) as a connect-time graph
+snapshot. The e2e axis is now **4/4 on both hosts**, with zero console errors.
 
-`conformance/e2e-replay/README.md:18` is right that this must not be stubbed: a
-graph that appears to boot while composing no plugins would turn the axis green
-while testing nothing. Keep that constraint.
+The `conformance/e2e-replay/README.md:18` constraint is honored, not bypassed: a
+stub `__DSH_BOOT__` that composed no plugins would have turned the axis green
+while testing nothing. What landed instead composes the real 53-entry graph and
+serves real bundles, so a boot that renders the shell is a boot that loaded
+every plugin.
+
+Two boot-time gaps the live boot exposed were closed with the pipeline because
+they were console errors on the cell: the `open-in-app` host route
+(`GET /open-in-app/apps`, ported with the Linux locator subset) and the
+`dynamicCordisRunner` namespace (an empty registry is the faithful answer — the
+control's own answer before a dynamic plugin is defined).
 
 ### 3.2 e2e-replay cannot reach the upstream suite
 
@@ -359,17 +385,15 @@ not be counted as work in progress.
 
 ## P4 — Remaining endpoint coverage
 
-74/87 endpoints answered. The 13 outstanding are **one namespace and one
-endpoint**:
+86/87 endpoints answered. The one outstanding is:
 
-- `fileUploads/upload` (1) — needs an upload surface; independent of everything
-  above.
-- `dynamicCordisRunner/*` (12) — the dynamic Cordis runner. This is M5's
-  "Typert-over-subprocess" work and is the largest single unimplemented
-  namespace. Nothing currently depends on it.
+- `fileUploads/upload` — needs an upload surface; independent of everything
+  above, and not on the critical path for the agent core or the GUI.
 
-Neither is on the critical path for the agent core or the GUI. Treat as backlog
-until a client needs them.
+`dynamicCordisRunner/*` (12) landed 2026-09-19 as an empty registry — its
+`[]`/`null` are the control's own answers before a dynamic plugin is defined, so
+the namespace is answered rather than stubbed. Treat `fileUploads/upload` as
+backlog until a client needs it.
 
 ## Suggested sequencing
 
@@ -380,8 +404,10 @@ until a client needs them.
    twice.
 3. **1.1, 1.2, 1.5, and the stale `modelCatalog` marker** — cheap truth-and-gates
    work, batched into one pass.
-4. **P2** — the agent core, in the four steps above, starting with cancellation
-   (1.4) folded into step 1.
-5. **P3** — M5, with the 3.2 open question decided first.
+4. **P2** — the agent core. **All four steps are now DONE** (steps 1–3 landed
+   2026-09-19, step 4 on 2026-09-20 with `bash` as the runner's consumer).
+5. **P3** — M5. 3.1 (the client-module pipeline) landed; 3.2 (wiring the 35
+   URL-only specs onto the e2e axis) is the open question to decide first.
 
-Deferred deliberately, not forgotten: P4's 13 endpoints, and `harness/fixtures/`.
+Deferred deliberately, not forgotten: P4's `fileUploads/upload`, and
+`harness/fixtures/`.

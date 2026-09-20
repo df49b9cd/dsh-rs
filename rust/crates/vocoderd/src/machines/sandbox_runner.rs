@@ -41,11 +41,13 @@
 //! mode that makes a sandbox worse than none, because the caller believes it was
 //! confined.
 
-// The module is complete and tested but **not yet wired**: the executor that
-// drives it is the next step, so in a non-test build every item here reads as
-// dead code. The allow is scoped to the module rather than sprinkled per item so
-// that removing it later is one deletion, and so the reason is stated once.
-// `sandbox.rs` and `agent_loop.rs` carry the same allow for the same reason.
+// The module is now **wired**: `tool_exec::start_bash` calls [`confine`] and the
+// driver probes the chain via `driver::probe_sandbox`. What remains dead in a
+// non-test Linux build is only the *other* platforms' rungs — the Seatbelt and
+// Windows ACL arms, and the Landlock launcher when `bwrap` wins the chain — plus
+// helpers that exist to make those arms testable. The allow is kept scoped to
+// the module so a future platform-cfg pass can narrow it to those items; the
+// real-kernel tests exercise the parts that matter here.
 #![allow(dead_code)]
 
 use serde_json::{Value, json};

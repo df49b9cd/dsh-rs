@@ -243,6 +243,7 @@ pub fn realize_with(
         ) {
             Ok(done) => EffectResult::ProcessDone {
                 exit_code: done.exit_code,
+                signal: done.signal,
                 stdout: done.stdout,
                 stderr: done.stderr,
                 truncated: done.truncated,
@@ -311,13 +312,105 @@ fn program_is_executable(program: &str) -> bool {
     }
 }
 
+/// Probe the platform's sandbox chain and assemble the boot facts.
+///
+/// The probe is **functional**, not an existence check: a runner can be
+/// installed and still unusable (an unprivileged-userns-disabled kernel is the
+/// common case), so each rung is asked to confine a trivial command and the
+/// verdict is whether that really ran. That is why this is a driver function
+/// and not a machine one — it spawns processes.
+///
+/// A chain of one is selected without probing, which `select_runner` already
+/// encodes: a sole candidate's own execution-time refusal is the fail-closed
+/// end, and demanding a probe verdict for it would fail on a host where the
+/// runner's *presence* is the only fact available (macOS, Windows).
+pub fn probe_sandbox(platform: &str) -> crate::machines::tool_bash::SandboxContext {
+    use crate::machines::sandbox_runner::{Runner, select_runner};
+    let selection = select_runner(Runner::chain(platform), &mut |runner| {
+        runner_usable(runner).then(|| runner.enforcement())
+    });
+    crate::machines::tool_bash::SandboxContext {
+        selection,
+        env: bash_env(),
+    }
+}
+
+/// The environment a model-authored command runs under.
+///
+/// `ProcessExec` does `env_clear` then the given pairs, so nothing is inherited
+/// — the server's environment holds provider credentials and must not reach a
+/// model-authored command. What remains is the fixed overrides plus the two
+/// facts a command genuinely needs: `PATH` (so `bash` can find its commands) and
+/// the managed `DSH_*` facts upstream exposes. `DSH_HOME` is resolved from the
+/// home the driver was given rather than read here, which is this module's usual
+/// convention.
+fn bash_env() -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = crate::machines::tool_bash::ENV_OVERRIDES
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+    // `PATH` is a process fact, resolved once here.
+    if let Ok(path) = std::env::var("PATH") {
+        env.push(("PATH".to_string(), path));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        env.push(("DSH_HOME".to_string(), home));
+    }
+    env.push((
+        "DSH_SHELL".to_string(),
+        crate::machines::tool_bash::DSH_SHELL.to_string(),
+    ));
+    env
+}
+
+/// Whether one runner can confine a trivial command on this host.
+///
+/// The probe runs the runner's *real* profile around `true` under `read-only`,
+/// so the answer is the kernel's rather than the binary's. `read-only` is the
+/// right probe mode because its profile references no workspace: it grants only
+/// `/dev/null`, so no session root is needed to ask the question.
+fn runner_usable(runner: crate::machines::sandbox_runner::Runner) -> bool {
+    use crate::machines::sandbox::Mode;
+    use crate::machines::sandbox_runner::profile_args;
+    let mut argv = vec![runner.program().to_string()];
+    argv.extend(profile_args(runner, Mode::ReadOnly, "/"));
+    argv.push("--".to_string());
+    argv.push("true".to_string());
+    std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 /// What one finished process reported.
 struct ProcessOutcome {
     exit_code: Option<i32>,
+    /// The signal that killed the child, when one did. A signal death reports no
+    /// exit code, so this is the only way a renderer can tell `[killed by
+    /// signal: N]` from an exit status the OS never produced.
+    signal: Option<i32>,
     stdout: String,
     stderr: String,
     truncated: bool,
     timed_out: bool,
+}
+
+/// The signal that terminated a child, when one did.
+///
+/// `None` on a platform without POSIX signals, and for a normal exit. Both are
+/// "no signal evidence", which is what the caller branches on.
+#[cfg(unix)]
+fn status_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn status_signal(_status: &std::process::ExitStatus) -> Option<i32> {
+    None
 }
 
 /// Run a process to completion, bounded in time and in output size.
@@ -427,9 +520,9 @@ fn run_process(
     let deadline =
         timeout_ms.map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
     let mut timed_out = false;
-    let exit_code = loop {
+    let (exit_code, signal) = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status.code(),
+            Ok(Some(status)) => break (status.code(), status_signal(&status)),
             Ok(None) => {}
             Err(e) => return Err(format!("failed to wait for {program}: {e}")),
         }
@@ -439,7 +532,7 @@ fn run_process(
             let _ = child.kill();
             timed_out = true;
             match child.wait() {
-                Ok(status) => break status.code(),
+                Ok(status) => break (status.code(), status_signal(&status)),
                 Err(e) => return Err(format!("failed to reap {program}: {e}")),
             }
         }
@@ -468,6 +561,7 @@ fn run_process(
 
     Ok(ProcessOutcome {
         exit_code,
+        signal,
         stdout: bound_text(stdout, bound),
         stderr: bound_text(stderr, bound),
         truncated,

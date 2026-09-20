@@ -24,7 +24,9 @@ parking_lot = "0.12"
 vocoder-spec-api = { path = "../vocoder-spec-api" }
 vocoder-session = { path = "../vocoder-session" }
 anyhow.workspace = true
+thiserror.workspace = true
 axum.workspace = true
+futures-util.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true

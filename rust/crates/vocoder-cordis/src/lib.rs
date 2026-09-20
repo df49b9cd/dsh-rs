@@ -161,6 +161,12 @@ pub enum EffectResult {
     /// fact the caller must be able to state.
     ProcessDone {
         exit_code: Option<i32>,
+        /// The signal that killed the child, when one did. Carried separately
+        /// because `exit_code` cannot express it: a signal death reports *no*
+        /// exit code, and a renderer that only saw `None` could not tell a
+        /// SIGTERM from a spawn that never produced a status — and would render
+        /// `[exit code: null]` for both.
+        signal: Option<i32>,
         stdout: String,
         stderr: String,
         /// Whether output was dropped by the byte bound or the timeout killed

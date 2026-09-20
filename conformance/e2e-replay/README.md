@@ -11,12 +11,18 @@ four hand-written cells:
 | `shell/no-console-errors` | no console/page errors during boot |
 | `shell/boot-payload` | `window.__DSH_BOOT__` is defined |
 
-Current baseline against vocoderd: 3/4. `shell/no-console-errors` fails with
-`web boot: window.__ModuleLoader__ bootstrap facade is missing` — vocoderd
-injects `__DSH_BOOT__` but not the module-loader facade the shell requires.
+Current baseline against vocoderd: **4/4**, and 4/4 against the control too
+(measured 2026-09-19). The cell that used to fail —
+`shell/no-console-errors`, with `web boot: window.__ModuleLoader__ bootstrap
+facade is missing` — now passes because the client-module pipeline landed:
+vocoderd composes the boot graph, serves the per-plugin bundles, injects the
+module-loader facade, and serves the `client-hmr` dev channel. See
+`rust/crates/vocoderd/src/web_boot.rs`.
 
-**These four cells do not move until M5.** Nothing in this directory makes the
-upstream suite run; the sections below say what would, and how far away it is.
+**The four cells pass, but the axis is still a boot smoke test, not the
+upstream-suite replay it is named for.** Nothing in this directory runs the
+`.e2e.ts` specs; the sections below say what that would take, and how far away
+it is.
 
 ## What the upstream suite actually needs
 
@@ -97,10 +103,10 @@ under-count. Two false positives found while building it are why the heuristic
 is deliberately strict: `dsh-llm` is a package *import*, and `subagents` in
 `preview-boot.e2e.ts` is a button label and a Playwright locator.
 
-## Blocker: the client-module pipeline (M5)
+## The client-module pipeline (M5) — landed
 
-`shell/no-console-errors` cannot pass until vocoderd serves the module-loader
-facade the shell bootstraps with. Upstream does not serve a static dist:
+`shell/no-console-errors` used to fail because vocoderd served a static dist
+with a stub `__DSH_BOOT__`. Upstream does not serve a static dist:
 `ClientModuleRegistry` (`dsh/packages/client/modules/src/index.ts`,
 `bootInjections()`) scans loaded entries for `dsh.client` declarations at
 runtime, builds a `WebBootGraph`, serves per-plugin bundles from its own batch
@@ -110,10 +116,23 @@ scripts, then the `__DSH_BOOT__` graph global. `dsh/apps/web/dist/` holds only
 `index.html`, one app chunk, one vendor chunk, CSS, fonts, langs, and
 `preview/`: no client-modules bundle and no per-plugin bundles.
 
-Do **not** stub it. A graph that appears to boot while composing no plugins
-would turn this axis green while testing nothing, which is worse than an honest
-3/4. Until then the other three cells still earn their place: they catch a host
-that fails to boot at all.
+vocoderd now reproduces that composer (`rust/crates/vocoderd/src/web_boot.rs`):
+the roster rule, the batch partition, the combo URL format, the facade script
+(byte-identical, test-checked against upstream's template), the graph fields,
+and the index injection order. The combo route serves real bundles and the
+indexed source-map form, and `GET /plugins/events` serves the dev channel's
+connect-time graph snapshot.
+
+It was **not** stubbed. A graph that appeared to boot while composing no plugins
+would turn this axis green while testing nothing — so the graph is the real
+53-entry composition, and the boot that renders the shell is a boot that loaded
+every plugin. Two boot-time gaps the live boot then exposed were closed the same
+way: the `open-in-app` host route and the `dynamicCordisRunner` namespace, both
+of which produced console errors this cell counts.
+
+**What remains is wiring, not a pipeline.** These four cells still do not run
+the upstream `.e2e.ts` specs; the classification below says which could run
+against a URL.
 
 ## Carriers (unchanged)
 

@@ -525,6 +525,13 @@ pub struct AgentMachine {
     /// rejected and leave the partial live forever. Carrying the summary is how
     /// the closing frame stays attributable after its decoder is gone.
     last_attempt: Option<(String, u64, u64)>,
+    /// The boot-resolved sandbox facts a confined `bash` call needs.
+    ///
+    /// Resolved by the driver (probing runners and the environment is I/O) and
+    /// handed in at mount. The default is fail-closed: a machine that was never
+    /// given a context refuses every command rather than running one unconfined,
+    /// which is what every test that drives the fs tools but not `bash` wants.
+    sandbox: super::tool_bash::SandboxContext,
 }
 
 impl AgentMachine {
@@ -543,7 +550,18 @@ impl AgentMachine {
             last_attempt: None,
             exec: None,
             tool_effect: None,
+            sandbox: super::tool_bash::SandboxContext::default(),
         }
+    }
+
+    /// The fail-closed default replaced with a resolved context.
+    ///
+    /// Mount is where a driver hands a machine its boot facts, so this is the
+    /// seam the real host uses and the tests do not — a test that runs `bash`
+    /// passes its own context here rather than resolving one.
+    pub fn with_sandbox(mut self, sandbox: super::tool_bash::SandboxContext) -> Self {
+        self.sandbox = sandbox;
+        self
     }
 
     /// The directory holding a session's log, once the tree has been walked.
@@ -1282,6 +1300,24 @@ impl AgentMachine {
             EffectResult::Stat {
                 canonical, is_dir, ..
             } => Ok(Answer::Stat { canonical, is_dir }),
+            // A confined command settled. Every field is carried to the
+            // renderer: the exit code and the signal are distinct (a signal
+            // death has no code), and `truncated` is not inferable from text.
+            EffectResult::ProcessDone {
+                exit_code,
+                signal,
+                stdout,
+                stderr,
+                truncated,
+                timed_out,
+            } => Ok(Answer::Process {
+                exit_code,
+                signal,
+                stdout,
+                stderr,
+                truncated,
+                timed_out,
+            }),
             // A missing target is its own answer rather than a failure, because
             // the tools branch on it: a `write` creates, a `read` refuses, and
             // each says so in its own words.
@@ -1293,6 +1329,11 @@ impl AgentMachine {
                     super::tool_exec::Effect::Stat { path }
                     | super::tool_exec::Effect::Read { path }
                     | super::tool_exec::Effect::Write { path, .. } => path,
+                    // A `bash` failure never reaches here: its spawn failure is
+                    // `Answer::Failed` (handled above), not `EffectError`. The
+                    // path is unused either way — only the message is rendered —
+                    // so a command's empty path is inert.
+                    super::tool_exec::Effect::Exec { .. } => "",
                 };
                 let _ = display_path(&fence.root, path);
                 Ok(Answer::Failed(e.message()))
@@ -1327,7 +1368,7 @@ impl AgentMachine {
         let mut state = state;
         let root = self.workspace_root(&state);
         let wants = match self.exec.as_mut() {
-            Some(exec) => exec.on_verdict(verdict, &root),
+            Some(exec) => exec.on_verdict(verdict, &root, &self.sandbox),
             None => Vec::new(),
         };
         let outs = self.absorb_tool_wants(&mut state, wants);
@@ -1386,7 +1427,9 @@ impl AgentMachine {
         }
         let fence = self.fence_for(state);
         let wants = match self.exec.as_mut() {
-            Some(exec) => exec.begin(&root, &fence),
+            // `exec` and `sandbox` are disjoint fields, so the shared borrow of
+            // the context can coexist with the mutable borrow of the executor.
+            Some(exec) => exec.begin(&root, &fence, &self.sandbox),
             None => return Vec::new(),
         };
         self.absorb_tool_wants(state, wants)
@@ -1441,6 +1484,23 @@ impl AgentMachine {
             Effect::Write { path, contents } => RealizeRequest::WriteText {
                 path: path.clone(),
                 contents: contents.clone(),
+            },
+            // The argv arrives already wrapped by the sandbox machine, so this is
+            // a plain spawn. No stdin is passed, matching the tool layer's
+            // reduction, and the output is bounded by bash's own byte cap.
+            Effect::Exec {
+                confined,
+                workdir,
+                env,
+                timeout_ms,
+                ..
+            } => RealizeRequest::ProcessExec {
+                argv: confined.argv.clone(),
+                workdir: Some(workdir.clone()),
+                env: env.clone(),
+                timeout_ms: Some(*timeout_ms),
+                stdout_max_bytes: Some(super::tool_bash::BASH_STDOUT_MAX_BYTES),
+                stdin: None,
             },
         };
         let id = self.cache.next_effect(&mut self.pending, &mut self.effects);
@@ -2465,6 +2525,231 @@ mod tests {
         "\"object\":\"chat.completion.chunk\"}\n\n",
         "data: [DONE]\n\n",
     );
+
+    /// A canned reply that calls `bash`, then answers.
+    ///
+    /// The `bash` counterpart of [`READ_THEN_ANSWER`]: one body proposes a
+    /// confined shell command, the second answers once its result is in the log.
+    const BASH_THEN_ANSWER: [&str; 2] = [
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],",
+            "\"created\":1,\"id\":\"c1\",\"model\":\"m\",\"object\":\"chat.completion.chunk\"}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_b1\",",
+            "\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"\"}}]},",
+            "\"finish_reason\":null,\"index\":0}],\"created\":1,\"id\":\"c1\",\"model\":\"m\",",
+            "\"object\":\"chat.completion.chunk\"}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,",
+            "\"function\":{\"arguments\":\"{\\\"command\\\":\\\"echo dsh-bash-e2e\\\",",
+            "\\\"description\\\":\\\"Prove bash runs\\\"}\"}}]},",
+            "\"finish_reason\":null,\"index\":0}],\"created\":1,\"id\":\"c1\",\"model\":\"m\",",
+            "\"object\":\"chat.completion.chunk\"}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\",\"index\":0}],",
+            "\"created\":1,\"id\":\"c1\",\"model\":\"m\",\"object\":\"chat.completion.chunk\"}\n\n",
+            "data: [DONE]\n\n",
+        ),
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],",
+            "\"created\":1,\"id\":\"c2\",\"model\":\"m\",\"object\":\"chat.completion.chunk\"}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"DONE\"},\"finish_reason\":\"stop\",\"index\":0}],",
+            "\"created\":1,\"id\":\"c2\",\"model\":\"m\",\"object\":\"chat.completion.chunk\"}\n\n",
+            "data: [DONE]\n\n",
+        ),
+    ];
+
+    /// **`bash` runs through the whole agent, confined by the kernel.**
+    ///
+    /// This is the test the sandbox runner seam has been waiting for: before it,
+    /// no tool executed code, so the runner had no consumer. The model asks to
+    /// run a command, the executor confines it via the real runner chain, the
+    /// driver spawns the wrapped argv, and the command's output lands in the log.
+    ///
+    /// It self-skips where no runner is usable, loudly, because such a host
+    /// leaves the claim untested rather than false — the same discipline
+    /// `sandbox_runner`'s own kernel tests use. On this host `bwrap` is present,
+    /// so it really runs.
+    #[test]
+    fn a_bash_call_runs_confined_through_the_whole_agent() {
+        let context = crate::driver::probe_sandbox(std::env::consts::OS);
+        if matches!(
+            context.selection,
+            super::super::sandbox_runner::Selection::Unavailable
+        ) {
+            eprintln!("SKIP: no sandbox runner is usable; bash end-to-end unverified");
+            return;
+        }
+        let work = tempfile::tempdir().expect("workspace");
+        let session_id = "session-bash";
+        let (_home, sessions) = session_home_in(session_id, work.path());
+        let mut machine = AgentMachine::new(
+            sessions.clone(),
+            vec![canned_provider_seq(&BASH_THEN_ANSWER)],
+        )
+        .with_sandbox(context);
+        let _ = machine.handle(MachineIn::ServicesReady { keys: vec![] });
+
+        let outs = drive(
+            &mut machine,
+            MachineIn::Event {
+                name: vocoder_cordis::EventName::new(rpc::call_event("agent")),
+                payload: json!({
+                    "method": "run",
+                    "args": {
+                        "sessionId": session_id,
+                        "requestId": "req-bash",
+                        "content": [{ "type": "text", "text": "run a command" }],
+                    },
+                }),
+            },
+        );
+        assert!(
+            matches!(reply_of(&outs), RpcReply::Ok { .. }),
+            "the turn is accepted: {outs:?}"
+        );
+
+        let rows = written_rows_in(&sessions, Some(work.path()), session_id);
+        // The command ran despite confinement — that is the whole point. A refusal
+        // would still produce a `tool/result`, so the assertion is on the text.
+        let result = rows
+            .iter()
+            .find(|r| r.get("type").and_then(Value::as_str) == Some("tool/result"))
+            .expect("the tool result row");
+        let text = result
+            .pointer("/data/message/content/0/content/0/text")
+            .and_then(Value::as_str)
+            .expect("the result text");
+        assert_eq!(
+            result.pointer("/data/message/content/0/isError"),
+            Some(&json!(false)),
+            "a confined command is a result, not an error: {result}"
+        );
+        assert!(
+            text.contains("dsh-bash-e2e"),
+            "the command's stdout reached the model: {text:?}"
+        );
+        // The tool call is recorded with the model's own arguments, and the turn
+        // continues to a second model call that answers.
+        let call = rows
+            .iter()
+            .find(|r| r.get("type").and_then(Value::as_str) == Some("tool/call"))
+            .expect("the tool call row");
+        assert_eq!(call.pointer("/data/name"), Some(&json!("bash")));
+        let messages: Vec<&Value> = rows
+            .iter()
+            .filter(|r| r.get("type").and_then(Value::as_str) == Some("assistant/message"))
+            .collect();
+        assert_eq!(messages.len(), 2, "two model calls, two messages");
+        assert_eq!(
+            messages[1].pointer("/data/message/content/0/text"),
+            Some(&json!("DONE")),
+            "the second call's answer"
+        );
+    }
+
+    /// **A confined command cannot write outside the workspace.** Under
+    /// `workspace-write` a write to a path outside the root is refused by the
+    /// kernel, and the observable world proves it: the file does not appear.
+    ///
+    /// This is the difference between testing the denial *message* and testing the
+    /// *confinement* — the message can be produced by a profile that enforced
+    /// nothing. Like the test above, it self-skips where no runner is usable.
+    #[test]
+    fn a_confined_bash_cannot_write_outside_the_workspace() {
+        let context = crate::driver::probe_sandbox(std::env::consts::OS);
+        if matches!(
+            context.selection,
+            super::super::sandbox_runner::Selection::Unavailable
+        ) {
+            eprintln!("SKIP: no sandbox runner is usable; confinement unverified");
+            return;
+        }
+        // A path outside the workspace **and outside `/tmp`**: the
+        // `workspace-write` profile replaces `/tmp` with a fresh tmpfs, so a
+        // write there fails with ENOENT (the path simply is not in the new
+        // mount) rather than exercising the read-only root. `/var/tmp` stays
+        // under the read-only `/` bind, so a write there is refused by the
+        // kernel with the runner's own `Read-only file system` signature — the
+        // dialect the denial classifier is built on.
+        let target =
+            std::path::Path::new("/var/tmp").join(format!("vocoder-fence-{}.txt", rpc::new_id()));
+        let work = tempfile::tempdir().expect("workspace");
+        let session_id = "session-bash-fence";
+        let (_home, sessions) = session_home_in(session_id, work.path());
+
+        // The command tries to write outside; if confinement holds it cannot.
+        // The command *is* the failing write, so its exit status is the denial's
+        // — the classifier is exit-gated, and a trailing successful statement
+        // would report exit 0 and match no signature (which is upstream's own
+        // contract, not a gap).
+        let bodies = [
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_x\",",
+                "\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":",
+                "\"{\\\"command\\\":\\\"touch OUTSIDE_PATH\\\",",
+                "\\\"description\\\":\\\"Attempt an outside write\\\"}\"}}]},",
+                "\"finish_reason\":\"tool_calls\",\"index\":0}],\"created\":1,\"id\":\"c1\",",
+                "\"model\":\"m\",\"object\":\"chat.completion.chunk\"}\n\n",
+                "data: [DONE]\n\n",
+            ),
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"DONE\"},",
+                "\"finish_reason\":\"stop\",\"index\":0}],\"created\":1,\"id\":\"c2\",",
+                "\"model\":\"m\",\"object\":\"chat.completion.chunk\"}\n\n",
+                "data: [DONE]\n\n",
+            ),
+        ];
+        // Substitute the outside path into the canned body (it is runtime data).
+        let body0 = bodies[0].replace("OUTSIDE_PATH", &target.to_string_lossy());
+        let dir = std::env::temp_dir().join(format!("voco-fence-{}", rpc::new_id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("body-0.txt"), &body0).expect("body 0");
+        std::fs::write(dir.join("body-1.txt"), bodies[1]).expect("body 1");
+        let route = Route {
+            config: ProviderConfig {
+                id: "canned".into(),
+                kind: ProviderKind::OpenAiChat,
+                base_url: format!("canned-seq://{}", dir.to_string_lossy()),
+                model: "test-model".into(),
+                api_key_env: None,
+            },
+        };
+
+        let mut machine = AgentMachine::new(sessions.clone(), vec![route]).with_sandbox(context);
+        let _ = machine.handle(MachineIn::ServicesReady { keys: vec![] });
+        let _ = drive(
+            &mut machine,
+            MachineIn::Event {
+                name: vocoder_cordis::EventName::new(rpc::call_event("agent")),
+                payload: json!({
+                    "method": "run",
+                    "args": {
+                        "sessionId": session_id,
+                        "requestId": "req-fence",
+                        "content": [{ "type": "text", "text": "try to escape" }],
+                    },
+                }),
+            },
+        );
+
+        // The kernel refused: the file the command tried to create does not exist.
+        assert!(
+            !target.exists(),
+            "the confined write escaped the workspace: {target:?} exists"
+        );
+        // Leave no trace if the assertion above would have let it through.
+        let _ = std::fs::remove_file(&target);
+        // And the model was told why, in the sandbox's own vocabulary.
+        let rows = written_rows_in(&sessions, Some(work.path()), session_id);
+        let text = rows
+            .iter()
+            .find(|r| r.get("type").and_then(Value::as_str) == Some("tool/result"))
+            .and_then(|r| r.pointer("/data/message/content/0/content/0/text"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            text.contains("file access denied"),
+            "the denial marker is present: {text:?}"
+        );
+    }
 
     /// A canned reply that calls `read` on a file, then answers.    ///
     /// Two bodies because the turn has two model calls: the first proposes the

@@ -211,8 +211,81 @@ pub fn catalog() -> Vec<ToolSpec> {
                 "required": ["file_path", "old_string", "new_string"],
             }),
         },
+        ToolSpec {
+            name: "bash",
+            description: BASH_DESCRIPTION,
+            input_schema: json!({
+                "type": "object",
+                // Unlike the fs tools, this schema does NOT set
+                // `additionalProperties: false`, mirroring upstream: undeclared
+                // keys are allowed through, which is exactly why the executor
+                // refuses an unadvertised `run_in_background` rather than relying
+                // on the schema to reject it.
+                "properties": {
+                    "command": { "type": "string", "description": "The bash command to execute." },
+                    "description": {
+                        "type": "string",
+                        "description": "Clear, concise description of what this command does in active voice, 5-10 words (shown in the UI). Examples: \"ls\" -> \"List files in current directory\"; \"git status\" -> \"Show working tree status\"; \"npm install\" -> \"Install package dependencies\".",
+                    },
+                    "timeoutMs": { "type": "number", "description": "Timeout in milliseconds. The executor applies its configured default and cap, and kills the command on expiry." },
+                    "workdir": { "type": "string", "description": "Working directory for this command. Defaults to the session workspace; a relative path is resolved against it." },
+                    // `run_in_background` is deliberately absent: this host has
+                    // no jobs service, so there is no `job_output` to collect a
+                    // background call. The description takes upstream's own
+                    // disabled-deployment sentence and the field is not offered —
+                    // offering it and refusing the call would teach the model the
+                    // tool exists and is broken.
+                    "sandbox_permissions": {
+                        "type": "string",
+                        "enum": escalation_targets(),
+                        "description": ESCALATION_PERMISSIONS_DESCRIPTION,
+                    },
+                    "justification": {
+                        "type": "string",
+                        "description": ESCALATION_JUSTIFICATION_DESCRIPTION,
+                    },
+                },
+                "required": ["command", "description"],
+            }),
+        },
     ]
 }
+
+/// The `bash` tool's description, upstream's `bashDescription` verbatim at
+/// `enableRunInBackground: false` with escalation advertised.
+///
+/// Copied rather than paraphrased because it is prompt text a model acts on: it
+/// teaches the fresh-shell contract, the exit marker, the sandbox denial marker,
+/// and — load-bearing for the escalation ladder — the sanctioned one-shot retry.
+/// A paraphrase would change what the model does on a denial without changing
+/// anything a test could see, which is exactly the kind of drift the corpus
+/// exists to prevent.
+///
+/// The disabled-background sentence (`Background execution is not available…`)
+/// and the escalation paragraph are both upstream's own `bashDescription`
+/// branches — this host composes the `enableRunInBackground: false` variant with
+/// `escalationModes.length > 0`.
+pub const BASH_DESCRIPTION: &str = concat!(
+    "Execute a bash command (`bash -c`) and return its stdout/stderr. ",
+    "Each call runs in a fresh shell: no state (cwd, variables, functions) persists between calls — ",
+    "pass `workdir` instead of using `cd`. Non-zero exits are reported as `[exit code: N]`. ",
+    "Current harness environment facts are exposed through managed `$DSH_*` variables; inspect them when needed. ",
+    "Commands may run under a file sandbox; a blocked file operation is reported as ",
+    "`[sandbox: file access denied under <mode> mode]` — a policy denial, not a bug in the command; do not retry another way. ",
+    "Long output is truncated to its tail; the full output is saved to a file whose path is reported when available. ",
+    "Background execution is not available; long-running commands must finish within the timeout. ",
+    "Attempting a command the sandbox may deny is safe and expected: run it and read the ",
+    "marker rather than assuming the denial. When a command is denied and a wider mode would let it ",
+    "succeed, escalate immediately in the same turn — the one sanctioned exception to a denial: retry ",
+    "the exact same command once with `sandbox_permissions` (the narrowest wider mode that suffices) ",
+    "plus a one-sentence `justification`. Do not detour through chat to ask permission first — the ",
+    "approval prompt raised by that retry is how the user consents. If the session states approval ",
+    "prompts are disabled, there is no exception: a denial is final — do not set `sandbox_permissions`. ",
+    "Never escalate speculatively: ground the request in a real denial — normally the one this command ",
+    "just hit; escalating up front is fine only when this session already denied the same access. ",
+    "A rejected escalation is final for that command — stop and explain, never work around ",
+    "it — but it does not forbid attempting or escalating other commands later.",
+);
 
 /// The escalation target names, as the schema's `enum` carries them.
 ///
@@ -897,6 +970,18 @@ pub enum Answer {
     /// The target does not exist. Distinct from [`Self::Failed`] because the
     /// tools branch on it: a `write` creates, a `read` refuses.
     NotFound,
+    /// A `ProcessExec` settled. Every field is a fact the bash renderer needs
+    /// and none is derivable from another: the exit code and the signal are
+    /// distinct (a signal death has no code), and `truncated` is not inferable
+    /// from the text.
+    Process {
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+        stdout: String,
+        stderr: String,
+        truncated: bool,
+        timed_out: bool,
+    },
     /// The effect failed, with the message the driver rendered.
     Failed(String),
 }
@@ -1574,9 +1659,20 @@ mod tests {
     #[test]
     fn the_catalog_is_small_and_executable() {
         let names: Vec<&str> = catalog().iter().map(|t| t.name).collect();
-        assert_eq!(names, vec!["read", "write", "edit"]);
+        assert_eq!(names, vec!["read", "write", "edit", "bash"]);
         for spec in catalog() {
             assert_eq!(spec.input_schema["type"], "object");
+            assert!(
+                spec.input_schema["properties"]
+                    .as_object()
+                    .is_some_and(|p| !p.is_empty()),
+                "{} advertises no properties",
+                spec.name
+            );
+        }
+        // The fs family resolves a path; `bash` takes a command instead, so the
+        // `file_path` property is a fact of those three and not of the catalog.
+        for spec in &catalog()[..3] {
             assert!(
                 spec.input_schema["properties"]["file_path"].is_object(),
                 "{} has no file_path",

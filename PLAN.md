@@ -134,9 +134,11 @@ run: see *Known gaps* below.
 
 - API controller machines (goals, sessions, workspace, settings) behind descriptors
 - [x] Static client asset serving (`--web-dist`); `window.__DSH_BOOT__` boot manifest
-- [ ] `conformance/e2e-replay` as a boot smoke test — 4 cells, **3/4 passing**.
-  The failure is real and diagnosed; see the M5 bullet on the client-module
-  pipeline. This is the honest ceiling until that pipeline exists.
+- [x] `conformance/e2e-replay` as a boot smoke test — 4 cells, **4/4 passing on
+  both hosts** (measured 2026-09-19). The one previously failing cell was real
+  and diagnosed (`web boot: window.__ModuleLoader__ bootstrap facade is
+  missing`); it now passes because the client-module pipeline landed (M5). The
+  cells still do not replay upstream `.e2e.ts` specs — see M5.
 - [x] Per-spec classification of the 98 upstream web specs — which can run
   against a URL, which need the in-process scaffold, which need the M5 pipeline.
   Measured by `conformance/e2e-replay/spec-classification.mjs` (`just
@@ -145,16 +147,19 @@ run: see *Known gaps* below.
   unimplemented namespace.
 
 **Exit:** the e2e axis reports what it actually measures — a 4-cell boot smoke
-test with its one failure named, plus a measured classification of the upstream
-suite it is named for — and the *non*-e2e business surface is complete for the
-namespaces that do not depend on the agent core.
+test that now passes on both hosts, plus a measured classification of the
+upstream suite it is named for — and the *non*-e2e business surface is complete
+for the namespaces that do not depend on the agent core.
 
 **Why the original exit criterion moved.** It read "e2e diff report exists and
 shrinks release-over-release", inherited from the intent to replay upstream's
 `apps/web/tests/*.e2e.ts`. That target is not reachable from here, for two
 reasons now established:
 
-1. The replay needs the **client-module pipeline** (below), which is M5 work.
+1. The replay needs the **client-module pipeline** (M5) — **since landed**: the
+   shell now boots against vocoderd, so this reason no longer holds. What
+   remains from it is the wiring of the 35 URL-only specs onto the axis, which
+   is M5 work rather than a missing pipeline.
 2. `launchWebScaffold` is not an HTTP adapter: it boots the real Cordis Loader
    *in-process* (`dsh/apps/web/tests/scaffold.ts`) and hands each test the live
    `Context`. 60 of the 98 upstream web specs consume that host-side surface
@@ -177,8 +182,8 @@ own CI runs the whole web lane that way (`scripts/run-gates.ts` runs
 `dsh/.github/workflows/ci.yml` carries no key at all). 94 of the 98 files never
 mention the key; across all of dsh only 11 `.e2e.ts` files self-skip for a
 missing key. The axis's ceiling is ~98 cells, not 4 — the obstacle is the
-in-process scaffold and the missing client-module pipeline, which are larger
-problems than a credential.
+in-process scaffold (which no adapter reaches) and the client-module pipeline
+which, since it landed, leaves the axis's wiring as the remaining work.
 
 ## M4 — Agent core
 
@@ -255,10 +260,11 @@ problems than a credential.
     escalation paths, and those fire only on `sandbox_permissions`. So the ask is
     raised by a *request to widen*, not by mutating — a gate that asked on every
     write would fill the log with questions no tool asked.
-  - **`read`/`write`/`edit` only, and the set is closed on purpose.** Upstream
-    composes ~30 tools; offering a name this host cannot execute teaches the
-    model that the tool exists and is broken. The 28 absent ones (`bash`,
-    `subagent`, `run_code`, …) are the honest boundary.
+  - **`read`/`write`/`edit` and now `bash`, and the set stays closed on
+    purpose.** Upstream composes ~30 tools; offering a name this host cannot
+    execute teaches the model that the tool exists and is broken. `bash` joined
+    the set when step 4 gave it a sandbox to run under (see below). The 27 still
+    absent (`subagent`, `run_code`, …) are the honest boundary.
   - **The rendered text is a contract, not a formatting choice.** The envelope,
     `1: line` numbering, EOF footer, truncation suffix, `Created`/`Updated`, and
     the two edit sentences are `tool-fs`'s verbatim, because the recorded corpus
@@ -267,9 +273,8 @@ problems than a credential.
     strict serial order (every tool here is `isConcurrencySafe`, and 215 of 221
     corpus steps make one call); `edit` has **no version guard**, so two
     concurrent editors could lose an update; and the fence is containment over a
-    model-controlled path, not a kernel boundary — which is exactly why no
-    `bash` is offered. Step 4's Landlock/seccomp machines are what would change
-    the last one.
+    model-controlled path, not a kernel boundary — which is why `bash` did not
+    join the catalog until step 4's kernel boundary existed to confine it.
   - **Unit and integration cells pass; the live probe is written and
     unrun.** `conformance/wire/tests/live_tools.rs` drives a real model into a
     real file read and asserts the follow-up request was accepted — but it needs
@@ -278,13 +283,35 @@ problems than a credential.
     dialect tests in `provider.rs` (which check the rendered body per dialect)
     rather than on a live acceptance. Stated here because it is the one part of
     this step that reading and fixtures cannot confirm.
-- [ ] sandbox machines (Landlock/seccomp native) (step 4) — **the runner seam
-  has landed**; nothing *calls* it yet. `machines/sandbox_runner.rs` reproduces
+- [x] sandbox machines (Landlock/seccomp native) (step 4) — **the runner seam
+  has landed and now has a consumer.** `machines/sandbox_runner.rs` reproduces
   upstream's `LocalSandboxProvider.confine` seam, which is already a machine's
   signature: argv + policy in, wrapped argv + classification metadata out. So
   the whole interesting half — chain selection, per-runner profiles, exit-gated
   runner-failure classification, the denial dialect — is pure and tested without
   spawning; the driver's half is a `Command::new`.
+  - **`bash` is the consumer** (`machines/tool_bash.rs`, 2026-09-20). It is the
+    host's first tool that executes code, which is exactly what the runner was
+    waiting for: a model-authored command is the untrusted code the kernel
+    sandbox exists to isolate. The tool's pure half (request parsing, the result
+    renderer, the escalation-refusal wording) is upstream's `tool-bash` +
+    `render.ts` verbatim; the executor confines the argv once, in
+    `tool_exec::start_bash`, and issues a `ProcessExec` carrying the wrapped argv.
+    Two kernel-backed agent tests now drive it end to end: a command runs
+    confined and its stdout reaches the model, and a confined write outside the
+    workspace is refused by the kernel (the target file does not appear) and
+    reported in the sandbox's own denial vocabulary.
+  - **What is reduced, and each is stated rather than hidden.** `seccomp` is not
+    implemented and upstream's Linux chain does not use it either (`bwrap` then
+    Landlock); `run_in_background` is not offered (no jobs service to collect it,
+    so the field is absent and the description takes upstream's own
+    disabled-deployment sentence); output is bounded by a byte cap with no spill
+    file, so the truncation suffix reports `(unavailable)` rather than a path;
+    and a turn cancel does not kill a running child, because the effects are
+    synchronous. The `bash` schema deliberately does **not** set
+    `additionalProperties: false` (upstream's does not either), which is why the
+    executor refuses an unadvertised `run_in_background` at runtime rather than
+    relying on the schema.
   - **Two new effects carry what a machine cannot do.** `ProcessExec` takes an
     argv that is *already wrapped*, so the driver never decides whether to
     confine; `ProbeProgram` answers usability as data. The first is where the
@@ -293,7 +320,8 @@ problems than a credential.
   - **The runner chain is real, and so is the fallback.** `bwrap` → Landlock on
     Linux, Seatbelt, Windows ACL; a chain of one is selected unprobed, a longer
     one is probed in preference order. `windows-acl` claims `partial`
-    enforcement, and the others `full`.
+    enforcement, and the others `full`. `driver::probe_sandbox` is the functional
+    probe (it runs the real profile around `true`), resolved once at mount.
   - **Verified against the kernel, not only against fixtures.** `bwrap` is
     present on this host, so the tests spawn a confined process and assert the
     *observable world* — under `read-only` the target file does not appear,
@@ -314,37 +342,56 @@ problems than a credential.
     examples are `{name, code}`, never the part). And the containment fence and
     the kernel profiles each derived writable roots separately, so they could
     disagree — now one shared function, for the reason upstream gives.
-  - **What is reduced.** `seccomp` is not implemented and no `bash` tool exists,
-    so nothing yet *calls* this seam: the fence still guards `read`/`write`/`edit`,
-    which execute no code. `ProbeProgram` is an existence-and-execute-bit check
-    rather than upstream's functional probe (which runs the real profile around
-    `true`) — because probing by execution would mean the host spawns an
-    arbitrary path a machine named, which is the thing the probe exists to
-    decide. The Windows ACL rung is written but unexercised on Linux, and the
-    Landlock launcher is unreachable here for the same reason (bwrap wins the
-    chain), so both rest on upstream's recorded dialects rather than on this
-    host's kernel. The `partial` ABI-reporting path is likewise tested through
-    the fixture's shape rather than a real older-ABI kernel.
+  - **What is still reduced.** `seccomp` is not implemented (see *Known gaps*).
+    The Windows ACL rung is written but unexercised on Linux, and the Landlock
+    launcher is unreachable here for the same reason (bwrap wins the chain), so
+    both rest on upstream's recorded dialects rather than on this host's kernel.
+    The `partial` ABI-reporting path is likewise tested through the fixture's
+    shape rather than a real older-ABI kernel. And `bash` is the *only* code
+    executor: the other 27 upstream tools (`subagent`, `run_code`, …) remain
+    absent, so the model cannot yet reach a subagent or a Python block.
 
 ## M5 — Plugin interop
 
 - Typert-over-subprocess machine ("vocoder plugin ABI") — already the default
   shape; M5 is productionizing, not researching
-- **Client-module pipeline** — the prerequisite for a working web GUI, and the
-  reason e2e-replay is stuck at 3/4. Upstream does not serve a static dist:
-  `ClientModuleRegistry` (`dsh/packages/client/modules/src/index.ts`,
+- [x] **Client-module pipeline** — landed 2026-09-19; e2e-replay moved 3/4 → 4/4
+  with zero console errors, on both hosts. Upstream does not serve a static
+  dist: `ClientModuleRegistry` (`dsh/packages/client/modules/src/index.ts`,
   `bootInjections()`) scans loaded entries for `dsh.client` declarations at
   runtime, builds a `WebBootGraph`, serves each plugin's client bundle from its
   own batch routes, and *generates* the index injection table — the inline
   `__ModuleLoader__` registration queue, the application preloads, the blocking
-  bootstrap scripts, and finally the `__DSH_BOOT__` graph global. vocoderd serves
-  `apps/web/dist/` as static files (which holds only `index.html`, one app chunk,
-  one vendor chunk, CSS, fonts, and languages — **no client-modules bundle and no
-  per-plugin bundles**) and injects a stub `__DSH_BOOT__`, so the shell throws
-  `web boot: window.__ModuleLoader__ bootstrap facade is missing` before mount.
-  Building this is what moves e2e-replay from 3/4 toward 4/4.
+  bootstrap scripts, and finally the `__DSH_BOOT__` graph global.
+  `rust/crates/vocoderd/src/web_boot.rs` reproduces the composer: the roster
+  rule (declared ∩ patch-enabled, plus the runtime-resolved picker backend), the
+  module-graph ordering, the batch partition, the combo URL format (script and
+  indexed source-map forms served from real built bundles), the facade script
+  (byte-identical, test-checked against upstream's own template), and the index
+  injection order.
+  - **It was not stubbed, and that is the point.** A stub `__DSH_BOOT__` that
+    composed no plugins would have turned the axis green while testing nothing.
+    The graph is the real 53-entry composition, so a boot that renders the
+    shell is a boot that loaded every plugin.
+  - **Two boot-time gaps the live boot exposed, closed the same way** (each was a
+    console error the cell counts): the `open-in-app` host route
+    (`GET /open-in-app/apps`, the Linux locator subset — `cli`/`file`/`desktop`
+    — ported with the SSH and display gates), and the `dynamicCordisRunner`
+    namespace (an empty registry, answering `[]`/`null`, is the control's own
+    answer before a dynamic plugin is defined). Coverage moved 74/87 → 86/87;
+    only `fileUploads/upload` remains.
+  - **What this does not do.** The e2e axis still runs four hand-written cells,
+    not the 35 URL-only upstream specs; wiring those is the remaining M5 work.
+    The 60 in-process specs stay unreachable by any adapter (see M3).
+  - **Reduced, and it was measured not assumed:** entry order is emitted
+    sorted-then-topologically (upstream's exact order comes from a 971-line
+    two-layer config merge and is not boot-observable — `bootClient` creates
+    every row through `Promise.all`), revs are a dependency-free hash rather
+    than sha1 (an opaque per-boot cache key, never a wire contract), and there
+    is no HMR rebuild path (the graph composes once; `/plugins/events` serves
+    the connect snapshot and never a `rebuilt` frame).
 - Composition-replay axis reaches full profile coverage
-- Optional JS-compat island (rquickjs) scoped to `Out::SpawnScope` subtrees
+- [ ] Optional JS-compat island (rquickjs) scoped to `Out::SpawnScope` subtrees
 
 ## Known gaps
 
@@ -368,10 +415,12 @@ than it is:
   has no such endpoint. Covered by unit tests in `machines/agent_teams.rs`.
 - **The generated `traits.rs` façade is still unused** (see M1) — now a choice
   rather than a gap, since the validator covers the untyped-extraction class.
-- **e2e-replay does not replay upstream specs** (see M3). Two independent gaps
-  block it, both larger than a credential: the missing `__ModuleLoader__`
-  pipeline (M5) and the in-process `launchWebScaffold` that 60 of the 98 specs
-  depend on. Its one failing cell is a real product gap, not a missing assertion.
+- **e2e-replay does not replay upstream specs** (see M3). Its four cells are now
+  all green on both hosts, but they are hand-written, not the upstream suite.
+  One obstacle remains reachable and one does not: the in-process
+  `launchWebScaffold` that 60 of the 98 specs depend on (no adapter reaches it),
+  and the wiring of the 35 URL-only specs onto the axis — the `__ModuleLoader__`
+  pipeline that also blocked this is now landed (M5).
 - **Composition traces are hand-authored**, not recorded from JS (see M5).
 - **`session-replay` has no suite directory**; its tests live in
   `rust/crates/vocoder-session/tests/interop.rs`.
@@ -386,22 +435,26 @@ than it is:
   this host keeps no per-session observation state, so a read-modify-write race
   can lose an update. Sound today only because the executor is serial and the
   model is the sole writer.
-- **The confinement fence is containment, not a kernel boundary** (see M4 step
-  3). That is upstream's own framing for `fs-sandbox` too. The kernel boundary
-  now *exists* (step 4) but nothing calls it: the fence guards `read`/`write`/
-  `edit`, which execute no code, and `bash` is still absent from the catalog. So
-  the two are not yet joined — the runner seam is the answer to a question no
-  live call is asking.
-- **The sandbox runner seam has no consumer** (see M4 step 4). Its module carries
-  `#![allow(dead_code)]` for that reason, and the three real-kernel tests are the
-  only thing exercising it end to end. Wiring it needs a tool that executes code,
-  which is the same prerequisite `bash` has always had.
+- **The confinement fence and the kernel boundary are now joined for `bash`**
+  (see M4 steps 3–4). `read`/`write`/`edit` still move no bytes a kernel filter
+  would govern — they execute no code — and the containment fence remains
+  containment for them. But `bash` is where the kernel boundary does the work,
+  and it is joined there: the argv is wrapped by the runner chain before it
+  leaves the machine, and the two kernel-backed agent tests assert the
+  *observable world* (an outside write does not land). Upstream's own framing —
+  that `fs-sandbox` is containment — still stands for the fs family.
 - **`seccomp` is not implemented** (see M4 step 4), despite the plan item naming
   it. Upstream's Linux chain does not use seccomp either — it is `bwrap` then
   Landlock — so the vocabulary in this item was wrong, not merely incomplete.
   Syscall filtering is a strictly narrower mechanism than the file-effect mode
   vocabulary the rest of the sandbox speaks, and nothing in the corpus asks for
   one.
+- **`bash` is the only code executor, and it is reduced** (see M4 step 4). Its
+  argv is confined and its output is bounded, but `run_in_background` is not
+  offered (no jobs service), output does not spill to a file (the truncation
+  suffix names `(unavailable)` rather than a path), there is no stdin, and a
+  turn cancel does not kill a running child. The Windows ACL rung and the
+  Landlock launcher are written but unexercised on this Linux host.
 
 ## Spec parity gate (CI)
 

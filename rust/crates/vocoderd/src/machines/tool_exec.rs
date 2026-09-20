@@ -93,6 +93,18 @@ pub enum Effect {
     Read { path: String },
     /// Write a file's text.
     Write { path: String, contents: String },
+    /// Run a model-authored command whose argv is **already wrapped** by
+    /// [`super::sandbox_runner::confine`]. The whole [`ConfinedArgv`] travels
+    /// rather than just the argv, because classifying what the run produces
+    /// depends on which runner wrapped it — re-deriving the runner in
+    /// `on_effect` would repeat a decision rather than carry it.
+    Exec {
+        confined: super::sandbox_runner::ConfinedArgv,
+        mode: super::sandbox::Mode,
+        workdir: String,
+        env: Vec<(String, String)>,
+        timeout_ms: u64,
+    },
 }
 
 /// Which tool a pipeline is running, once the target is resolved.
@@ -147,6 +159,19 @@ enum Stage {
         call_display: String,
         /// The write's own renderer inputs.
         render: Render,
+    },
+    /// A confined command is out. Carries everything the result renderer needs,
+    /// because classification and rendering both happen on the answer and
+    /// nothing else survives the wait. The call itself is not carried: the
+    /// queue still owns it, and `finish_call` reads it from there.
+    Executing {
+        request: super::tool_bash::BashRequest,
+        mode: super::sandbox::Mode,
+        enforcement: super::sandbox_runner::Enforcement,
+        /// The runner's dialect, so the settled process can be classified as a
+        /// denial or a runner failure rather than a plain nonzero exit.
+        denial_signatures: Vec<&'static str>,
+        runner_failure_rules: Vec<super::sandbox_runner::RunnerFailureRule>,
     },
 }
 
@@ -210,8 +235,15 @@ impl Executor {
     /// Start the next call: either an effect, an ask, or a refusal.
     ///
     /// `root` is the session's workspace root, which the fence needs and the
-    /// machine resolves from the log's header row.
-    pub fn begin(&mut self, root: &str, fence: &Fence) -> Vec<ExecutorOut> {
+    /// machine resolves from the log's header row. `sandbox` carries the
+    /// boot-resolved runner selection and command environment, because a
+    /// confined command (`bash`) needs both and a machine may not resolve them.
+    pub fn begin(
+        &mut self,
+        root: &str,
+        fence: &Fence,
+        sandbox: &super::tool_bash::SandboxContext,
+    ) -> Vec<ExecutorOut> {
         if self.stage.is_some() {
             return Vec::new();
         }
@@ -237,7 +269,7 @@ impl Executor {
                 outs
             }
             Gate::Allow => {
-                let outs = self.start(&call, args, fence.clone(), root);
+                let outs = self.start(&call, args, fence.clone(), root, sandbox);
                 let mut rows = vec![self.call_row(&call)];
                 rows.extend(outs);
                 rows
@@ -274,7 +306,12 @@ impl Executor {
     /// how the emitter writes the audit pair with the same identity the answerer
     /// recorded — the approval machine owns the id because it owns the decision,
     /// and this machine owns the log, so the id has to travel between them.
-    pub fn on_verdict(&mut self, verdict: &Value, root: &str) -> Vec<ExecutorOut> {
+    pub fn on_verdict(
+        &mut self,
+        verdict: &Value,
+        root: &str,
+        sandbox: &super::tool_bash::SandboxContext,
+    ) -> Vec<ExecutorOut> {
         let Some(Stage::Asking {
             call, args, fence, ..
         }) = self.stage.take()
@@ -320,9 +357,22 @@ impl Executor {
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             let widened = super::tool::escalated_fence(&fence, requested);
-            outs.extend(self.start(&call, args, widened, root));
+            outs.extend(self.start(&call, args, widened, root, sandbox));
         } else {
-            outs.extend(self.finish_call(super::tool::approval_denial(&call.name, &outcome)));
+            // Bash words an escalation refusal its own way (`this command to
+            // "<mode>"`); the filesystem family says `tool "<name>"`. The corpus
+            // records both, so the mapping is per-family rather than shared.
+            let requested = args
+                .as_object()
+                .and_then(|a| a.get("sandbox_permissions"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let outcome = if call.name == "bash" {
+                super::tool_bash::escalation_denial(requested, &outcome)
+            } else {
+                super::tool::approval_denial(&call.name, &outcome)
+            };
+            outs.extend(self.finish_call(outcome));
         }
         outs
     }
@@ -503,6 +553,86 @@ impl Executor {
                 Ok(Answer::Failed(m)) => self.finish_call(Outcome::denied(m)),
                 _ => self.finish_call(Outcome::denied("the write did not land")),
             },
+            // The command settled: classify the sandbox, then render.
+            (
+                Stage::Executing {
+                    request,
+                    mode,
+                    enforcement,
+                    denial_signatures,
+                    runner_failure_rules,
+                },
+                Effect::Exec { .. },
+            ) => {
+                let done = match answer {
+                    Ok(Answer::Process {
+                        exit_code,
+                        signal,
+                        stdout,
+                        stderr,
+                        truncated,
+                        timed_out,
+                    }) => (exit_code, signal, stdout, stderr, truncated, timed_out),
+                    // A spawn failure is not a command that failed — no command
+                    // ran. It is the runner being unusable, the same class as a
+                    // missing backend, and it carries the same structured error.
+                    Ok(Answer::Failed(m)) => {
+                        return self.finish_call(
+                            Outcome::denied(
+                                super::sandbox_runner::Unavailable {
+                                    mode,
+                                    runner_detail: Some(m),
+                                }
+                                .message(),
+                            )
+                            .with_error(super::tool::sandbox_unavailable()),
+                        );
+                    }
+                    _ => {
+                        return self
+                            .finish_call(Outcome::denied("the command gave an unexpected answer"));
+                    }
+                };
+                let (exit_code, signal, stdout, stderr, truncated, timed_out) = done;
+                // Runner failure outranks denial: if the sandbox never started,
+                // nothing was denied, and the model must not read it as its
+                // command's fault. Exit-gated and signature-matched, so a plain
+                // nonzero exit is neither.
+                if let Some(m) = super::sandbox_runner::classify_runner_failure(
+                    exit_code,
+                    &stderr,
+                    &runner_failure_rules,
+                ) {
+                    return self.finish_call(
+                        Outcome::denied(
+                            super::sandbox_runner::Unavailable {
+                                mode,
+                                runner_detail: Some(m.detail),
+                            }
+                            .message(),
+                        )
+                        .with_error(super::tool::sandbox_unavailable()),
+                    );
+                }
+                let denied = super::sandbox_runner::matches_signature(
+                    exit_code,
+                    &stderr,
+                    &denial_signatures,
+                );
+                let run = super::tool_bash::BashRun {
+                    exit_code,
+                    signal,
+                    timed_out,
+                    timeout_ms: request.timeout_ms,
+                    stdout,
+                    stderr,
+                    truncated,
+                    denied,
+                    mode,
+                    enforcement,
+                };
+                self.finish_call(super::tool_bash::bash_outcome(&run, true))
+            }
             (stage, _) => {
                 self.stage = Some(stage);
                 Vec::new()
@@ -511,13 +641,23 @@ impl Executor {
     }
 
     /// Resolve the target, then read or write as the tool needs.
+    ///
+    /// `bash` diverges here: it has no filesystem target to resolve, and its
+    /// confinement is decided *once*, now, rather than after a `Stat`. That is
+    /// what makes the fail-closed contract structural — there is no arm that
+    /// hands a confined mode its original argv, and the unavailable case never
+    /// reaches an effect at all.
     fn start(
         &mut self,
         call: &Call,
         args: Arguments,
         fence: Fence,
         root: &str,
+        sandbox: &super::tool_bash::SandboxContext,
     ) -> Vec<ExecutorOut> {
+        if call.name == "bash" {
+            return self.start_bash(&args, &fence, root, sandbox);
+        }
         let acting = match call.name.as_str() {
             "read" => match read_window(&args, root) {
                 Ok(window) => Acting::Read { window },
@@ -553,7 +693,68 @@ impl Executor {
         vec![ExecutorOut::Effect(Effect::Stat { path })]
     }
 
-    /// Run the next effect for a resolved target.
+    /// Confine a `bash` command and issue the exec effect, or fail closed.
+    ///
+    /// The confinement decision happens exactly once, here. Three outcomes:
+    ///
+    /// - A malformed call or a background request is a call failure (no effect).
+    /// - A confining mode with no usable runner is a **fail-closed** refusal —
+    ///   no effect is issued, so an unconfined command cannot run. The result
+    ///   carries `SandboxUnavailableError`, the one bash failure with a
+    ///   structured `data.error`.
+    /// - Otherwise the argv is wrapped and the exec effect is issued; the runner
+    ///   metadata travels with it so the settled process can be classified.
+    fn start_bash(
+        &mut self,
+        args: &Arguments,
+        fence: &Fence,
+        root: &str,
+        sandbox: &super::tool_bash::SandboxContext,
+    ) -> Vec<ExecutorOut> {
+        let request = match super::tool_bash::bash_request(args, root) {
+            Ok(request) => request,
+            Err(message) => return self.finish_call(Outcome::denied(message)),
+        };
+        // The schema does not advertise `run_in_background`, but the schema also
+        // does not forbid extra keys, so a call can still carry it — and there is
+        // no jobs service here to collect a background run. Refuse it rather
+        // than silently running it in the foreground.
+        if request.background {
+            return self.finish_call(Outcome::denied(super::tool_bash::BACKGROUND_UNAVAILABLE));
+        }
+        // A model command is `bash -c <command>`, a fresh shell per call.
+        let argv = vec![
+            "bash".to_string(),
+            "-c".to_string(),
+            request.command.clone(),
+        ];
+        match super::sandbox_runner::confine(&argv, fence.mode(), root, &sandbox.selection) {
+            Err(unavailable) => self.finish_call(
+                Outcome::denied(unavailable.message())
+                    .with_error(super::tool::sandbox_unavailable()),
+            ),
+            Ok(confined) => {
+                let mode = fence.mode();
+                let enforcement = confined.enforcement;
+                let denial_signatures = confined.denial_signatures.clone();
+                let runner_failure_rules = confined.runner_failure_rules.clone();
+                self.stage = Some(Stage::Executing {
+                    request: request.clone(),
+                    mode,
+                    enforcement,
+                    denial_signatures,
+                    runner_failure_rules,
+                });
+                vec![ExecutorOut::Effect(Effect::Exec {
+                    confined,
+                    mode,
+                    workdir: request.workdir.clone(),
+                    env: sandbox.env.clone(),
+                    timeout_ms: request.timeout_ms,
+                })]
+            }
+        }
+    }
     fn act(
         &mut self,
         call: &Call,
@@ -724,6 +925,15 @@ mod tests {
         Fence::new(Mode::WorkspaceWrite, "/w")
     }
 
+    /// The fail-closed sandbox a test that does not run `bash` uses.
+    ///
+    /// Every fs-tool test wants this: the executor resolves confinement only for
+    /// `bash`, so an unavailable runner is inert — it refuses a command rather
+    /// than changing how a `read` or `write` behaves.
+    fn sandbox() -> super::super::tool_bash::SandboxContext {
+        super::super::tool_bash::SandboxContext::default()
+    }
+
     /// The effects an executor asked for, in order.
     fn effects(outs: &[ExecutorOut]) -> Vec<Effect> {
         outs.iter()
@@ -753,11 +963,19 @@ mod tests {
         rows(outs)[n].1.clone()
     }
 
+    /// The model-facing text of the nth row's single content block.
+    fn text_of(outs: &[ExecutorOut], n: usize) -> String {
+        data(outs, n)["message"]["content"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
     /// A read resolves, fences, reads, and renders — one call, three effects.
     #[test]
     fn a_read_resolves_then_reads() {
         let mut e = Executor::new(vec![call("read", json!({ "file_path": "a.txt" }))], 1, 1);
-        let outs = e.begin("/w", &fence());
+        let outs = e.begin("/w", &fence(), &sandbox());
         assert_eq!(row_types(&outs), vec!["tool/call"]);
         assert_eq!(
             effects(&outs),
@@ -805,7 +1023,7 @@ mod tests {
     #[test]
     fn a_missing_read_names_the_path() {
         let mut e = Executor::new(vec![call("read", json!({ "file_path": "gone.txt" }))], 1, 1);
-        e.begin("/w", &fence());
+        e.begin("/w", &fence(), &sandbox());
         e.observe_row("tool/call", 1);
         let outs = e.on_effect(
             &Effect::Stat {
@@ -826,7 +1044,7 @@ mod tests {
     #[test]
     fn a_directory_is_not_a_regular_file() {
         let mut e = Executor::new(vec![call("read", json!({ "file_path": "d" }))], 1, 1);
-        e.begin("/w", &fence());
+        e.begin("/w", &fence(), &sandbox());
         e.observe_row("tool/call", 1);
         let outs = e.on_effect(
             &Effect::Stat {
@@ -857,7 +1075,7 @@ mod tests {
             1,
             1,
         );
-        let outs = e.begin("/w", &fence());
+        let outs = e.begin("/w", &fence(), &sandbox());
         assert_eq!(effects(&outs).len(), 1);
         e.observe_row("tool/call", 1);
 
@@ -906,7 +1124,7 @@ mod tests {
             1,
             1,
         );
-        e.begin("/w", &fence());
+        e.begin("/w", &fence(), &sandbox());
         e.observe_row("tool/call", 1);
         let outs = e.on_effect(
             &Effect::Stat {
@@ -955,7 +1173,7 @@ mod tests {
             1,
             1,
         );
-        e.begin("/w", &fence());
+        e.begin("/w", &fence(), &sandbox());
         e.observe_row("tool/call", 1);
         let outs = e.on_effect(
             &Effect::Stat {
@@ -1006,7 +1224,7 @@ mod tests {
             1,
             1,
         );
-        e.begin("/w", &fence());
+        e.begin("/w", &fence(), &sandbox());
         e.observe_row("tool/call", 1);
         e.on_effect(
             &Effect::Stat {
@@ -1049,7 +1267,7 @@ mod tests {
             1,
             1,
         );
-        e.begin("/w", &fence());
+        e.begin("/w", &fence(), &sandbox());
         e.observe_row("tool/call", 1);
         let outs = e.on_effect(
             &Effect::Stat {
@@ -1074,15 +1292,19 @@ mod tests {
 
     /// An unknown tool is a call failure, and it still gets a `tool/call` row:
     /// the model made the call, and the log records what happened.
+    ///
+    /// `subagent` stands in for the ~27 upstream tools this host deliberately
+    /// does not compose — it is the honest example of an absent name now that
+    /// `bash` is implemented.
     #[test]
     fn an_unknown_tool_is_a_result_not_a_turn_failure() {
-        let mut e = Executor::new(vec![call("bash", json!({ "command": "ls" }))], 1, 1);
-        let outs = e.begin("/w", &fence());
+        let mut e = Executor::new(vec![call("subagent", json!({ "command": "ls" }))], 1, 1);
+        let outs = e.begin("/w", &fence(), &sandbox());
         assert_eq!(row_types(&outs), vec!["tool/call", "tool/result"]);
         assert!(effects(&outs).is_empty());
         assert_eq!(
             data(&outs, 1)["message"]["content"][0]["content"][0]["text"],
-            "Error: unknown tool \"bash\""
+            "Error: unknown tool \"subagent\""
         );
         // The call's own arguments are preserved in the row, unparsed by this
         // host, because they are what the model actually sent.
@@ -1101,7 +1323,7 @@ mod tests {
             1,
             1,
         );
-        let outs = e.begin("/w", &fence());
+        let outs = e.begin("/w", &fence(), &sandbox());
         assert!(
             !outs
                 .iter()
@@ -1128,7 +1350,7 @@ mod tests {
             1,
             1,
         );
-        let outs = e.begin("/w", &ro);
+        let outs = e.begin("/w", &ro, &sandbox());
         assert_eq!(row_types(&outs), vec!["tool/call"]);
         let dispatch = outs
             .iter()
@@ -1149,6 +1371,7 @@ mod tests {
         let outs = e.on_verdict(
             &json!({ "outcome": "allowed-once", "approvalId": "approval-1" }),
             "/w",
+            &sandbox(),
         );
         assert_eq!(
             row_types(&outs),
@@ -1181,10 +1404,11 @@ mod tests {
             1,
             1,
         );
-        e.begin("/w", &ro);
+        e.begin("/w", &ro, &sandbox());
         let outs = e.on_verdict(
             &json!({ "outcome": "rejected", "approvalId": "approval-7" }),
             "/w",
+            &sandbox(),
         );
         assert_eq!(
             row_types(&outs),
@@ -1221,7 +1445,7 @@ mod tests {
             1,
             1,
         );
-        e.begin("/w", &ro);
+        e.begin("/w", &ro, &sandbox());
         let outs = e.on_verdict(
             &json!({
                 "outcome": "unavailable",
@@ -1229,6 +1453,7 @@ mod tests {
                 "reason": "escalate sandbox to workspace-write: the user asked",
             }),
             "/w",
+            &sandbox(),
         );
         assert!(effects(&outs).is_empty(), "a denied call must not run");
         assert_eq!(
@@ -1267,8 +1492,8 @@ mod tests {
             1,
             1,
         );
-        e.begin("/w", &ro);
-        let outs = e.on_verdict(&json!({ "outcome": "unavailable" }), "/w");
+        e.begin("/w", &ro, &sandbox());
+        let outs = e.on_verdict(&json!({ "outcome": "unavailable" }), "/w", &sandbox());
         assert_eq!(row_types(&outs), vec!["tool/result"]);
     }
 
@@ -1284,7 +1509,7 @@ mod tests {
             1,
             1,
         );
-        let outs = e.begin("/w", &fence());
+        let outs = e.begin("/w", &fence(), &sandbox());
         assert_eq!(row_types(&outs), vec!["tool/call", "tool/result"]);
         assert!(
             !outs
@@ -1311,7 +1536,7 @@ mod tests {
             1,
             1,
         );
-        let outs = e.begin("/w", &fence());
+        let outs = e.begin("/w", &fence(), &sandbox());
         e.observe_row("tool/call", 1);
         assert_eq!(
             effects(&outs)[0],
@@ -1340,7 +1565,7 @@ mod tests {
         // what keeps a call's rows contiguous.
         assert!(effects(&outs).is_empty());
 
-        let outs = e.begin("/w", &fence());
+        let outs = e.begin("/w", &fence(), &sandbox());
         assert_eq!(row_types(&outs), vec!["tool/call"]);
         assert_eq!(
             effects(&outs)[0],
@@ -1348,5 +1573,208 @@ mod tests {
                 path: "/w/b.txt".into()
             }
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // bash: the host's first tool that executes code, and the one that makes
+    // the kernel sandbox load-bearing. These drive the seam end to end without
+    // spawning: the executor decides confinement, asks for the exec effect, and
+    // classifies the settled process the answer describes.
+    // -----------------------------------------------------------------------
+
+    /// A sandbox context whose runner really confines (`bwrap`, full).
+    fn confining() -> super::super::tool_bash::SandboxContext {
+        use super::super::sandbox_runner::{Enforcement, Runner, Selection};
+        super::super::tool_bash::SandboxContext {
+            selection: Selection::Confined(Runner::Bwrap, Enforcement::Full),
+            env: vec![("PATH".into(), "/usr/bin".into())],
+        }
+    }
+
+    fn bash_call(args: Value) -> Call {
+        call("bash", args)
+    }
+
+    /// A well-formed command is confined and issues exactly one exec effect,
+    /// carrying the wrapped argv and the runner's own metadata.
+    #[test]
+    fn a_command_is_confined_then_run() {
+        let mut e = Executor::new(
+            vec![bash_call(
+                json!({ "command": "echo hi", "description": "Say hi" }),
+            )],
+            1,
+            1,
+        );
+        let outs = e.begin("/w", &fence(), &confining());
+        assert_eq!(row_types(&outs), vec!["tool/call"]);
+        let Effect::Exec {
+            confined,
+            mode,
+            workdir,
+            env,
+            timeout_ms,
+        } = &effects(&outs)[0]
+        else {
+            panic!("expected an exec effect, got {:?}", effects(&outs));
+        };
+        // The argv is `bwrap <profile> -- bash -c <command>`: already wrapped, so
+        // the driver spawns it without deciding anything.
+        assert_eq!(confined.argv[0], "bwrap");
+        assert_eq!(
+            &confined.argv[confined.argv.len() - 3..],
+            &["bash", "-c", "echo hi"]
+        );
+        assert_eq!(*mode, Mode::WorkspaceWrite);
+        assert_eq!(workdir, "/w");
+        assert_eq!(env, &vec![("PATH".to_string(), "/usr/bin".to_string())]);
+        assert_eq!(
+            *timeout_ms,
+            super::super::tool_bash::BASH_DEFAULT_TIMEOUT_MS
+        );
+        assert!(!e.finished(), "the command is still out");
+    }
+
+    /// A plain exit renders the body and no marker — the corpus's own shape.
+    #[test]
+    fn a_settled_command_renders_its_output() {
+        let mut e = Executor::new(
+            vec![bash_call(
+                json!({ "command": "echo hi", "description": "Say hi" }),
+            )],
+            1,
+            1,
+        );
+        let outs = e.begin("/w", &fence(), &confining());
+        let effect = effects(&outs)[0].clone();
+        let outs = e.on_effect(
+            &effect,
+            Ok(Answer::Process {
+                exit_code: Some(0),
+                signal: None,
+                stdout: "hi\n".into(),
+                stderr: String::new(),
+                truncated: false,
+                timed_out: false,
+            }),
+        );
+        assert_eq!(row_types(&outs), vec!["tool/result"]);
+        let text = text_of(&outs, 0);
+        assert_eq!(text, "hi\n");
+        // A nonzero exit is reported, not errored; so is a denial.
+        assert!(e.finished());
+    }
+
+    /// A denial is classified from the runner's dialect: `bwrap`'s kernel says
+    /// `Read-only file system`, and the marker plus the escalation hint follow.
+    #[test]
+    fn a_denied_command_is_classified_from_the_dialect() {
+        let mut e = Executor::new(
+            vec![bash_call(
+                json!({ "command": "touch /etc/x", "description": "Write outside" }),
+            )],
+            1,
+            1,
+        );
+        let outs = e.begin("/w", &fence(), &confining());
+        let effect = effects(&outs)[0].clone();
+        let outs = e.on_effect(
+            &effect,
+            Ok(Answer::Process {
+                exit_code: Some(1),
+                signal: None,
+                stdout: String::new(),
+                stderr: "touch: cannot touch '/etc/x': Read-only file system\n".into(),
+                truncated: false,
+                timed_out: false,
+            }),
+        );
+        let text = text_of(&outs, 0);
+        assert!(
+            text.contains("[sandbox: file access denied under workspace-write mode]"),
+            "{text}"
+        );
+        assert!(text.contains("retry this exact command"), "{text}");
+        // A denial is a result the model reacts to, not an error.
+        assert!(data(&outs, 0)["message"]["content"][0]["isError"] != json!(true));
+    }
+
+    /// A runner that fails before executing its profile is *not* a denial: the
+    /// reserved exit plus the runner's own signature classify it as
+    /// unavailable, and it carries the one structured bash error.
+    #[test]
+    fn a_runner_failure_outranks_a_denial() {
+        let mut e = Executor::new(
+            vec![bash_call(
+                json!({ "command": "true", "description": "No-op" }),
+            )],
+            1,
+            1,
+        );
+        let outs = e.begin("/w", &fence(), &confining());
+        let effect = effects(&outs)[0].clone();
+        let outs = e.on_effect(
+            &effect,
+            Ok(Answer::Process {
+                exit_code: Some(1),
+                signal: None,
+                stdout: String::new(),
+                stderr: "bwrap: Creating new namespace failed\n".into(),
+                truncated: false,
+                timed_out: false,
+            }),
+        );
+        let text = text_of(&outs, 0);
+        assert!(text.contains("no sandbox backend is usable"), "{text}");
+        // The one bash failure with a structured error, because it is an
+        // infrastructure failure rather than a result.
+        assert_eq!(data(&outs, 0)["error"]["name"], "SandboxUnavailableError");
+    }
+
+    /// A confining mode with no usable runner refuses *without* issuing an
+    /// effect — that is what makes the fail-closed contract structural rather
+    /// than a discipline: there is no arm that hands a confined mode its argv.
+    #[test]
+    fn an_unavailable_runner_refuses_before_any_effect() {
+        let mut e = Executor::new(
+            vec![bash_call(json!({ "command": "ls", "description": "List" }))],
+            1,
+            1,
+        );
+        let outs = e.begin("/w", &fence(), &sandbox()); // fail-closed default
+        assert_eq!(row_types(&outs), vec!["tool/call", "tool/result"]);
+        assert!(effects(&outs).is_empty(), "no command runs unconfined");
+        let text = text_of(&outs, 1);
+        assert!(text.contains("no sandbox backend is usable"), "{text}");
+        assert_eq!(data(&outs, 1)["error"]["name"], "SandboxUnavailableError");
+        assert!(e.finished());
+    }
+
+    /// `danger-full-access` is the mode whose meaning is "do not confine", so it
+    /// runs unwrapped — and that is deliberate, not the forbidden passthrough.
+    #[test]
+    fn danger_full_access_runs_the_argv_unwrapped() {
+        let mut e = Executor::new(
+            vec![bash_call(json!({ "command": "ls", "description": "List" }))],
+            1,
+            1,
+        );
+        let ro = Fence::new(Mode::DangerFullAccess, "/w");
+        let outs = e.begin("/w", &ro, &sandbox());
+        let Effect::Exec { confined, .. } = &effects(&outs)[0] else {
+            panic!("expected an exec effect");
+        };
+        assert_eq!(confined.argv, vec!["bash", "-c", "ls"]);
+    }
+
+    /// A malformed call is refused before confinement is even considered.
+    #[test]
+    fn a_malformed_command_is_refused() {
+        let mut e = Executor::new(vec![bash_call(json!({ "command": "ls" }))], 1, 1);
+        // Missing `description`.
+        let outs = e.begin("/w", &fence(), &confining());
+        assert!(effects(&outs).is_empty());
+        let text = text_of(&outs, 1);
+        assert!(text.contains("invalid description"), "{text}");
     }
 }

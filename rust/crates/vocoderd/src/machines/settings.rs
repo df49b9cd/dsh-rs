@@ -295,16 +295,30 @@ impl SettingsMachine {
             }
             None => (value, user, Vec::new()),
         };
-        serde_json::json!({
+        // `base` and `user` are **omitted** when absent, never emitted as
+        // `null`. Upstream's `namespaceView` spreads each key only when the
+        // descriptor carries it (`...descriptor.user === undefined ? {} : ...`,
+        // `api/settings-controller/src/index.ts:67`), and the control's own
+        // describe confirms it: `base` appears on 9 of 14 namespaces and `user`
+        // on none. A `null` here is not harmless — the settings page's
+        // `CardForm.stored` calls `Object.hasOwn(this.userLayer(), field)`,
+        // which throws `Cannot convert undefined or null to object` and takes
+        // the whole subscriber down, which is what a live boot reported.
+        let mut entry = serde_json::json!({
             "ns": ns,
             "schema": entry.map(|e| serde_json::json!({"$catalogSchema": e.schema})).unwrap_or_else(|| serde_json::json!({})),
             "value": value,
-            "base": base,
-            "user": if user.is_object() && !user.as_object().unwrap().is_empty() { Some(user) } else { None },
             "applies": "live",
             "secrets": secrets,
             "revision": revision,
-        })
+        });
+        if let Some(base) = base {
+            entry["base"] = base;
+        }
+        if user.is_object() && !user.as_object().unwrap().is_empty() {
+            entry["user"] = user;
+        }
+        entry
     }
 
     fn apply_write(

@@ -4,14 +4,18 @@
 mod composition;
 mod driver;
 mod machines;
+mod open_in_app;
 mod registry;
+#[cfg(test)]
+mod routes;
 mod rpc;
 mod validate;
+mod web_boot;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::{
     Router as AxumRouter,
     body::Bytes,
@@ -55,6 +59,11 @@ struct ServeArgs {
     /// Serve the built dsh web GUI from this directory (expects dist/index.html).
     #[arg(long)]
     web_dist: Option<std::path::PathBuf>,
+    /// The dsh checkout the client-module graph is composed from. Only read when
+    /// `--web-dist` is set: the boot graph needs the package tree's manifests
+    /// and built client bundles, which the dist directory does not contain.
+    #[arg(long, default_value = "dsh")]
+    dsh_root: std::path::PathBuf,
     /// Workspace-of-first-run display name in the injected boot payload.
     #[arg(long, default_value = "vocoder")]
     host_name: String,
@@ -414,10 +423,18 @@ async fn main() -> Result<()> {
     // namespace registry.
     initial_router.handle(RouteIn::Mount {
         id: MachineId::new("agent"),
-        machine: Box::new(crate::machines::agent::AgentMachine::new(
-            sessions_root.clone(),
-            crate::machines::agent::routes_from_env(),
-        )),
+        machine: Box::new(
+            crate::machines::agent::AgentMachine::new(
+                sessions_root.clone(),
+                crate::machines::agent::routes_from_env(),
+            )
+            // The sandbox chain is probed once, here, because probing spawns
+            // processes and a machine may not. `std::env::consts::OS` yields the
+            // same names `Runner::chain` matches on (`linux`/`macos`/`windows`),
+            // so an unlisted platform gets an empty chain and every confined
+            // command fails closed rather than running unconfined.
+            .with_sandbox(crate::driver::probe_sandbox(std::env::consts::OS)),
+        ),
     });
     let mut registry = vocoder_typert::dispatch::NamespaceRegistry::new();
     registry_owner_register(&mut registry, "goals", "goals");
@@ -442,6 +459,18 @@ async fn main() -> Result<()> {
     registry_owner_register(&mut registry, "agentTeams", "agentTeams");
     registry_owner_register(&mut registry, "llm", "llm");
     registry_owner_register(&mut registry, "subagents", "subagents");
+
+    // `dynamicCordisRunner` is mounted even though this host defines no dynamic
+    // plugins: the web GUI calls `inventory` and `syncInspectManifest` at boot,
+    // and a bare 404 there is a console error. The empty answers are the
+    // control's own empty-registry answers, not a stub. See the module docs.
+    initial_router.handle(RouteIn::Mount {
+        id: MachineId::new("dynamicCordisRunner"),
+        machine: Box::new(
+            crate::machines::dynamic_cordis_runner::DynamicCordisRunnerMachine::new(),
+        ),
+    });
+    registry_owner_register(&mut registry, "dynamicCordisRunner", "dynamicCordisRunner");
 
     // `pluginInventory` is mounted last and takes its answer from the two facts
     // that only exist now: the mounted machine tree and the namespace registry.
@@ -484,10 +513,60 @@ async fn main() -> Result<()> {
         .route("/healthz", get(|| async { StatusCode::OK }));
 
     let app = if let Some(dist) = args.web_dist.clone() {
-        let boot = boot_script(&args);
         let dist2 = dist.clone();
         info!(dist = ?args.web_dist, "serving web GUI");
-        app.route("/", get(move || serve_index(dist.clone(), boot.clone())))
+        // Compose the client-module boot graph. Fatal on failure: a dist served
+        // without the graph is a shell that throws
+        // `window.__ModuleLoader__ bootstrap facade is missing` before mount, so
+        // booting anyway would only move the failure into the browser console.
+        let backend = web_boot::resolve_picker_backend(&web_boot::PickerFacts::detect(&args.bind));
+        let boot = std::sync::Arc::new(
+            web_boot::DshTree::new(&args.dsh_root)
+                .compose(backend)
+                .context("composing the client-module boot graph")?,
+        );
+        info!(
+            entries = boot.graph.entries.len(),
+            batches = boot.graph.batches.len(),
+            backend = ?backend,
+            "client-module boot graph composed"
+        );
+        let boot2 = boot.clone();
+        let boot3 = boot.clone();
+        let boot_events = boot.clone();
+        app.route("/", get(move || serve_index(dist.clone(), boot2.clone())))
+            // The combo route must precede the dist fallback, or a
+            // `/plugins/...` request would be served as a static miss. The
+            // specifier starts with `??`, so the path is exactly `/plugins/`
+            // and the whole thing rides in the query string: the handler reads
+            // the raw request target (`pathname + search`), which is exactly the
+            // key upstream registers its responses under.
+            //
+            // Two routes, because axum's `{*rest}` requires at least one
+            // character: every real combo request is the bare `/plugins/`, so a
+            // catch-all alone never matches one and the static fallback would
+            // 404 it. Keep both so a future non-combo `/plugins/<name>` path
+            // still reaches the handler's own 404 rather than the fallback's.
+            .route(
+                "/plugins/",
+                get(move |uri: axum::http::Uri| serve_combo(uri, boot3.clone())),
+            )
+            // The client-module dev channel. An exact path, so it wins over the
+            // catch-all below (axum matches literal segments ahead of a
+            // wildcard) and does not fall into `serve_combo`'s specifier parse.
+            .route(
+                "/plugins/events",
+                get(move || serve_plugin_events(boot_events.clone())),
+            )
+            .route(
+                "/plugins/{*resource}",
+                get(move |uri: axum::http::Uri| serve_combo(uri, boot.clone())),
+            )
+            // The client plugin `ui-open-in-app` fetches this at boot. An exact
+            // path registered ahead of the dist fallback, so a missing dist
+            // file cannot answer it; the GUI surface only exists with
+            // `--web-dist`, hence registration here and not in the base router.
+            .route("/open-in-app/apps", get(open_in_app::handler))
             .nest_service(
                 "/assets",
                 tower_http::services::ServeDir::new(dist2.join("assets")),
@@ -1043,18 +1122,14 @@ fn parse_env_file(path: &std::path::Path) -> std::collections::BTreeMap<String, 
     out
 }
 
-fn boot_script(args: &ServeArgs) -> String {
-    let payload = serde_json::json!({
-        "kind": "vocoder",
-        "host": { "home": args.home.display().to_string(), "name": args.host_name },
-    });
-    format!(
-        "<script>window.__DSH_BOOT__ = {};</script>",
-        serde_json::to_string(&payload).unwrap()
-    )
-}
-
-async fn serve_index(dist: std::path::PathBuf, boot: String) -> axum::response::Response {
+/// Serve the web GUI's index with the client-module boot table injected.
+///
+/// The dist is static and carries no graph; the injection table (facade, batch
+/// preloads, `__DSH_BOOT__`) is what makes it bootable. See `web_boot`.
+async fn serve_index(
+    dist: std::path::PathBuf,
+    boot: std::sync::Arc<web_boot::Boot>,
+) -> axum::response::Response {
     let path = dist.join("index.html");
     let html = match std::fs::read_to_string(&path) {
         Ok(h) => h,
@@ -1065,8 +1140,114 @@ async fn serve_index(dist: std::path::PathBuf, boot: String) -> axum::response::
                 .unwrap();
         }
     };
-    let html = html.replacen("<head>", &format!("<head>\n    {boot}\n  "), 1);
-    axum::response::Html(html).into_response()
+    axum::response::Html(web_boot::inject_into_index(&html, &boot.graph)).into_response()
+}
+
+/// Serve a `/plugins/??<id>/client.js,<id>/client.js&rev=<rev>` combo.
+///
+/// The specifier begins with `??`, so it is the request's **query string**, not
+/// its path: axum routes `/plugins/{*resource}` on the path alone and would see
+/// an empty capture. The handler therefore takes the raw request target
+/// (`pathname + search`) and strips the `/plugins/` prefix, which is exactly the
+/// key upstream registers its combo responses under. `rev` rides in the same
+/// string after `&rev=`; a rev this host did not issue still resolves, because
+/// the response is looked up by resource list — which is what a cache-busting
+/// query needs.
+async fn serve_combo(
+    uri: axum::http::Uri,
+    boot: std::sync::Arc<web_boot::Boot>,
+) -> axum::response::Response {
+    let target = uri
+        .path_and_query()
+        .map(axum::http::uri::PathAndQuery::as_str)
+        .unwrap_or("");
+    let Some(resource) = target.strip_prefix("/plugins/") else {
+        return axum::response::Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body("combo route expects /plugins/??<id>/client.js".into())
+            .unwrap();
+    };
+    let (list, rev) = match resource.split_once("&rev=") {
+        Some((list, rev)) => (list, rev.to_string()),
+        None => (resource, String::new()),
+    };
+    let Some(ids) = list.strip_prefix("??") else {
+        return axum::response::Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body("combo route expects /plugins/??<id>/client.js".into())
+            .unwrap();
+    };
+    // Split into resource names and normalize each to its package id. A single
+    // request is all-script or all-map; the map suffix on any resource selects
+    // the map form for the whole response, matching how the client builds a
+    // source-map request (one map URL per combo script).
+    let mut map = false;
+    let mut packages = Vec::new();
+    for one in ids.split(',').filter(|s| !s.is_empty()) {
+        let stem = if let Some(stem) = one.strip_suffix("/client.js") {
+            stem
+        } else if let Some(stem) = one.strip_suffix("/client.js.map") {
+            map = true;
+            stem
+        } else {
+            return axum::response::Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(format!("bad combo resource: {one}").into())
+                .unwrap();
+        };
+        packages.push(stem.to_string());
+    }
+    if packages.is_empty() {
+        return axum::response::Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body("empty combo".into())
+            .unwrap();
+    }
+    match boot.combo(&packages, &rev, map) {
+        Ok(body) => axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", web_boot::Boot::combo_content_type(map))
+            // Immutable: the URL carries the revision, so a changed bundle is a
+            // changed URL.
+            .header("cache-control", "public, max-age=31536000, immutable")
+            .body(body.into())
+            .unwrap(),
+        Err(e) => axum::response::Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(format!("combo failed: {e}").into())
+            .unwrap(),
+    }
+}
+
+/// The client-module dev channel: `GET /plugins/events`.
+///
+/// This is the host half of `client-hmr` (`packages/client/hmr/src/index.ts:158`),
+/// the SSE stream the browser opens to learn a bundle was rebuilt. Faithful to
+/// upstream in framing, in the connect-time `graph` snapshot, and — importantly
+/// — in what it does *not* do here: no filesystem watcher exists, so a
+/// `rebuilt` frame is never emitted. The graph is composed once at boot, so the
+/// connect snapshot is the boot graph and never changes.
+///
+/// It is served rather than omitted because its absence is a *console error* in
+/// the client, and the e2e boot cell is "no console errors": an `EventSource`
+/// against a 404 fires the browser's resource error, which this axis counts.
+async fn serve_plugin_events(boot: std::sync::Arc<web_boot::Boot>) -> axum::response::Response {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    // `sseData`'s frame, verbatim: `data: <json>\n\n`. axum's `Event` renders
+    // the same `data:` framing; the graph value is the same `__DSH_BOOT__`
+    // object, so a client receiving it sees no difference from the control's
+    // connect frame.
+    let graph = serde_json::json!({ "type": "graph", "graph": boot.graph.to_json() });
+    let first = futures_util::stream::once(async move {
+        Ok::<_, std::convert::Infallible>(Event::default().data(graph.to_string()))
+    });
+    // The connection stays open after the snapshot, as upstream's does: the
+    // writer holds the response rather than ending the body.
+    use futures_util::StreamExt;
+    let stream = first.chain(futures_util::stream::pending());
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 fn uuid() -> String {
