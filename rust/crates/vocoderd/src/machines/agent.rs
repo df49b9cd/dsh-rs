@@ -438,6 +438,18 @@ fn stream_event(session: &str, frame: Value) -> MachineOut {
     }
 }
 
+/// A stage of a session lookup the cache still owes, after the walk was
+/// refreshed to see a session the stale one did not.
+///
+/// `Tree` waits on the invalidation's fresh `ListTree`; `Reads` waits on the
+/// per-generation `ReadBytes` the refreshed tree names. Ordered, because the
+/// reads cannot be requested until the walk names their paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshWants {
+    Tree,
+    Reads,
+}
+
 /// How far the in-flight turn has advanced.
 ///
 /// There is deliberately no "the turn is running" variant: a running turn is
@@ -533,6 +545,14 @@ pub struct AgentMachine {
     /// is structural here rather than checked: a session's own table is the
     /// only one its reads ever reach.
     jobs: BTreeMap<String, super::tool_exec::Jobs>,
+    /// Filesystem answers the session lookup is still owed, in order.
+    ///
+    /// A fresh session lookup can owe a walk *and then* the generation reads
+    /// the refreshed walk names: the tree is invalidated on a miss, the reads
+    /// cannot be requested until its answer names the files, and the
+    /// machine contract suspends on one effect at a time — so the queue is the
+    /// record of what comes next, one stage per answer.
+    wants: std::collections::VecDeque<RefreshWants>,
     /// The boot-resolved sandbox facts a confined `bash` call needs.
     ///
     /// Resolved by the driver (probing runners and the environment is I/O) and
@@ -560,6 +580,7 @@ impl AgentMachine {
             tool_effect: None,
             sandbox: super::tool_bash::SandboxContext::default(),
             jobs: BTreeMap::new(),
+            wants: std::collections::VecDeque::new(),
         }
     }
 
@@ -615,21 +636,33 @@ impl AgentMachine {
     /// two is what made an unwalked tree look like a missing session.
     fn rows_of(&mut self, session: &str) -> Result<Option<Vec<Value>>, Vec<MachineOut>> {
         let tree = self.tree()?;
+        // A session the cached walk does not know is not proof of absence: the
+        // tree was walked before it existed, and the follow stream's snapshot
+        // caller is *still* the only writer of the new session's initial
+        // generation. Refresh and re-enter behind the invalidation's ListTree,
+        // feeding one *unread* generation per answer.
+        if self.session_dir_in(session, &tree).is_none()
+            && !self.wants.contains(&RefreshWants::Tree)
+        {
+            self.wants.push_back(RefreshWants::Tree);
+            self.cache.invalidate_tree();
+            return Err(self.tree().unwrap_err());
+        }
+        if self.wants.front() == Some(&RefreshWants::Tree) {
+            self.wants.pop_front();
+        }
         let Some(dir) = self.session_dir_in(session, &tree) else {
             return Ok(None);
         };
         if let Some(rows) = self.cache.session_rows(&dir, &tree) {
             return Ok(Some(rows));
         }
-        // The directory is there but its newest generation is not cached yet.
         let unread = self.cache.unread_generations(&tree);
         if let Some(path) = unread.first().cloned() {
             return Err(self
                 .cache
                 .request_read(&path, &mut self.pending, &mut self.effects));
         }
-        // A session whose generation cannot be read at all is still a session;
-        // an empty log is the honest reading of "no rows are available".
         Ok(Some(Vec::new()))
     }
 
@@ -1297,7 +1330,6 @@ impl AgentMachine {
             }),
         )];
         if state.pending_calls.is_some() {
-            tracing::debug!("settle: has pending calls");
             self.op = Some(Op::Tools { state });
             // The calls are captured; the executor is created and driven on the
             // same re-entry that put the op in place.
@@ -1305,7 +1337,6 @@ impl AgentMachine {
             end_frames.extend(resumed);
             return end_frames;
         }
-        tracing::debug!("settle: no pending calls");
         let outs = state
             .fsm
             .step_reply(outcome, has_calls && !interrupted, false);
@@ -4250,6 +4281,86 @@ mod tests {
             .filter(|c| c.get("type").and_then(Value::as_str) == Some("text-delta"))
             .filter_map(|c| c.get("text").and_then(Value::as_str).map(str::to_string))
             .collect()
+    }
+
+    /// A turn for a session the agent machine walked *before it knew* must
+    /// refresh the tree and find the session, not refuse it as missing.
+    ///
+    /// The artefact ordering that hides the stale walk is the prompt itself:
+    /// a session created *before* any agent call leaves a cache that was never
+    /// confused, and the refusal this test replays came from the host's
+    /// real first-second ordering — `session/create` wrote the log after an
+    /// earlier agent call had already walked and cached.
+    #[test]
+    fn a_turn_for_a_session_created_after_the_walk_rewalks() {
+        let (_home, sessions) = session_home_with("session-seed", true);
+        let mut machine = AgentMachine::new(sessions.clone(), vec![canned_provider(MARKDOWN_BODY)]);
+        let _ = machine.handle(MachineIn::ServicesReady { keys: vec![] });
+
+        // Sink the walk: one unknown lookup lands an empty tree in the cache.
+        let misses = drive(
+            &mut machine,
+            MachineIn::Event {
+                name: vocoder_cordis::EventName::new(rpc::call_event("agent")),
+                payload: json!({
+                    "method": "run",
+                    "args": {
+                        "sessionId": "session-missing",
+                        "requestId": "req-seed",
+                        "content": [{ "type": "text", "text": "hi" }],
+                    },
+                }),
+            },
+        );
+        assert!(
+            matches!(reply_of(&misses), RpcReply::Err { .. }),
+            "the pre-create turn for a session that is not there is refused: {misses:?}"
+        );
+
+        // A new session is created on disk *after* that walk, as if the
+        // `session` machine had just accepted its create; the agent's cache
+        // has not heard about it.
+        let (dir2, sessions2) = session_home_with("session-late", true);
+        let late_dir = sessions2.join(
+            std::path::Path::new(&super::super::session::SessionStore::project_dir(None)).join(
+                super::super::session::SessionStore::encode_segment("session-late"),
+            ),
+        );
+        let gen_bytes =
+            std::fs::read(late_dir.join(vocoder_session::generation_filename(0, false)))
+                .expect("read seed generation");
+        let target = sessions.join(
+            std::path::Path::new(&super::super::session::SessionStore::project_dir(None)).join(
+                super::super::session::SessionStore::encode_segment("session-late"),
+            ),
+        );
+        std::fs::create_dir_all(&target).expect("make late session dir");
+        std::fs::write(
+            target.join(vocoder_session::generation_filename(0, false)),
+            gen_bytes,
+        )
+        .expect("write late generation");
+        drop(dir2);
+
+        // The turn must run, not refuse the session.
+        let terminal = drive(
+            &mut machine,
+            MachineIn::Event {
+                name: vocoder_cordis::EventName::new(rpc::call_event("agent")),
+                payload: json!({
+                    "method": "run",
+                    "args": {
+                        "sessionId": "session-late",
+                        "requestId": "req-late",
+                        "content": [{ "type": "text", "text": "hi" }],
+                    },
+                }),
+            },
+        );
+        assert!(
+            matches!(reply_of(&terminal), RpcReply::Ok { .. }),
+            "a session created after the walk is not not-found: {terminal:?}"
+        );
     }
 
     /// A settled turn announces the rows it appended, so a follower's event
