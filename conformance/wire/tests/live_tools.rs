@@ -59,21 +59,13 @@ async fn rpc(method: &str, args: Value) -> Value {
     v["result"].clone()
 }
 
-/// The rows a session's newest generation holds.
-async fn session_rows(session_id: &str) -> Vec<Value> {
-    let listed = rpc("session/list", json!({})).await;
-    let _ = listed;
-    // The file API is the durable read this host exposes; the session's own
-    // `session/follow` snapshot carries the same rows, so the follow stream is
-    // used instead of a filesystem reach-around.
-    let _ = session_id;
-    Vec::new()
-}
-
 /// **The whole loop, against a real model**: offered tools, a real call, a real
 /// file read, and a second request whose shape the provider accepts.
 #[tokio::test]
 async fn a_live_model_calls_a_tool_and_the_turn_continues() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
     if std::env::var("VOCODER_LIVE_API_KEY").is_err() {
         eprintln!("SKIPPED: set VOCODER_LIVE_API_KEY to run the live tool probe");
         return;
@@ -92,6 +84,51 @@ async fn a_live_model_calls_a_tool_and_the_turn_continues() {
     assert!(created["ok"].as_bool().unwrap(), "create: {created}");
     let session_id = created["value"]["sessionId"].as_str().unwrap().to_string();
 
+    // One follow stream, held for the whole turn. Polling `session/follow`
+    // once per snapshot would lose every event between polls — a previous
+    // shape of this probe asserted against exactly that — so the rows this
+    // test reads are the *live* items, just as a real client sees them.
+    let url = format!("{}/api/remote.mux", base_url().replace("http://", "ws://"));
+    let (mut socket, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("connect /api/remote.mux");
+    let stream_id = format!("s-{}", uuid());
+    socket
+        .send(Message::Text(
+            json!({
+                "type": "open",
+                "streamId": stream_id,
+                "endpoint": "session/follow",
+                "payload": { "args": { "request": {
+                    "address": { "kind": "session", "sessionId": session_id },
+                } } },
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    // Wait for the opening snapshot before prompting, so the prompt's own
+    // event cannot race the open.
+    {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let Ok(Some(Ok(msg))) = tokio::time::timeout_at(deadline, socket.next()).await else {
+                panic!("no opening snapshot");
+            };
+            let Message::Text(t) = msg else { continue };
+            let Ok(v) = serde_json::from_str::<Value>(&t) else {
+                continue;
+            };
+            if v["streamId"] == stream_id
+                && v["value"].get("type").and_then(Value::as_str) == Some("snapshot")
+            {
+                break;
+            }
+        }
+    }
+
     let prompted = rpc(
         "session/prompt",
         json!({ "request": {
@@ -106,22 +143,44 @@ async fn a_live_model_calls_a_tool_and_the_turn_continues() {
     .await;
     assert!(prompted["ok"].as_bool().unwrap(), "prompt: {prompted}");
 
-    // The turn runs detached, so poll the follow snapshot until it settles. A
-    // tool-using turn is several model calls and can take a while.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    // Read the stream until the turn's durable end arrives. A tool-using turn
+    // is several model calls and can take a while.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(180);
     let mut rows: Vec<Value> = Vec::new();
-    while std::time::Instant::now() < deadline {
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        rows = snapshot_rows(&session_id).await;
-        if rows
-            .iter()
-            .any(|r| r.get("type").and_then(Value::as_str) == Some("turn/end"))
-        {
+    while tokio::time::Instant::now() < deadline {
+        let Ok(Some(Ok(msg))) = tokio::time::timeout_at(deadline, socket.next()).await else {
+            break;
+        };
+        let Message::Text(t) = msg else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(&t) else {
+            continue;
+        };
+        if v["streamId"] != stream_id {
+            continue;
+        }
+        let value = &v["value"];
+        if value.get("type").and_then(Value::as_str) != Some("event") {
+            continue;
+        }
+        let Some(event) = value.get("event").cloned() else {
+            continue;
+        };
+        let done =
+            event.get("type").and_then(Value::as_str) == Some("turn/end");
+        rows.push(event);
+        if done {
             break;
         }
     }
-    assert!(!rows.is_empty(), "the session never produced rows");
-
+    assert!(
+        rows.iter()
+            .any(|r| r.get("type").and_then(Value::as_str) == Some("turn/end")),
+        "the turn settled: {}",
+        rows.iter()
+            .filter_map(|r| r.get("type").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
     let types: Vec<&str> = rows
         .iter()
         .filter_map(|r| r.get("type").and_then(Value::as_str))
@@ -191,65 +250,5 @@ async fn a_live_model_calls_a_tool_and_the_turn_continues() {
         "the model answered from the file it read: {final_text:?}"
     );
 
-    let _ = session_rows(&session_id).await;
     let _ = std::fs::remove_dir_all(&workspace);
-}
-
-/// The session's rows, read back through the follow stream's opening snapshot.
-///
-/// The follow stream is used rather than a filesystem read because it is the
-/// same projection a client sees — so this asserts on what a client would, not on
-/// an internal file whose layout is an implementation detail.
-async fn snapshot_rows(session_id: &str) -> Vec<Value> {
-    use futures::{SinkExt, StreamExt};
-    use tokio_tungstenite::tungstenite::Message;
-
-    let url = format!("{}/api/remote.mux", base_url().replace("http://", "ws://"));
-    let Ok((mut socket, _)) = tokio_tungstenite::connect_async(&url).await else {
-        return Vec::new();
-    };
-    let stream_id = format!("s-{}", uuid());
-    if socket
-        .send(Message::Text(
-            json!({
-                "type": "open",
-                "streamId": stream_id,
-                "endpoint": "session/follow",
-                "payload": { "args": { "request": {
-                    "address": { "kind": "session", "sessionId": session_id },
-                } } },
-            })
-            .to_string()
-            .into(),
-        ))
-        .await
-        .is_err()
-    {
-        return Vec::new();
-    }
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    while tokio::time::Instant::now() < deadline {
-        let Ok(Some(Ok(msg))) = tokio::time::timeout_at(deadline, socket.next()).await else {
-            break;
-        };
-        let Message::Text(t) = msg else { continue };
-        let Ok(v) = serde_json::from_str::<Value>(&t) else {
-            continue;
-        };
-        if v["streamId"] != stream_id {
-            continue;
-        }
-        let value = &v["value"];
-        if value.get("type").and_then(Value::as_str) == Some("snapshot")
-            && let Some(records) = value.get("records").and_then(Value::as_array)
-        {
-            // The snapshot's own frame is the snapshot itself, and each record
-            // wraps its row under `event`.
-            return records
-                .iter()
-                .filter_map(|r| r.get("event").cloned())
-                .collect();
-        }
-    }
-    Vec::new()
 }
